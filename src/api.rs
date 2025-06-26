@@ -11,12 +11,6 @@ use crate::store::Response;
 
 /**
  * Application API
- *
- * This is where you place your application, you can use the example below to create your
- * API. The current implementation:
- *
- *  - `POST - /write` saves a value in a key and sync the nodes.
- *  - `POST - /read` attempt to find a value from a given key.
  */
 #[post("/api/perform")]
 pub async fn perform(app: Data<App>, req: Json<Request>) -> actix_web::Result<impl Responder> {
