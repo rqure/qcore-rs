@@ -1645,18 +1645,18 @@ name = "qcore-rs"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "clap",
  "openraft",
  "qlib-rs",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "qlib-rs"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "101548a06f842d0a409fe842249dc2cc624ba8a72d6b647cd153854e1183c792"
 dependencies = [
  "serde",
 ]
