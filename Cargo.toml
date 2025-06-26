@@ -5,5 +5,8 @@ edition = "2024"
 
 [dependencies]
 actix-web = "4.11.0"
+openraft = "0.9.20"
 qlib-rs = "0.1.1"
+reqwest = "0.12.20"
+serde = "1.0.219"
 tokio = "1.45.1"
