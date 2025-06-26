@@ -17,6 +17,7 @@ use openraft::SnapshotMeta;
 use openraft::StorageError;
 use openraft::StorageIOError;
 use openraft::StoredMembership;
+use qlib_rs::Store;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::RwLock;
@@ -226,15 +227,9 @@ mod impl_log_store {
     }
 }
 
-/**
- * Here you will set the types of request that will interact with the raft nodes.
- * For example the `Set` will be used to write data (key and value) to the raft database.
- * The `AddNode` will append a new node to the current existing shared list of nodes.
- * You will want to add any request that can write data in all nodes here.
- */
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum Request {
-    Set { key: String, value: String },
+pub struct Request {
+    pub request: Vec<qlib_rs::Request>,
 }
 
 /**
@@ -245,7 +240,8 @@ pub enum Request {
  */
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Response {
-    pub value: Option<String>,
+    pub response: Vec<qlib_rs::Request>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -268,7 +264,7 @@ pub struct StateMachineData {
     pub last_membership: StoredMembership<NodeId, BasicNode>,
 
     /// Application data.
-    pub data: BTreeMap<String, String>,
+    pub data: Store
 }
 
 /// Defines a state machine for the Raft cluster. This state machine represents a copy of the
@@ -350,18 +346,23 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             sm.last_applied_log = Some(entry.log_id);
 
             match entry.payload {
-                EntryPayload::Blank => res.push(Response { value: None }),
-                EntryPayload::Normal(ref req) => match req {
-                    Request::Set { key, value } => {
-                        sm.data.insert(key.clone(), value.clone());
-                        res.push(Response {
-                            value: Some(value.clone()),
-                        })
+                EntryPayload::Blank => res.push(Response { response: Vec::new(), error: None }),
+                EntryPayload::Normal(ref req) => {
+                   let mut req = req.request.clone();
+
+                    match sm.data.perform(&qlib_rs::Context {  }, &mut req) {
+                        Ok(_) => {
+                            res.push(Response { response: req, error: None });
+                        },
+                        Err(e) => res.push(Response {
+                            response: req,
+                            error: Some(format!("Error applying request: {}", e)),
+                        }),
                     }
                 },
                 EntryPayload::Membership(ref mem) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
-                    res.push(Response { value: None })
+                    res.push(Response { response: Vec::new(), error: None })
                 }
             };
         }

@@ -92,9 +92,7 @@ async fn main() -> std::io::Result<()> {
             .service(management::change_membership)
             .service(management::metrics)
             // application API
-            .service(api::write)
-            .service(api::read)
-            .service(api::consistent_read)
+            .service(api::perform)
     });
 
     let x = server.bind(http_addr)?;

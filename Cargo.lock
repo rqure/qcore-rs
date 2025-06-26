@@ -1447,6 +1447,7 @@ dependencies = [
  "maplit",
  "openraft-macros",
  "rand 0.8.5",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
