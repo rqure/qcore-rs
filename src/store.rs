@@ -228,7 +228,7 @@ mod impl_log_store {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Request {
+pub struct PerformRequest {
     pub request: Vec<qlib_rs::Request>,
 }
 
@@ -239,7 +239,7 @@ pub struct Request {
  *
  */
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Response {
+pub struct PerformResponse {
     pub response: Vec<qlib_rs::Request>,
     pub error: Option<String>,
 }
@@ -336,7 +336,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         Ok((state_machine.last_applied_log, state_machine.last_membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Response>, StorageError<NodeId>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<PerformResponse>, StorageError<NodeId>>
     where I: IntoIterator<Item = Entry<TypeConfig>> + Send {
         let mut res = Vec::new(); //No `with_capacity`; do not know `len` of iterator
 
@@ -346,15 +346,15 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             sm.last_applied_log = Some(entry.log_id);
 
             match entry.payload {
-                EntryPayload::Blank => res.push(Response { response: Vec::new(), error: None }),
+                EntryPayload::Blank => res.push(PerformResponse { response: Vec::new(), error: None }),
                 EntryPayload::Normal(ref req) => {
                    let mut req = req.request.clone();
 
                     match sm.data.perform(&qlib_rs::Context {  }, &mut req) {
                         Ok(_) => {
-                            res.push(Response { response: req, error: None });
+                            res.push(PerformResponse { response: req, error: None });
                         },
-                        Err(e) => res.push(Response {
+                        Err(e) => res.push(PerformResponse {
                             response: req,
                             error: Some(format!("Error applying request: {}", e)),
                         }),
@@ -362,7 +362,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                 },
                 EntryPayload::Membership(ref mem) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
-                    res.push(Response { response: Vec::new(), error: None })
+                    res.push(PerformResponse { response: Vec::new(), error: None })
                 }
             };
         }
