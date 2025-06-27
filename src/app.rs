@@ -1,15 +1,15 @@
 use std::sync::Arc;
 use std::io::Cursor;
 
-use crate::store::{PerformRequest, PerformResponse, StateMachineStore};
+use crate::store::{CommandRequest, CommandResponse, StateMachineStore};
 
 pub type NodeId = u64;
 
 openraft::declare_raft_types!(
     /// Declare the type configuration for example K/V store.
     pub TypeConfig:
-        D = PerformRequest,
-        R = PerformResponse,
+        D = CommandRequest,
+        R = CommandResponse,
 );
 
 pub type Raft = openraft::Raft<TypeConfig>;
