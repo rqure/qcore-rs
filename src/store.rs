@@ -17,6 +17,8 @@ use openraft::SnapshotMeta;
 use openraft::StorageError;
 use openraft::StorageIOError;
 use openraft::StoredMembership;
+use qlib_rs::EntitySchema;
+use qlib_rs::Single;
 use qlib_rs::Store;
 use serde::Deserialize;
 use serde::Serialize;
@@ -228,8 +230,21 @@ mod impl_log_store {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PerformRequest {
-    pub request: Vec<qlib_rs::Request>,
+pub enum CommandRequest {
+    UpdateEntity {
+        request: Vec<qlib_rs::Request>,
+    },
+    CreateEntity {
+        entity_type: qlib_rs::EntityType,
+        parent_id: Option<qlib_rs::EntityId>,
+        name: String,
+    },
+    DeleteEntity {
+        entity_id: qlib_rs::EntityId,
+    },
+    SetSchema {
+        entity_schema: qlib_rs::EntitySchema::<qlib_rs::Single>,
+    },
 }
 
 /**
@@ -239,9 +254,22 @@ pub struct PerformRequest {
  *
  */
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PerformResponse {
-    pub response: Vec<qlib_rs::Request>,
-    pub error: Option<String>,
+pub enum CommandResponse {
+    UpdateEntity {
+        response: Vec<qlib_rs::Request>,
+        error: Option<String>,
+    },
+    CreateEntity {
+        response: Option<qlib_rs::EntityId>,
+        error: Option<String>,
+    },
+    DeleteEntity {
+        error: Option<String>,
+    },
+    SetSchema {
+        error: Option<String>,
+    },
+    Blank {}
 }
 
 #[derive(Debug)]
@@ -336,7 +364,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         Ok((state_machine.last_applied_log, state_machine.last_membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<PerformResponse>, StorageError<NodeId>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<CommandResponse>, StorageError<NodeId>>
     where I: IntoIterator<Item = Entry<TypeConfig>> + Send {
         let mut res = Vec::new(); //No `with_capacity`; do not know `len` of iterator
 
@@ -346,23 +374,46 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             sm.last_applied_log = Some(entry.log_id);
 
             match entry.payload {
-                EntryPayload::Blank => res.push(PerformResponse { response: Vec::new(), error: None }),
+                EntryPayload::Blank => res.push(CommandResponse::Blank {  }),
                 EntryPayload::Normal(ref req) => {
-                   let mut req = req.request.clone();
-
-                    match sm.data.perform(&qlib_rs::Context {  }, &mut req) {
-                        Ok(_) => {
-                            res.push(PerformResponse { response: req, error: None });
+                    let ctx = qlib_rs::Context {  };
+                    match req {
+                        CommandRequest::CreateEntity { entity_type, parent_id, name } => {
+                            match sm.data.create_entity(&ctx, entity_type, parent_id.clone(), name.as_str()) {
+                                Ok(entity) => {
+                                    res.push(CommandResponse::CreateEntity { response: Some(entity.entity_id), error: None });
+                                },
+                                Err(e) => {
+                                    res.push(CommandResponse::CreateEntity { response: None, error: Some(format!("Error creating entity: {}", e)) });
+                                }
+                            }
                         },
-                        Err(e) => res.push(PerformResponse {
-                            response: req,
-                            error: Some(format!("Error applying request: {}", e)),
-                        }),
+                        CommandRequest::DeleteEntity { entity_id } => {
+                            sm.data.delete_entity(&ctx, entity_id);
+                            res.push(CommandResponse::DeleteEntity { error: None });
+                        },
+                        CommandRequest::SetSchema { entity_schema } => {
+                            sm.data.set_entity_schema(&ctx, entity_schema);
+                            res.push(CommandResponse::SetSchema { error: None });
+                        }
+                        CommandRequest::UpdateEntity { request } => {
+                            // Apply the request to the state machine.
+                            let mut req = request.clone();
+                            match sm.data.perform(&ctx, &mut req) {
+                                Ok(_) => {
+                                    res.push(CommandResponse::UpdateEntity { response: req, error: None });
+                                },
+                                Err(e) => res.push(CommandResponse::UpdateEntity {
+                                    response: Vec::new(),
+                                    error: Some(format!("Error applying request: {}", e)),
+                                }),
+                            }
+                        }
                     }
                 },
                 EntryPayload::Membership(ref mem) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
-                    res.push(PerformResponse { response: Vec::new(), error: None })
+                    res.push(CommandResponse::Blank {  })
                 }
             };
         }
