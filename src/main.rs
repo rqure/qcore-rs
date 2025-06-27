@@ -1,4 +1,5 @@
 use clap::Parser;
+use qlib_rs::{Context, EntitySchema, FieldSchema, FieldType, Single, Value};
 
 mod api;
 mod app;
@@ -48,6 +49,30 @@ async fn main() -> std::io::Result<()> {
     let log_store = LogStore::default();
     // Create a instance of where the Raft data will be stored.
     let state_machine_store = Arc::new(StateMachineStore::default());
+
+    {
+        let mut store = state_machine_store.state_machine.write().await;
+
+        let ctx = Context {};
+
+        let ft_name: FieldType = "Name".into();
+
+        let mut es_object = EntitySchema::<Single>::new("Object", None);
+        es_object.fields.insert(ft_name.clone(), FieldSchema { 
+            field_type: ft_name.clone(),
+            default_value: Value::String("".into()),
+            rank: 0,
+            read_permission: None,
+            write_permission: None,
+            choices: None,
+        });
+        store.data.set_entity_schema(&ctx, &es_object);
+
+        let mut es_root = EntitySchema::<Single>::new("Root", Some(es_object.entity_type));
+        store.data.set_entity_schema(&ctx, &es_root);
+
+        
+    }
 
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
