@@ -25,12 +25,16 @@ pub async fn perform(app: Data<App>, req: Json<Request>) -> actix_web::Result<im
             Ok(_) => {
                 let mut store_req = req.0.request;
                 let mut state_machine = app.state_machine_store.state_machine.write().await;
-                state_machine.data.perform(&Context {}, &mut store_req)?;
-
-                Ok(Json(Response {
-                    response: store_req,
-                    error: None,
-                }))
+                match state_machine.data.perform(&Context {}, &mut store_req) {
+                    Ok(_) => Ok(Json(Response {
+                        response: store_req,
+                        error: None,
+                    })),
+                    Err(e) => Ok(Json(Response {
+                        response: vec![],
+                        error: Some(e.to_string()),
+                    })),
+                }
             }
             Err(e) => {
                 Ok(Json(Response {
