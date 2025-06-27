@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 actix-web = "4.11.0"
 clap = "4.5.40"
-openraft = { version="0.9.20", features = ["serde"] }
+openraft = { version="0.9.20", features = ["serde", "storage-v2"] }
 qlib-rs = { "path"="../qlib-rs" }
 reqwest = { version = "0.12.20", features = ["json"] }
 serde = "1.0.219"

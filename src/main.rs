@@ -70,9 +70,7 @@ async fn main() -> std::io::Result<()> {
         id: node_id,
         addr: http_addr.clone(),
         raft,
-        log_store,
         state_machine_store,
-        config,
     });
 
     // Start the actix-web server.
