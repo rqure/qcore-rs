@@ -6,14 +6,14 @@ use qlib_rs::Context;
 use web::Json;
 
 use crate::app::App;
-use crate::store::PerformRequest;
-use crate::store::PerformResponse;
+use crate::store::CommandRequest;
+use crate::store::CommandResponse;
 
 /**
  * Application API
  */
 #[post("/api/perform")]
-pub async fn perform(app: Data<App>, req: Json<PerformRequest>) -> actix_web::Result<impl Responder> {
+pub async fn perform(app: Data<App>, req: Json<CommandRequest>) -> actix_web::Result<impl Responder> {
     if req
         .0
         .request
@@ -26,18 +26,18 @@ pub async fn perform(app: Data<App>, req: Json<PerformRequest>) -> actix_web::Re
                 let mut store_req = req.0.request;
                 let mut state_machine = app.state_machine_store.state_machine.write().await;
                 match state_machine.data.perform(&Context {}, &mut store_req) {
-                    Ok(_) => Ok(Json(PerformResponse {
+                    Ok(_) => Ok(Json(CommandResponse {
                         response: store_req,
                         error: None,
                     })),
-                    Err(e) => Ok(Json(PerformResponse {
+                    Err(e) => Ok(Json(CommandResponse {
                         response: vec![],
                         error: Some(e.to_string()),
                     })),
                 }
             }
             Err(e) => {
-                Ok(Json(PerformResponse {
+                Ok(Json(CommandResponse {
                     response: vec![],
                     error: Some(e.to_string()),
                 }))
@@ -47,7 +47,7 @@ pub async fn perform(app: Data<App>, req: Json<PerformRequest>) -> actix_web::Re
 
     match app.raft.client_write(req.0).await {
         Ok(response) => Ok(Json(response.response().clone())),
-        Err(err) => Ok(Json(PerformResponse {
+        Err(err) => Ok(Json(CommandResponse {
             response: vec![],
             error: Some(err.to_string()),
         })),
