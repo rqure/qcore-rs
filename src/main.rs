@@ -162,11 +162,19 @@ async fn main() -> std::io::Result<()> {
                 },
                 Err(err) => {
                     log::error!("Failed to load schemas from config file: {}", err);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Failed to load schemas from config file",
+                    ));
                 }
             }
         } else {
             log::error!("No config file provided, using default schemas");
-        }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "No config file provided",
+            ));
+        };
         
         // Apply the schemas to the store
         for schema in schemas {
