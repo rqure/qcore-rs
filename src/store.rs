@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
-use openraft::storage::RaftStateMachine;
-use openraft::storage::Snapshot;
 use openraft::BasicNode;
 use openraft::Entry;
 use openraft::EntryPayload;
@@ -17,18 +15,18 @@ use openraft::SnapshotMeta;
 use openraft::StorageError;
 use openraft::StorageIOError;
 use openraft::StoredMembership;
-use qlib_rs::EntitySchema;
-use qlib_rs::Single;
+use openraft::storage::RaftStateMachine;
+use openraft::storage::Snapshot;
 use qlib_rs::Store;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::RwLock;
 use std::ops::RangeBounds;
+use tokio::sync::RwLock;
 
-use openraft::storage::LogFlushed;
 use openraft::LogState;
 use openraft::RaftLogId;
 use openraft::Vote;
+use openraft::storage::LogFlushed;
 use tokio::sync::Mutex;
 
 use crate::app::NodeId;
@@ -74,12 +72,20 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
     where
         C::Entry: Clone,
     {
-        let response = self.log.range(range.clone()).map(|(_, val)| val.clone()).collect::<Vec<_>>();
+        let response = self
+            .log
+            .range(range.clone())
+            .map(|(_, val)| val.clone())
+            .collect::<Vec<_>>();
         Ok(response)
     }
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
-        let last = self.log.iter().next_back().map(|(_, ent)| ent.get_log_id().clone());
+        let last = self
+            .log
+            .iter()
+            .next_back()
+            .map(|(_, ent)| ent.get_log_id().clone());
 
         let last_purged = self.last_purged_log_id.clone();
 
@@ -94,12 +100,17 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         })
     }
 
-    async fn save_committed(&mut self, committed: Option<LogId<C::NodeId>>) -> Result<(), StorageError<C::NodeId>> {
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogId<C::NodeId>>,
+    ) -> Result<(), StorageError<C::NodeId>> {
         self.committed = committed;
         Ok(())
     }
 
-    async fn read_committed(&mut self) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
+    async fn read_committed(
+        &mut self,
+    ) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
         Ok(self.committed.clone())
     }
 
@@ -112,8 +123,14 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         Ok(self.vote.clone())
     }
 
-    async fn append<I>(&mut self, entries: I, callback: LogFlushed<C>) -> Result<(), StorageError<C::NodeId>>
-    where I: IntoIterator<Item = C::Entry> {
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<C>,
+    ) -> Result<(), StorageError<C::NodeId>>
+    where
+        I: IntoIterator<Item = C::Entry>,
+    {
         // Simple implementation that calls the flush-before-return `append_to_log`.
         for entry in entries {
             self.log.insert(entry.get_log_id().index, entry);
@@ -124,7 +141,11 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
     }
 
     async fn truncate(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
-        let keys = self.log.range(log_id.index..).map(|(k, _v)| *k).collect::<Vec<_>>();
+        let keys = self
+            .log
+            .range(log_id.index..)
+            .map(|(k, _v)| *k)
+            .collect::<Vec<_>>();
         for key in keys {
             self.log.remove(&key);
         }
@@ -140,7 +161,11 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         }
 
         {
-            let keys = self.log.range(..=log_id.index).map(|(k, _v)| *k).collect::<Vec<_>>();
+            let keys = self
+                .log
+                .range(..=log_id.index)
+                .map(|(k, _v)| *k)
+                .collect::<Vec<_>>();
             for key in keys {
                 self.log.remove(&key);
             }
@@ -154,19 +179,20 @@ mod impl_log_store {
     use std::fmt::Debug;
     use std::ops::RangeBounds;
 
-    use openraft::storage::LogFlushed;
-    use openraft::storage::RaftLogStorage;
     use openraft::LogId;
     use openraft::LogState;
     use openraft::RaftLogReader;
     use openraft::RaftTypeConfig;
     use openraft::StorageError;
     use openraft::Vote;
+    use openraft::storage::LogFlushed;
+    use openraft::storage::RaftLogStorage;
 
     use crate::store::LogStore;
 
     impl<C: RaftTypeConfig> RaftLogReader<C> for LogStore<C>
-    where C::Entry: Clone
+    where
+        C::Entry: Clone,
     {
         async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug>(
             &mut self,
@@ -178,7 +204,8 @@ mod impl_log_store {
     }
 
     impl<C: RaftTypeConfig> RaftLogStorage<C> for LogStore<C>
-    where C::Entry: Clone
+    where
+        C::Entry: Clone,
     {
         type LogReader = Self;
 
@@ -187,17 +214,25 @@ mod impl_log_store {
             inner.get_log_state().await
         }
 
-        async fn save_committed(&mut self, committed: Option<LogId<C::NodeId>>) -> Result<(), StorageError<C::NodeId>> {
+        async fn save_committed(
+            &mut self,
+            committed: Option<LogId<C::NodeId>>,
+        ) -> Result<(), StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
             inner.save_committed(committed).await
         }
 
-        async fn read_committed(&mut self) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
+        async fn read_committed(
+            &mut self,
+        ) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
             inner.read_committed().await
         }
 
-        async fn save_vote(&mut self, vote: &Vote<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+        async fn save_vote(
+            &mut self,
+            vote: &Vote<C::NodeId>,
+        ) -> Result<(), StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
             inner.save_vote(vote).await
         }
@@ -207,13 +242,22 @@ mod impl_log_store {
             inner.read_vote().await
         }
 
-        async fn append<I>(&mut self, entries: I, callback: LogFlushed<C>) -> Result<(), StorageError<C::NodeId>>
-        where I: IntoIterator<Item = C::Entry> {
+        async fn append<I>(
+            &mut self,
+            entries: I,
+            callback: LogFlushed<C>,
+        ) -> Result<(), StorageError<C::NodeId>>
+        where
+            I: IntoIterator<Item = C::Entry>,
+        {
             let mut inner = self.inner.lock().await;
             inner.append(entries, callback).await
         }
 
-        async fn truncate(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+        async fn truncate(
+            &mut self,
+            log_id: LogId<C::NodeId>,
+        ) -> Result<(), StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
             inner.truncate(log_id).await
         }
@@ -243,7 +287,13 @@ pub enum CommandRequest {
         entity_id: qlib_rs::EntityId,
     },
     SetSchema {
-        entity_schema: qlib_rs::EntitySchema::<qlib_rs::Single>,
+        entity_schema: qlib_rs::EntitySchema<qlib_rs::Single>,
+    },
+    GetSchema {
+        entity_type: qlib_rs::EntityType,
+    },
+    GetCompleteSchema {
+        entity_type: qlib_rs::EntityType,
     },
 }
 
@@ -269,7 +319,15 @@ pub enum CommandResponse {
     SetSchema {
         error: Option<String>,
     },
-    Blank {}
+    GetSchema {
+        response: Option<qlib_rs::EntitySchema<qlib_rs::Single>>,
+        error: Option<String>,
+    },
+    GetCompleteSchema {
+        response: Option<qlib_rs::EntitySchema<qlib_rs::Complete>>,
+        error: Option<String>,
+    },
+    Blank {},
 }
 
 #[derive(Debug)]
@@ -292,7 +350,7 @@ pub struct StateMachineData {
     pub last_membership: StoredMembership<NodeId, BasicNode>,
 
     /// Application data.
-    pub data: Store
+    pub data: Store,
 }
 
 /// Defines a state machine for the Raft cluster. This state machine represents a copy of the
@@ -317,7 +375,8 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         // Serialize the data of the state machine.
         let state_machine = self.state_machine.read().await;
-        let data = serde_json::to_vec(&state_machine.data).map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let data = serde_json::to_vec(&state_machine.data)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
 
         let last_applied_log = state_machine.last_applied_log;
         let last_membership = state_machine.last_membership.clone();
@@ -359,13 +418,19 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>> {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
+    {
         let state_machine = self.state_machine.read().await;
-        Ok((state_machine.last_applied_log, state_machine.last_membership.clone()))
+        Ok((
+            state_machine.last_applied_log,
+            state_machine.last_membership.clone(),
+        ))
     }
 
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<CommandResponse>, StorageError<NodeId>>
-    where I: IntoIterator<Item = Entry<TypeConfig>> + Send {
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+    {
         let mut res = Vec::new(); //No `with_capacity`; do not know `len` of iterator
 
         let mut sm = self.state_machine.write().await;
@@ -374,46 +439,115 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             sm.last_applied_log = Some(entry.log_id);
 
             match entry.payload {
-                EntryPayload::Blank => res.push(CommandResponse::Blank {  }),
+                EntryPayload::Blank => res.push(CommandResponse::Blank {}),
                 EntryPayload::Normal(ref req) => {
-                    let ctx = qlib_rs::Context {  };
+                    let ctx = qlib_rs::Context {};
                     match req {
-                        CommandRequest::CreateEntity { entity_type, parent_id, name } => {
-                            match sm.data.create_entity(&ctx, entity_type, parent_id.clone(), name.as_str()) {
+                        CommandRequest::CreateEntity {
+                            entity_type,
+                            parent_id,
+                            name,
+                        } => {
+                            match sm.data.create_entity(
+                                &ctx,
+                                entity_type,
+                                parent_id.clone(),
+                                name.as_str(),
+                            ) {
                                 Ok(entity) => {
-                                    res.push(CommandResponse::CreateEntity { response: Some(entity.entity_id), error: None });
-                                },
+                                    res.push(CommandResponse::CreateEntity {
+                                        response: Some(entity.entity_id),
+                                        error: None,
+                                    });
+                                }
                                 Err(e) => {
-                                    res.push(CommandResponse::CreateEntity { response: None, error: Some(format!("Error creating entity: {}", e)) });
+                                    res.push(CommandResponse::CreateEntity {
+                                        response: None,
+                                        error: Some(format!("Error creating entity: {}", e)),
+                                    });
                                 }
                             }
-                        },
+                        }
                         CommandRequest::DeleteEntity { entity_id } => {
-                            sm.data.delete_entity(&ctx, entity_id);
-                            res.push(CommandResponse::DeleteEntity { error: None });
-                        },
+                            match sm.data.delete_entity(&ctx, entity_id) {
+                                Ok(_) => {
+                                    res.push(CommandResponse::DeleteEntity { error: None });
+                                }
+                                Err(e) => {
+                                    res.push(CommandResponse::DeleteEntity {
+                                        error: Some(format!("Error deleting entity: {}", e)),
+                                    });
+                                }
+                            }
+                        }
                         CommandRequest::SetSchema { entity_schema } => {
-                            sm.data.set_entity_schema(&ctx, entity_schema);
-                            res.push(CommandResponse::SetSchema { error: None });
+                            match sm.data.set_entity_schema(&ctx, entity_schema) {
+                                Ok(_) => {
+                                    res.push(CommandResponse::SetSchema { error: None });
+                                }
+                                Err(e) => {
+                                    res.push(CommandResponse::SetSchema {
+                                        error: Some(format!("Error setting schema: {}", e)),
+                                    });
+                                }
+                            }
                         }
                         CommandRequest::UpdateEntity { request } => {
                             // Apply the request to the state machine.
                             let mut req = request.clone();
                             match sm.data.perform(&ctx, &mut req) {
                                 Ok(_) => {
-                                    res.push(CommandResponse::UpdateEntity { response: req, error: None });
-                                },
+                                    res.push(CommandResponse::UpdateEntity {
+                                        response: req,
+                                        error: None,
+                                    });
+                                }
                                 Err(e) => res.push(CommandResponse::UpdateEntity {
                                     response: Vec::new(),
                                     error: Some(format!("Error applying request: {}", e)),
                                 }),
                             }
                         }
+                        CommandRequest::GetSchema { entity_type } => {
+                            match sm.data.get_entity_schema(&ctx, entity_type) {
+                                Ok(schema) => {
+                                    res.push(CommandResponse::GetSchema {
+                                        response: Some(schema),
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    res.push(CommandResponse::GetSchema {
+                                        response: None,
+                                        error: Some(format!("Error getting schema: {}", e)),
+                                    });
+                                }
+                            }
+                        }
+                        CommandRequest::GetCompleteSchema { entity_type } => {
+                            match sm.data.get_complete_entity_schema(&ctx, entity_type) {
+                                Ok(schema) => {
+                                    res.push(CommandResponse::GetCompleteSchema {
+                                        response: Some(schema),
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    res.push(CommandResponse::GetCompleteSchema {
+                                        response: None,
+                                        error: Some(format!(
+                                            "Error getting complete schema: {}",
+                                            e
+                                        )),
+                                    });
+                                }
+                            }
+                        }
                     }
-                },
+                }
                 EntryPayload::Membership(ref mem) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
-                    res.push(CommandResponse::Blank {  })
+                    res.push(CommandResponse::Blank {})
                 }
             };
         }
@@ -457,7 +591,9 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
         match &*self.current_snapshot.read().await {
             Some(snapshot) => {
                 let data = snapshot.data.clone();
