@@ -33,7 +33,7 @@ pub struct Opt {
     #[clap(long)]
     pub http_addr: String,
 
-    #[clap(long, help = "Path to the YAML schema configuration file")]
+    #[clap(long, help = "Path to the YAML schema configuration file", default_value = "schemas.yaml")]
     pub config_file: Option<PathBuf>,
 }
 
@@ -47,19 +47,17 @@ struct YamlFieldSchema {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+#[allow(non_snake_case)]
 enum YamlValue {
     Bool(bool),
     Int(i64),
     Float(f64),
-    String(String),
-    #[serde(rename = "EntityReference")]
-    EntityReference(Option<String>),
-    #[serde(rename = "EntityList")]
-    EntityList(Vec<String>),
-    #[serde(rename = "Choice")]
-    Choice(i64),
-    #[serde(rename = "Blob")]
-    Blob(Vec<u8>),
+    String { String: String },
+    EntityReference { EntityReference: Option<String> },
+    EntityList { EntityList: Vec<String> },
+    Choice { Choice: i64 },
+    Blob { Blob: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,13 +87,13 @@ impl From<YamlValue> for Value {
             YamlValue::Bool(b) => Value::Bool(b),
             YamlValue::Int(i) => Value::Int(i),
             YamlValue::Float(f) => Value::Float(f),
-            YamlValue::String(s) => Value::String(s),
-            YamlValue::EntityReference(e) => Value::EntityReference(e.and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok())),
-            YamlValue::EntityList(list) => Value::EntityList(list.into_iter()
+            YamlValue::String { String: s } => Value::String(s),
+            YamlValue::EntityReference { EntityReference: e } => Value::EntityReference(e.and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok())),
+            YamlValue::EntityList { EntityList: list } => Value::EntityList(list.into_iter()
                 .filter_map(|id| qlib_rs::EntityId::try_from(id.as_str()).ok())
                 .collect()),
-            YamlValue::Choice(c) => Value::Choice(c),
-            YamlValue::Blob(b) => Value::Blob(b),
+            YamlValue::Choice { Choice: c } => Value::Choice(c),
+            YamlValue::Blob { Blob: b } => Value::Blob(b),
         }
     }
 }
