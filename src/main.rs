@@ -58,6 +58,8 @@ enum YamlValue {
     EntityList(Vec<String>),
     #[serde(rename = "Choice")]
     Choice(i64),
+    #[serde(rename = "Blob")]
+    Blob(Vec<u8>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +95,7 @@ impl From<YamlValue> for Value {
                 .filter_map(|id| qlib_rs::EntityId::try_from(id.as_str()).ok())
                 .collect()),
             YamlValue::Choice(c) => Value::Choice(c),
+            YamlValue::Blob(b) => Value::Blob(b),
         }
     }
 }
