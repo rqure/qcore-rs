@@ -46,7 +46,7 @@ struct YamlFieldSchema {
     choices: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 enum YamlValue {
     Bool(bool),
     Int(i64),
@@ -155,7 +155,9 @@ async fn create_entity_tree(
                 requests.push(qlib_rs::Request::Write {
                     entity_id: entity_id.clone(),
                     field_type: field_name.clone().into(),
-                    value: Some(value.clone().into()),
+                    value: Some(value
+                        .clone()
+                        .into()),
                     push_condition: qlib_rs::PushCondition::Always,
                     adjust_behavior: qlib_rs::AdjustBehavior::Set,
                     write_time: None,
@@ -169,7 +171,7 @@ async fn create_entity_tree(
         
         // Process children recursively if present
         if let Some(children) = &node.children {
-            let child_entities = create_entity_tree(store, ctx, children, Some(entity_id.clone())).await?;
+            let child_entities = Box::pin(create_entity_tree(store, ctx, children, Some(entity_id.clone()))).await?;
             created_entities.extend(child_entities);
         }
         
