@@ -28,6 +28,17 @@ schemas:
     inherit: Object
     fields: {}
 
+  - entity_type: Folder
+    inherit: Object
+    fields:
+      Description:
+        default_value:
+          String: ""
+        rank: 3
+        read_permission: null
+        write_permission: null
+        choices: null
+
   - entity_type: User
     inherit: Object
     fields:
@@ -45,8 +56,32 @@ schemas:
         read_permission: null
         write_permission: null
         choices: null
-          Bool: true
-        rank: 4
-        read_permission: null
-        write_permission: null
-        choices: null
+
+tree:
+  - entity_type: Root
+    name: "Root"
+    children:
+      - entity_type: Folder
+        name: "Users"
+        attributes:
+          Description:
+            String: "Contains all user accounts"
+        children:
+          - entity_type: User
+            name: "Admin"
+            attributes:
+              Email:
+                String: "admin@example.com"
+          - entity_type: User
+            name: "Guest"
+            attributes:
+              Email:
+                String: "guest@example.com"
+      - entity_type: Folder
+        name: "System"
+        attributes:
+          Description:
+            String: "System configuration"
+        children:
+          - entity_type: Folder
+            name: "Config"

@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 mod api;
 mod app;
@@ -69,6 +70,15 @@ struct YamlEntitySchema {
 #[derive(Debug, Serialize, Deserialize)]
 struct YamlSchemaConfig {
     schemas: Vec<YamlEntitySchema>,
+    tree: Option<Vec<YamlEntityTreeNode>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct YamlEntityTreeNode {
+    entity_type: String,
+    name: String,
+    children: Option<Vec<YamlEntityTreeNode>>,
+    attributes: Option<HashMap<String, YamlValue>>,
 }
 
 impl From<YamlValue> for Value {
@@ -87,7 +97,7 @@ impl From<YamlValue> for Value {
     }
 }
 
-fn load_schemas_from_yaml(path: &PathBuf) -> Result<Vec<EntitySchema<Single>>, Box<dyn std::error::Error>> {
+fn load_schemas_from_yaml(path: &PathBuf) -> Result<(Vec<EntitySchema<Single>>, Option<Vec<YamlEntityTreeNode>>), Box<dyn std::error::Error>> {
     let mut file = File::open(path)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
@@ -121,7 +131,52 @@ fn load_schemas_from_yaml(path: &PathBuf) -> Result<Vec<EntitySchema<Single>>, B
         schemas.push(schema);
     }
     
-    Ok(schemas)
+    Ok((schemas, config.tree))
+}
+
+/// Create entities based on the tree definition
+async fn create_entity_tree(
+    store: &mut qlib_rs::Store,
+    ctx: &Context,
+    tree_nodes: &Vec<YamlEntityTreeNode>,
+    parent_id: Option<qlib_rs::EntityId>
+) -> Result<Vec<qlib_rs::EntityId>, Box<dyn std::error::Error>> {
+    let mut created_entities = Vec::new();
+    
+    for node in tree_nodes {
+        // Create the entity
+        let entity = store.create_entity(ctx, &node.entity_type.clone().into(), parent_id.clone(), &node.name)?;
+        let entity_id = entity.entity_id;
+        
+        // Set additional attributes if specified
+        if let Some(attrs) = &node.attributes {
+            let mut requests = Vec::new();
+            for (field_name, value) in attrs {
+                requests.push(qlib_rs::Request::Write {
+                    entity_id: entity_id.clone(),
+                    field_type: field_name.clone().into(),
+                    value: Some(value.clone().into()),
+                    push_condition: qlib_rs::PushCondition::Always,
+                    adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                    write_time: None,
+                    writer_id: None,
+                });
+            }
+            if !requests.is_empty() {
+                store.perform(ctx, &mut requests)?;
+            }
+        }
+        
+        // Process children recursively if present
+        if let Some(children) = &node.children {
+            let child_entities = create_entity_tree(store, ctx, children, Some(entity_id.clone())).await?;
+            created_entities.extend(child_entities);
+        }
+        
+        created_entities.push(entity_id);
+    }
+    
+    Ok(created_entities)
 }
 
 #[actix_web::main]
@@ -154,11 +209,11 @@ async fn main() -> std::io::Result<()> {
         let ctx = Context {};
         
         // Load schemas from YAML if config file is provided, otherwise use defaults
-        let schemas = if let Some(config_path) = options.config_file {
+        let (schemas, tree_nodes) = if let Some(config_path) = options.config_file {
             match load_schemas_from_yaml(&config_path) {
-                Ok(schemas) => {
+                Ok((schemas, tree_nodes)) => {
                     log::info!("Successfully loaded {} schemas from config file", schemas.len());
-                    schemas
+                    (schemas, tree_nodes)
                 },
                 Err(err) => {
                     log::error!("Failed to load schemas from config file: {}", err);
@@ -180,6 +235,19 @@ async fn main() -> std::io::Result<()> {
         for schema in schemas {
             log::info!("Setting entity schema: {}", schema.entity_type);
             store.data.set_entity_schema(&ctx, &schema).expect("Failed to set entity schema");
+        }
+
+        // Create the initial tree structure if provided
+        if let Some(tree) = tree_nodes {
+            match create_entity_tree(&mut store.data, &ctx, &tree, None).await {
+                Ok(entities) => {
+                    log::info!("Successfully created {} entities from tree definition", entities.len());
+                }
+                Err(err) => {
+                    log::error!("Failed to create entity tree: {}", err);
+                    // Continue even if tree creation fails
+                }
+            }
         }
     }
 
