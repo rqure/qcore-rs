@@ -2,21 +2,14 @@ use clap::Parser;
 use qlib_rs::{Context};
 use std::path::PathBuf;
 
-mod api;
 mod app;
-mod management;
 mod network;
-mod raft;
 mod store;
 mod config;
+mod websocket;
 
 use std::sync::Arc;
 
-use actix_web::{
-    HttpServer,
-    middleware::{self, Logger},
-    web::Data,
-};
 use openraft::Config;
 
 use crate::{app::App, network::Network, store::{LogStore, StateMachineStore}};
@@ -27,21 +20,21 @@ pub struct Opt {
     #[clap(long)]
     pub id: u64,
 
-    #[clap(long)]
-    pub http_addr: String,
+    #[clap(long, help = "WebSocket address to bind to (e.g., 127.0.0.1:8080)")]
+    pub ws_addr: String,
 
     #[clap(long, help = "Path to the YAML schema configuration file", default_value = "schemas.yaml")]
     pub config_file: Option<PathBuf>,
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     // Initialize logging
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     
     let options = Opt::parse();
     let node_id = options.id;
-    let http_addr = options.http_addr;
+    let ws_addr = options.ws_addr;
     
     // Create a configuration for the raft instance.
     let config = Config {
@@ -108,7 +101,7 @@ async fn main() -> std::io::Result<()> {
 
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
-    let network = Network {};
+    let network = Network::default();
 
     // Create a local raft instance.
     let raft = openraft::Raft::new(
@@ -122,35 +115,14 @@ async fn main() -> std::io::Result<()> {
     .unwrap();
 
     // Create an application that will store all the instances created above, this will
-    // later be used on the actix-web services.
-    let app_data = Data::new(App {
+    // later be used on the websocket services.
+    let app = Arc::new(App {
         id: node_id,
-        addr: http_addr.clone(),
+        addr: ws_addr.clone(),
         raft,
         state_machine_store,
     });
 
-    // Start the actix-web server.
-    let server = HttpServer::new(move || {
-        actix_web::App::new()
-            .wrap(Logger::default())
-            .wrap(Logger::new("%a %{User-Agent}i"))
-            .wrap(middleware::Compress::default())
-            .app_data(app_data.clone())
-            // raft internal RPC
-            .service(raft::append)
-            .service(raft::snapshot)
-            .service(raft::vote)
-            // admin API
-            .service(management::init)
-            .service(management::add_learner)
-            .service(management::change_membership)
-            .service(management::metrics)
-            // application API
-            .service(api::perform)
-    });
-
-    let x = server.bind(http_addr)?;
-
-    x.run().await
+    // Start the websocket server.
+    websocket::start_websocket_server(ws_addr, app).await
 }

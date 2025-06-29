@@ -3,6 +3,10 @@ name = "qcore-rs"
 version = "0.1.0"
 edition = "2024"
 
+[[example]]
+name = "websocket_client"
+path = "examples/websocket_client.rs"
+
 [dependencies]
 actix-web = "4.11.0"
 actix-web-actors = "4.3.1"
@@ -17,3 +21,6 @@ serde_json = "1.0.140"
 serde_yaml = "0.9.34"
 tokio = "1.45.1"
 tokio-stream = "0.1.17"
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+uuid = { version = "1.0", features = ["v4"] }
