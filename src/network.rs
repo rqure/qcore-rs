@@ -16,15 +16,119 @@ use serde::Serialize;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex, oneshot};
+use std::time::Duration;
 
 use crate::app::typ;
 use crate::app::NodeId;
 use crate::app::TypeConfig;
 use crate::websocket::WebSocketMessage;
 
+type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+struct PersistentConnection {
+    sender: Arc<Mutex<futures_util::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>>,
+    pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
+}
+
+impl PersistentConnection {
+    async fn new(addr: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("ws://{}", addr);
+        let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
+        let (ws_sender, mut ws_receiver) = ws_stream.split();
+        
+        let sender = Arc::new(Mutex::new(ws_sender));
+        let pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>> = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Spawn a task to handle incoming messages
+        let pending_requests_clone = pending_requests.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = ws_receiver.next().await {
+                match msg {
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                        if let Ok(ws_msg) = serde_json::from_str::<WebSocketMessage>(&text) {
+                            let request_id = match &ws_msg {
+                                WebSocketMessage::RaftVoteResponse { id, .. } => Some(id.clone()),
+                                WebSocketMessage::RaftAppendResponse { id, .. } => Some(id.clone()),
+                                WebSocketMessage::RaftSnapshotResponse { id, .. } => Some(id.clone()),
+                                WebSocketMessage::Error { id, .. } => Some(id.clone()),
+                                _ => None,
+                            };
+                            
+                            if let Some(id) = request_id {
+                                let mut pending = pending_requests_clone.lock().await;
+                                if let Some(sender) = pending.remove(&id) {
+                                    let response_value = serde_json::to_value(&ws_msg).unwrap_or_default();
+                                    let _ = sender.send(response_value);
+                                }
+                            }
+                        }
+                    }
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                        log::warn!("WebSocket connection closed");
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!("WebSocket error: {}", e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        
+        Ok(PersistentConnection {
+            sender,
+            pending_requests,
+        })
+    }
+    
+    async fn send_request<Resp>(&self, ws_message: WebSocketMessage, request_id: String) -> Result<Resp, Box<dyn std::error::Error + Send + Sync>>
+    where
+        Resp: DeserializeOwned,
+    {
+        let (response_sender, response_receiver) = oneshot::channel();
+        
+        // Register the pending request
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.insert(request_id.clone(), response_sender);
+        }
+        
+        // Send the message
+        let message_json = serde_json::to_string(&ws_message)?;
+        {
+            let mut sender = self.sender.lock().await;
+            sender.send(tokio_tungstenite::tungstenite::Message::Text(message_json)).await?;
+        }
+        
+        // Wait for response with timeout
+        let response = tokio::time::timeout(Duration::from_secs(30), response_receiver).await??;
+        
+        // Extract the actual response from the WebSocket message
+        match serde_json::from_value::<WebSocketMessage>(response)? {
+            WebSocketMessage::RaftVoteResponse { response, .. } => {
+                let resp_bytes = serde_json::to_vec(&response)?;
+                Ok(serde_json::from_slice::<Resp>(&resp_bytes)?)
+            }
+            WebSocketMessage::RaftAppendResponse { response, .. } => {
+                let resp_bytes = serde_json::to_vec(&response)?;
+                Ok(serde_json::from_slice::<Resp>(&resp_bytes)?)
+            }
+            WebSocketMessage::RaftSnapshotResponse { response, .. } => {
+                let resp_bytes = serde_json::to_vec(&response)?;
+                Ok(serde_json::from_slice::<Resp>(&resp_bytes)?)
+            }
+            WebSocketMessage::Error { error, .. } => {
+                Err(format!("Remote error: {}", error).into())
+            }
+            _ => Err("Unexpected response type".into()),
+        }
+    }
+}
+
 pub struct Network {
-    connections: Arc<RwLock<HashMap<NodeId, tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>>,
+    connections: Arc<RwLock<HashMap<NodeId, Arc<PersistentConnection>>>>,
 }
 
 impl Default for Network {
@@ -36,9 +140,30 @@ impl Default for Network {
 }
 
 impl Network {
+    async fn get_or_create_connection(&self, target: NodeId, addr: &str) -> Result<Arc<PersistentConnection>, Box<dyn std::error::Error + Send + Sync>> {
+        // First try to get existing connection
+        {
+            let connections = self.connections.read().await;
+            if let Some(conn) = connections.get(&target) {
+                return Ok(conn.clone());
+            }
+        }
+        
+        // Create new connection
+        let new_conn = Arc::new(PersistentConnection::new(addr).await?);
+        
+        // Store the connection
+        {
+            let mut connections = self.connections.write().await;
+            connections.insert(target, new_conn.clone());
+        }
+        
+        Ok(new_conn)
+    }
+
     pub async fn send_rpc<Req, Resp, Err>(
         &self,
-        _target: NodeId,
+        target: NodeId,
         target_node: &BasicNode,
         uri: &str,
         req: Req,
@@ -48,118 +173,74 @@ impl Network {
         Err: std::error::Error + DeserializeOwned + Send + 'static,
         Resp: DeserializeOwned + Send + 'static,
     {
-        // For WebSocket communication, we'll use a simplified approach
-        // In a real implementation, you might want to maintain persistent connections
         let addr = &target_node.addr;
-        let url = format!("ws://{}", addr);
-
-        match tokio_tungstenite::connect_async(url).await {
-            Ok((ws_stream, _)) => {
-                let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-                
-                // Create a unique ID for this request
-                let request_id = uuid::Uuid::new_v4().to_string();
-                
-                // Create the appropriate WebSocket message based on the URI
-                let ws_message = match uri {
-                    "raft/vote" => {
-                        if let Ok(vote_req) = serde_json::from_str::<VoteRequest<NodeId>>(&serde_json::to_string(&req).unwrap()) {
-                            WebSocketMessage::RaftVote {
-                                id: request_id.clone(),
-                                request: vote_req,
-                            }
-                        } else {
-                            return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to serialize vote request"))));
-                        }
-                    }
-                    "raft/append" => {
-                        if let Ok(append_req) = serde_json::from_str::<AppendEntriesRequest<TypeConfig>>(&serde_json::to_string(&req).unwrap()) {
-                            WebSocketMessage::RaftAppend {
-                                id: request_id.clone(),
-                                request: append_req,
-                            }
-                        } else {
-                            return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to serialize append request"))));
-                        }
-                    }
-                    "raft/snapshot" => {
-                        if let Ok(snapshot_req) = serde_json::from_str::<InstallSnapshotRequest<TypeConfig>>(&serde_json::to_string(&req).unwrap()) {
-                            WebSocketMessage::RaftSnapshot {
-                                id: request_id.clone(),
-                                request: snapshot_req,
-                            }
-                        } else {
-                            return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to serialize snapshot request"))));
-                        }
-                    }
-                    _ => {
-                        return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unknown RPC endpoint"))));
-                    }
-                };
-
-                // Send the request
-                let message_json = serde_json::to_string(&ws_message)
-                    .map_err(|e| openraft::error::RPCError::Network(NetworkError::new(&e)))?;
-                
-                ws_sender.send(tokio_tungstenite::tungstenite::Message::Text(message_json)).await
-                    .map_err(|e| openraft::error::RPCError::Network(NetworkError::new(&e)))?;
-
-                // Wait for response
-                while let Some(msg) = ws_receiver.next().await {
-                    match msg {
-                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                            if let Ok(ws_msg) = serde_json::from_str::<WebSocketMessage>(&text) {
-                                match ws_msg {
-                                    WebSocketMessage::RaftVoteResponse { id, response } if id == request_id => {
-                                        if let Ok(resp_bytes) = serde_json::to_vec(&response) {
-                                            if let Ok(typed_response) = serde_json::from_slice::<Resp>(&resp_bytes) {
-                                                return Ok(typed_response);
-                                            }
-                                        }
-                                        return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize response"))));
-                                    }
-                                    WebSocketMessage::RaftAppendResponse { id, response } if id == request_id => {
-                                        if let Ok(resp_bytes) = serde_json::to_vec(&response) {
-                                            if let Ok(typed_response) = serde_json::from_slice::<Resp>(&resp_bytes) {
-                                                return Ok(typed_response);
-                                            }
-                                        }
-                                        return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize response"))));
-                                    }
-                                    WebSocketMessage::RaftSnapshotResponse { id, response } if id == request_id => {
-                                        if let Ok(resp_bytes) = serde_json::to_vec(&response) {
-                                            if let Ok(typed_response) = serde_json::from_slice::<Resp>(&resp_bytes) {
-                                                return Ok(typed_response);
-                                            }
-                                        }
-                                        return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to deserialize response"))));
-                                    }
-                                    WebSocketMessage::Error { error, .. } => {
-                                        return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::Other, error))));
-                                    }
-                                    _ => continue, // Ignore other messages
-                                }
-                            }
-                        }
-                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                            return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "WebSocket connection closed"))));
-                        }
-                        Err(e) => {
-                            return Err(openraft::error::RPCError::Network(NetworkError::new(&e)));
-                        }
-                        _ => continue,
-                    }
-                }
-
-                Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "No response received"))))
-            }
+        
+        // Get or create persistent connection
+        let connection = match self.get_or_create_connection(target, addr).await {
+            Ok(conn) => conn,
             Err(e) => {
-                // If the error is a connection error, we return `Unreachable` so that connection isn't retried
-                // immediately.
-                if e.to_string().contains("connect") {
-                    return Err(openraft::error::RPCError::Unreachable(Unreachable::new(&e)));
+                let error_msg = e.to_string();
+                if error_msg.contains("connect") {
+                    return Err(openraft::error::RPCError::Unreachable(Unreachable::new(&std::io::Error::new(std::io::ErrorKind::ConnectionRefused, error_msg))));
                 }
-                Err(openraft::error::RPCError::Network(NetworkError::new(&e)))
+                return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::Other, error_msg))));
+            }
+        };
+        
+        // Create a unique ID for this request
+        let request_id = uuid::Uuid::new_v4().to_string();
+        
+        // Create the appropriate WebSocket message based on the URI
+        let ws_message = match uri {
+            "raft/vote" => {
+                if let Ok(vote_req) = serde_json::from_str::<VoteRequest<NodeId>>(&serde_json::to_string(&req).unwrap()) {
+                    WebSocketMessage::RaftVote {
+                        id: request_id.clone(),
+                        request: vote_req,
+                    }
+                } else {
+                    return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to serialize vote request"))));
+                }
+            }
+            "raft/append" => {
+                if let Ok(append_req) = serde_json::from_str::<AppendEntriesRequest<TypeConfig>>(&serde_json::to_string(&req).unwrap()) {
+                    WebSocketMessage::RaftAppend {
+                        id: request_id.clone(),
+                        request: append_req,
+                    }
+                } else {
+                    return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to serialize append request"))));
+                }
+            }
+            "raft/snapshot" => {
+                if let Ok(snapshot_req) = serde_json::from_str::<InstallSnapshotRequest<TypeConfig>>(&serde_json::to_string(&req).unwrap()) {
+                    WebSocketMessage::RaftSnapshot {
+                        id: request_id.clone(),
+                        request: snapshot_req,
+                    }
+                } else {
+                    return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to serialize snapshot request"))));
+                }
+            }
+            _ => {
+                return Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unknown RPC endpoint"))));
+            }
+        };
+
+        // Send the request using the persistent connection
+        match connection.send_request::<Resp>(ws_message, request_id).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                // Remove the failed connection so it can be recreated next time
+                let mut connections = self.connections.write().await;
+                connections.remove(&target);
+                
+                let error_msg = e.to_string();
+                if error_msg.contains("connect") || error_msg.contains("timeout") {
+                    Err(openraft::error::RPCError::Unreachable(Unreachable::new(&std::io::Error::new(std::io::ErrorKind::TimedOut, error_msg))))
+                } else {
+                    Err(openraft::error::RPCError::Network(NetworkError::new(&std::io::Error::new(std::io::ErrorKind::Other, error_msg))))
+                }
             }
         }
     }
