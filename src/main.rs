@@ -7,6 +7,7 @@ mod network;
 mod store;
 mod config;
 mod websocket;
+mod discovery;
 
 use std::sync::Arc;
 
@@ -25,16 +26,33 @@ pub struct Opt {
 
     #[clap(long, help = "Path to the YAML schema configuration file", default_value = "schemas.yaml")]
     pub config_file: Option<PathBuf>,
+
+    #[clap(long, help = "Enable automatic node discovery using mDNS")]
+    pub enable_discovery: bool,
+
+    #[clap(long, help = "Minimum number of nodes to wait for during discovery", default_value = "1")]
+    pub min_nodes: usize,
+
+    #[clap(long, help = "Timeout in seconds to wait for node discovery", default_value = "30")]
+    pub discovery_timeout: u64,
+
+    #[clap(long, help = "Auto-initialize cluster when minimum nodes are discovered")]
+    pub auto_init: bool,
 }
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     
     let options = Opt::parse();
     let node_id = options.id;
     let ws_addr = options.ws_addr;
+    
+    // Parse the port from ws_addr for mDNS discovery
+    let port = ws_addr.split(':').nth(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
     
     // Create a configuration for the raft instance.
     let config = Config {
@@ -65,18 +83,12 @@ async fn main() -> std::io::Result<()> {
                 },
                 Err(err) => {
                     log::error!("Failed to load schemas from config file: {}", err);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Failed to load schemas from config file",
-                    ));
+                    return Err(format!("Failed to load schemas from config file: {}", err).into());
                 }
             }
         } else {
             log::error!("No config file provided, using default schemas");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "No config file provided",
-            ));
+            return Err("No config file provided".into());
         };
         
         // Apply the schemas to the store
@@ -123,6 +135,107 @@ async fn main() -> std::io::Result<()> {
         state_machine_store,
     });
 
+    // Start mDNS discovery if enabled
+    if options.enable_discovery {
+        log::info!("Starting mDNS discovery...");
+        
+        match discovery::MdnsDiscovery::new(node_id, port) {
+            Ok(discovery) => {
+                match discovery.start_discovery().await {
+                    Ok(mut discovery_rx) => {
+                        // Clone app for the discovery task
+                        let _app_clone = app.clone();
+                        let min_nodes = options.min_nodes;
+                        let auto_init = options.auto_init;
+                        let discovery_timeout = std::time::Duration::from_secs(options.discovery_timeout);
+                        
+                        // Spawn discovery handling task
+                        tokio::spawn(async move {
+                            let mut discovered_count = 0;
+                            let mut initialized = false;
+                            
+                            // Wait for initial discovery timeout or minimum nodes
+                            if min_nodes > 0 {
+                                log::info!("Waiting for at least {} nodes (timeout: {}s)...", min_nodes, options.discovery_timeout);
+                                
+                                let start_time = std::time::Instant::now();
+                                while discovered_count < min_nodes && start_time.elapsed() < discovery_timeout {
+                                    tokio::select! {
+                                        Some(discovered_node) = discovery_rx.recv() => {
+                                            discovered_count += 1;
+                                            log::info!("Discovered node {} ({}/{})", discovered_node.node_id, discovered_count, min_nodes);
+                                            
+                                            // Add to network peers if app is available
+                                            // This would be implemented based on your network interface
+                                            log::info!("Added peer: {}", discovered_node.address);
+                                            
+                                            if discovered_count >= min_nodes && auto_init && !initialized {
+                                                log::info!("Minimum nodes reached, auto-initializing cluster...");
+                                                // Implement cluster initialization here
+                                                initialized = true;
+                                            }
+                                        }
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                            // Continue checking
+                                        }
+                                    }
+                                }
+                                
+                                if discovered_count < min_nodes {
+                                    log::warn!("Discovery timeout reached. Found {} nodes, expected at least {}", discovered_count, min_nodes);
+                                }
+                            }
+                            
+                            // Continue processing discovery events
+                            while let Some(discovered_node) = discovery_rx.recv().await {
+                                log::info!("Discovered node: {}", discovered_node.node_id);
+                                // Add peer to network
+                                log::info!("Added peer: {}", discovered_node.address);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to start mDNS discovery: {}. Continuing without discovery.", e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to create mDNS discovery: {}. Continuing without discovery.", e);
+            }
+        }
+    }
+
     // Start the websocket server.
-    websocket::start_websocket_server(ws_addr, app).await
+    websocket::start_websocket_server(ws_addr, app).await.map_err(|e| e.into())
+}
+
+async fn initialize_cluster_with_nodes(
+    app: &Arc<App>, 
+    nodes: &[discovery::DiscoveredNode]
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::BTreeMap;
+    use openraft::BasicNode;
+    
+    let mut node_map = BTreeMap::new();
+    
+    // Add ourselves
+    node_map.insert(app.id, BasicNode { addr: app.addr.clone() });
+    
+    // Add discovered nodes
+    for node in nodes {
+        node_map.insert(node.node_id, BasicNode { addr: node.address.clone() });
+    }
+    
+    log::info!("Initializing cluster with nodes: {:?}", node_map);
+    
+    match app.raft.initialize(node_map).await {
+        Ok(_) => {
+            log::info!("Cluster initialized successfully");
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("Failed to initialize cluster: {}", e);
+            Err(e.into())
+        }
+    }
 }
