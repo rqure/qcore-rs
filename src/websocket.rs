@@ -1,9 +1,9 @@
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::app::App;
@@ -37,7 +37,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<openraft::raft::InstallSnapshotResponse<u64>, String>,
     },
-    
+
     // Management API messages
     Init {
         id: String,
@@ -71,7 +71,7 @@ pub enum WebSocketMessage {
         id: String,
         response: openraft::RaftMetrics<u64, openraft::BasicNode>,
     },
-    
+
     // Application API messages
     Perform {
         id: String,
@@ -81,7 +81,7 @@ pub enum WebSocketMessage {
         id: String,
         response: CommandResponse,
     },
-    
+
     // Connection management
     Error {
         id: String,
@@ -103,7 +103,7 @@ pub async fn start_websocket_server(addr: String, app: Arc<App>) -> std::io::Res
 
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, app: Arc<App>) {
     log::info!("New WebSocket connection from: {}", addr);
-    
+
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -116,36 +116,34 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, app: Arc<App>) {
 
     while let Some(msg) = ws_receiver.next().await {
         match msg {
-            Ok(Message::Text(text)) => {
-                match serde_json::from_str::<WebSocketMessage>(&text) {
-                    Ok(ws_msg) => {
-                        let response = handle_websocket_message(ws_msg, &app).await;
-                        if let Some(response_msg) = response {
-                            match serde_json::to_string(&response_msg) {
-                                Ok(response_text) => {
-                                    if let Err(e) = ws_sender.send(Message::Text(response_text)).await {
-                                        log::error!("Failed to send WebSocket response: {}", e);
-                                        break;
-                                    }
+            Ok(Message::Text(text)) => match serde_json::from_str::<WebSocketMessage>(&text) {
+                Ok(ws_msg) => {
+                    let response = handle_websocket_message(ws_msg, &app).await;
+                    if let Some(response_msg) = response {
+                        match serde_json::to_string(&response_msg) {
+                            Ok(response_text) => {
+                                if let Err(e) = ws_sender.send(Message::Text(response_text)).await {
+                                    log::error!("Failed to send WebSocket response: {}", e);
+                                    break;
                                 }
-                                Err(e) => {
-                                    log::error!("Failed to serialize response: {}", e);
-                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to serialize response: {}", e);
                             }
                         }
                     }
-                    Err(e) => {
-                        log::error!("Failed to parse WebSocket message: {}", e);
-                        let error_msg = WebSocketMessage::Error {
-                            id: Uuid::new_v4().to_string(),
-                            error: format!("Failed to parse message: {}", e),
-                        };
-                        if let Ok(error_text) = serde_json::to_string(&error_msg) {
-                            let _ = ws_sender.send(Message::Text(error_text)).await;
-                        }
+                }
+                Err(e) => {
+                    log::error!("Failed to parse WebSocket message: {}", e);
+                    let error_msg = WebSocketMessage::Error {
+                        id: Uuid::new_v4().to_string(),
+                        error: format!("Failed to parse message: {}", e),
+                    };
+                    if let Ok(error_text) = serde_json::to_string(&error_msg) {
+                        let _ = ws_sender.send(Message::Text(error_text)).await;
                     }
                 }
-            }
+            },
             Ok(Message::Binary(_)) => {
                 log::warn!("Received binary message, ignoring");
             }
@@ -164,33 +162,50 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, app: Arc<App>) {
     log::info!("WebSocket connection closed: {}", addr);
 }
 
-async fn handle_websocket_message(msg: WebSocketMessage, app: &Arc<App>) -> Option<WebSocketMessage> {
+async fn handle_websocket_message(
+    msg: WebSocketMessage,
+    app: &Arc<App>,
+) -> Option<WebSocketMessage> {
     match msg {
         // Raft internal messages
         WebSocketMessage::RaftVote { id, request } => {
             let response = app.raft.vote(request).await;
             let simplified_response = response.map_err(|e| e.to_string());
-            Some(WebSocketMessage::RaftVoteResponse { id, response: simplified_response })
+            Some(WebSocketMessage::RaftVoteResponse {
+                id,
+                response: simplified_response,
+            })
         }
         WebSocketMessage::RaftAppend { id, request } => {
             let response = app.raft.append_entries(request).await;
             let simplified_response = response.map_err(|e| e.to_string());
-            Some(WebSocketMessage::RaftAppendResponse { id, response: simplified_response })
+            Some(WebSocketMessage::RaftAppendResponse {
+                id,
+                response: simplified_response,
+            })
         }
         WebSocketMessage::RaftSnapshot { id, request } => {
             let response = app.raft.install_snapshot(request).await;
             let simplified_response = response.map_err(|e| e.to_string());
-            Some(WebSocketMessage::RaftSnapshotResponse { id, response: simplified_response })
+            Some(WebSocketMessage::RaftSnapshotResponse {
+                id,
+                response: simplified_response,
+            })
         }
-        
+
         // Management API messages
         WebSocketMessage::Init { id, nodes } => {
-            use std::collections::BTreeMap;
             use openraft::BasicNode;
-            
+            use std::collections::BTreeMap;
+
             let mut node_map = BTreeMap::new();
             if nodes.is_empty() {
-                node_map.insert(app.id, BasicNode { addr: app.addr.clone() });
+                node_map.insert(
+                    app.id,
+                    BasicNode {
+                        addr: app.addr.clone(),
+                    },
+                );
             } else {
                 for (node_id, addr) in nodes {
                     node_map.insert(node_id, BasicNode { addr });
@@ -198,31 +213,51 @@ async fn handle_websocket_message(msg: WebSocketMessage, app: &Arc<App>) -> Opti
             }
             let response = app.raft.initialize(node_map).await;
             let simplified_response = response.map(|_| ()).map_err(|e| e.to_string());
-            Some(WebSocketMessage::InitResponse { id, response: simplified_response })
+            Some(WebSocketMessage::InitResponse {
+                id,
+                response: simplified_response,
+            })
         }
-        WebSocketMessage::AddLearner { id, node_id, node_addr } => {
+        WebSocketMessage::AddLearner {
+            id,
+            node_id,
+            node_addr,
+        } => {
             use openraft::BasicNode;
             let node = BasicNode { addr: node_addr };
             let response = app.raft.add_learner(node_id, node, true).await;
-            let simplified_response = response.map(|_| "Success".to_string()).map_err(|e| e.to_string());
-            Some(WebSocketMessage::AddLearnerResponse { id, response: simplified_response })
+            let simplified_response = response
+                .map(|_| "Success".to_string())
+                .map_err(|e| e.to_string());
+            Some(WebSocketMessage::AddLearnerResponse {
+                id,
+                response: simplified_response,
+            })
         }
         WebSocketMessage::ChangeMembership { id, members } => {
             let response = app.raft.change_membership(members, false).await;
-            let simplified_response = response.map(|_| "Success".to_string()).map_err(|e| e.to_string());
-            Some(WebSocketMessage::ChangeMembershipResponse { id, response: simplified_response })
+            let simplified_response = response
+                .map(|_| "Success".to_string())
+                .map_err(|e| e.to_string());
+            Some(WebSocketMessage::ChangeMembershipResponse {
+                id,
+                response: simplified_response,
+            })
         }
         WebSocketMessage::GetMetrics { id } => {
             let metrics = app.raft.metrics().borrow().clone();
-            Some(WebSocketMessage::GetMetricsResponse { id, response: metrics })
+            Some(WebSocketMessage::GetMetricsResponse {
+                id,
+                response: metrics,
+            })
         }
-        
+
         // Application API messages
         WebSocketMessage::Perform { id, request } => {
             let response = handle_perform_request(request, app).await;
             Some(WebSocketMessage::PerformResponse { id, response })
         }
-        
+
         // Response messages don't need handling here as they're sent by the client
         _ => None,
     }
@@ -231,23 +266,17 @@ async fn handle_websocket_message(msg: WebSocketMessage, app: &Arc<App>) -> Opti
 async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandResponse {
     // Check if it's a read-only request (UpdateEntity with only Read requests)
     if let CommandRequest::UpdateEntity { request } = &req {
-        if request.iter().all(|r| matches!(r, qlib_rs::Request::Read { .. })) {
-            let ret = app.raft.ensure_linearizable().await;
-            return match ret {
-                Ok(_) => {
-                    let mut store_req = request.clone();
-                    let mut state_machine = app.state_machine_store.state_machine.write().await;
-                    match state_machine.data.perform(&Context {}, &mut store_req) {
-                        Ok(_) => CommandResponse::UpdateEntity {
-                            response: store_req,
-                            error: None,
-                        },
-                        Err(e) => CommandResponse::UpdateEntity {
-                            response: vec![],
-                            error: Some(e.to_string()),
-                        },
-                    }
-                }
+        if request
+            .iter()
+            .all(|r| matches!(r, qlib_rs::Request::Read { .. }))
+        {
+            let mut store_req = request.clone();
+            let mut state_machine = app.state_machine_store.state_machine.write().await;
+            return match state_machine.data.perform(&Context {}, &mut store_req) {
+                Ok(_) => CommandResponse::UpdateEntity {
+                    response: store_req,
+                    error: None,
+                },
                 Err(e) => CommandResponse::UpdateEntity {
                     response: vec![],
                     error: Some(e.to_string()),
@@ -257,21 +286,15 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
     }
 
     if let CommandRequest::GetSchema { entity_type } = &req {
-        let ret = app.raft.ensure_linearizable().await;
-        return match ret {
-            Ok(_) => {
-                let state_machine = app.state_machine_store.state_machine.read().await;
-                match state_machine.data.get_entity_schema(&Context {}, entity_type) {
-                    Ok(schema) => CommandResponse::GetSchema {
-                        response: Some(schema),
-                        error: None,
-                    },
-                    Err(e) => CommandResponse::GetSchema {
-                        response: None,
-                        error: Some(e.to_string()),
-                    },
-                }
-            }
+        let state_machine = app.state_machine_store.state_machine.read().await;
+        return match state_machine
+            .data
+            .get_entity_schema(&Context {}, entity_type)
+        {
+            Ok(schema) => CommandResponse::GetSchema {
+                response: Some(schema),
+                error: None,
+            },
             Err(e) => CommandResponse::GetSchema {
                 response: None,
                 error: Some(e.to_string()),
@@ -280,21 +303,15 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
     }
 
     if let CommandRequest::GetCompleteSchema { entity_type } = &req {
-        let ret = app.raft.ensure_linearizable().await;
-        return match ret {
-            Ok(_) => {
-                let state_machine = app.state_machine_store.state_machine.read().await;
-                match state_machine.data.get_complete_entity_schema(&Context {}, entity_type) {
-                    Ok(schema) => CommandResponse::GetCompleteSchema {
-                        response: Some(schema),
-                        error: None,
-                    },
-                    Err(e) => CommandResponse::GetCompleteSchema {
-                        response: None,
-                        error: Some(e.to_string()),
-                    },
-                }
-            }
+        let state_machine = app.state_machine_store.state_machine.read().await;
+        return match state_machine
+            .data
+            .get_complete_entity_schema(&Context {}, entity_type)
+        {
+            Ok(schema) => CommandResponse::GetCompleteSchema {
+                response: Some(schema),
+                error: None,
+            },
             Err(e) => CommandResponse::GetCompleteSchema {
                 response: None,
                 error: Some(e.to_string()),
