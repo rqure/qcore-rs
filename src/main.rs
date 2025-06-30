@@ -174,17 +174,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         match discovery::MdnsDiscovery::new(node_id, port) {
             Ok(discovery) => {
+                let discovery = Arc::new(discovery);
                 match discovery.start_discovery().await {
                     Ok(mut discovery_rx) => {
                         // Clone app for the discovery task
-                        let _app_clone = app.clone();
+                        let app_clone = app.clone();
                         let min_nodes = options.min_nodes;
                         let auto_init = options.auto_init;
                         let discovery_timeout = std::time::Duration::from_secs(options.discovery_timeout);
                         
                         // Spawn discovery handling task
                         tokio::spawn(async move {
-                            let mut discovered_count = 0;
+                            let mut discovered_nodes = Vec::new();
                             let mut initialized = false;
                             
                             // Wait for initial discovery timeout or minimum nodes
@@ -192,20 +193,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 log::info!("Waiting for at least {} nodes (timeout: {}s)...", min_nodes, options.discovery_timeout);
                                 
                                 let start_time = std::time::Instant::now();
-                                while discovered_count < min_nodes && start_time.elapsed() < discovery_timeout {
+                                while discovered_nodes.len() < min_nodes && start_time.elapsed() < discovery_timeout {
                                     tokio::select! {
                                         Some(discovered_node) = discovery_rx.recv() => {
-                                            discovered_count += 1;
-                                            log::info!("Discovered node {} ({}/{})", discovered_node.node_id, discovered_count, min_nodes);
+                                            discovered_nodes.push(discovered_node.clone());
+                                            log::info!("Discovered node {} ({}/{})", discovered_node.node_id, discovered_nodes.len(), min_nodes);
                                             
-                                            // Add to network peers if app is available
-                                            // This would be implemented based on your network interface
-                                            log::info!("Added peer: {}", discovered_node.address);
-                                            
-                                            if discovered_count >= min_nodes && auto_init && !initialized {
+                                            if discovered_nodes.len() >= min_nodes && auto_init && !initialized {
                                                 log::info!("Minimum nodes reached, auto-initializing cluster...");
-                                                // Implement cluster initialization here
-                                                initialized = true;
+                                                if let Err(e) = initialize_cluster_with_nodes(&app_clone, &discovered_nodes).await {
+                                                    log::error!("Failed to initialize cluster: {}", e);
+                                                } else {
+                                                    log::info!("Cluster initialized successfully");
+                                                    initialized = true;
+                                                }
                                             }
                                         }
                                         _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
@@ -214,16 +215,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 
-                                if discovered_count < min_nodes {
-                                    log::warn!("Discovery timeout reached. Found {} nodes, expected at least {}", discovered_count, min_nodes);
+                                if discovered_nodes.len() < min_nodes {
+                                    log::warn!("Discovery timeout reached. Found {} nodes, expected at least {}", discovered_nodes.len(), min_nodes);
+                                    if auto_init && !initialized && !discovered_nodes.is_empty() {
+                                        log::info!("Auto-initializing cluster with available nodes...");
+                                        if let Err(e) = initialize_cluster_with_nodes(&app_clone, &discovered_nodes).await {
+                                            log::error!("Failed to initialize cluster: {}", e);
+                                        } else {
+                                            log::info!("Cluster initialized successfully with available nodes");
+                                            initialized = true;
+                                        }
+                                    }
                                 }
+                            } else {
+                                // No minimum nodes required, just listen for discoveries
+                                log::info!("Discovery enabled with no minimum node requirement");
                             }
                             
                             // Continue processing discovery events
                             while let Some(discovered_node) = discovery_rx.recv().await {
-                                log::info!("Discovered node: {}", discovered_node.node_id);
-                                // Add peer to network
-                                log::info!("Added peer: {}", discovered_node.address);
+                                log::info!("Discovered new node: {}", discovered_node.node_id);
+                                discovered_nodes.push(discovered_node);
+                                
+                                // If auto-init is enabled and we haven't initialized yet, try to initialize
+                                if auto_init && !initialized && discovered_nodes.len() >= 1 {
+                                    log::info!("Auto-initializing cluster with {} discovered nodes...", discovered_nodes.len());
+                                    if let Err(e) = initialize_cluster_with_nodes(&app_clone, &discovered_nodes).await {
+                                        log::error!("Failed to initialize cluster: {}", e);
+                                    } else {
+                                        log::info!("Cluster initialized successfully");
+                                        initialized = true;
+                                    }
+                                }
                             }
                         });
                     }
@@ -252,12 +275,17 @@ async fn initialize_cluster_with_nodes(
     
     let mut node_map = BTreeMap::new();
     
-    // Add ourselves
-    node_map.insert(app.id, BasicNode { addr: app.addr.clone() });
+    // Add ourselves - just use the port part since we're using WebSocket addresses
+    let our_port = app.addr.split(':').nth(1).unwrap_or("8080");
+    let our_local_addr = format!("127.0.0.1:{}", our_port);
+    node_map.insert(app.id, BasicNode { addr: our_local_addr });
     
-    // Add discovered nodes
+    // Add discovered nodes using localhost addresses for consistency
     for node in nodes {
-        node_map.insert(node.node_id, BasicNode { addr: node.address.clone() });
+        // Convert the discovered address to use localhost
+        let port = node.address.split(':').nth(1).unwrap_or("8080");
+        let local_addr = format!("127.0.0.1:{}", port);
+        node_map.insert(node.node_id, BasicNode { addr: local_addr });
     }
     
     log::info!("Initializing cluster with nodes: {:?}", node_map);

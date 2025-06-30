@@ -31,9 +31,8 @@ impl MdnsDiscovery {
     pub fn new(node_id: NodeId, port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let daemon = ServiceDaemon::new()?;
         let _hostname = hostname::get()
-            .unwrap_or_else(|_| format!("qcore-node-{}", node_id).into())
-            .to_string_lossy()
-            .to_string();
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| format!("qcore-node-{}", node_id));
         
         let service_name = format!("qcore-node-{}", node_id);
         
@@ -81,7 +80,7 @@ impl MdnsDiscovery {
         // Get local IP address
         let local_ip = Self::get_local_ip()?;
         
-        // Create service info
+        // Create service info with TXT records containing node metadata
         let properties = HashMap::from([
             ("node_id".to_string(), self.node_id.to_string()),
             ("version".to_string(), "1.0".to_string()),
@@ -118,28 +117,29 @@ impl MdnsDiscovery {
                     if let Some(val) = node_id_prop.val() {
                         if let Ok(node_id_str) = std::str::from_utf8(val) {
                             if let Ok(node_id) = node_id_str.parse::<NodeId>() {
-                        // Don't discover ourselves
-                        if node_id == our_node_id {
-                            return Ok(());
-                        }
-                        
-                        let discovered_node = DiscoveredNode {
-                            node_id,
-                            address: format!("{}:{}", info.get_addresses().iter().next().unwrap_or(&IpAddr::V4(Ipv4Addr::LOCALHOST)), info.get_port()),
-                            hostname: info.get_hostname().to_string(),
-                            port: info.get_port(),
-                        };
-                        
-                        // Add to discovered nodes
-                        {
-                            let mut nodes = discovered_nodes.write().await;
-                            nodes.insert(node_id, discovered_node.clone());
-                        }
-                        
-                        // Notify listeners
-                        if let Err(e) = tx.send(discovered_node.clone()).await {
-                            log::warn!("Failed to send discovered node notification: {}", e);
-                        }                            log::info!("Discovered node: {} at {}", node_id, discovered_node.address);
+                                // Don't discover ourselves
+                                if node_id == our_node_id {
+                                    return Ok(());
+                                }
+                                
+                                let discovered_node = DiscoveredNode {
+                                    node_id,
+                                    address: format!("{}:{}", info.get_addresses().iter().next().unwrap_or(&IpAddr::V4(Ipv4Addr::LOCALHOST)), info.get_port()),
+                                    hostname: info.get_hostname().to_string(),
+                                    port: info.get_port(),
+                                };
+                                
+                                // Add to discovered nodes
+                                {
+                                    let mut nodes = discovered_nodes.write().await;
+                                    nodes.insert(node_id, discovered_node.clone());
+                                }
+                                
+                                // Notify listeners
+                                if let Err(e) = tx.send(discovered_node.clone()).await {
+                                    log::warn!("Failed to send discovered node notification: {}", e);
+                                }
+                                log::info!("Discovered node: {} at {}", node_id, discovered_node.address);
                             }
                         }
                     }
