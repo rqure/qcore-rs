@@ -99,6 +99,16 @@ pub fn load_schemas_from_yaml(path: &PathBuf) -> Result<(Vec<EntitySchema<Single
         schemas.push(schema);
     }
     
+    // Sort schemas by dependency order - base schemas (no inheritance) first
+    schemas.sort_by(|a, b| {
+        match (&a.inherit, &b.inherit) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,    // Base schemas first
+            (Some(_), None) => std::cmp::Ordering::Greater, // Inherited schemas later
+            (Some(_), Some(_)) => std::cmp::Ordering::Equal, // Keep relative order for inherited schemas
+        }
+    });
+    
     Ok((schemas, config.tree))
 }
 
@@ -110,10 +120,17 @@ pub async fn create_entity_tree(
     parent_id: Option<qlib_rs::EntityId>
 ) -> Result<Vec<qlib_rs::EntityId>, Box<dyn std::error::Error>> {
     let mut created_entities = Vec::new();
+    let mut work_queue = Vec::new();
     
+    // Initialize work queue with root nodes
     for node in tree_nodes {
+        work_queue.push((node, parent_id.clone()));
+    }
+    
+    // Process nodes iteratively to avoid async recursion issues
+    while let Some((node, current_parent_id)) = work_queue.pop() {
         // Create the entity
-        let entity = store.create_entity(ctx, &node.entity_type.clone().into(), parent_id.clone(), &node.name)?;
+        let entity = store.create_entity(ctx, &node.entity_type.clone().into(), current_parent_id, &node.name)?;
         let entity_id = entity.entity_id;
         
         // Set additional attributes if specified
@@ -123,9 +140,7 @@ pub async fn create_entity_tree(
                 requests.push(qlib_rs::Request::Write {
                     entity_id: entity_id.clone(),
                     field_type: field_name.clone().into(),
-                    value: Some(value
-                        .clone()
-                        .into()),
+                    value: Some(value.clone().into()),
                     push_condition: qlib_rs::PushCondition::Always,
                     adjust_behavior: qlib_rs::AdjustBehavior::Set,
                     write_time: None,
@@ -137,10 +152,11 @@ pub async fn create_entity_tree(
             }
         }
         
-        // Process children recursively if present
+        // Add children to work queue for processing
         if let Some(children) = &node.children {
-            let child_entities = Box::pin(create_entity_tree(store, ctx, children, Some(entity_id.clone()))).await?;
-            created_entities.extend(child_entities);
+            for child in children {
+                work_queue.push((child, Some(entity_id.clone())));
+            }
         }
         
         created_entities.push(entity_id);

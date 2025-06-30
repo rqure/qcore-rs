@@ -92,13 +92,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         
         // Apply the schemas to the store
-        for schema in schemas {
-            log::info!("Setting entity schema: {}", schema.entity_type);
-            store.data.set_entity_schema(&ctx, &schema).expect("Failed to set entity schema");
+        for (index, schema) in schemas.iter().enumerate() {
+            log::info!("Setting entity schema: {} ({}/{})", schema.entity_type, index + 1, schemas.len());
+            log::debug!("About to set schema for entity type: {}", schema.entity_type);
+            log::debug!("Schema details: inherit={:?}, fields_count={}", 
+                       schema.inherit, schema.fields.len());
+            
+            // Try to set the schema with error handling and timeout
+            let schema_future = async {
+                store.data.set_entity_schema(&ctx, &schema)
+            };
+            
+            match tokio::time::timeout(std::time::Duration::from_secs(5), schema_future).await {
+                Ok(Ok(_)) => {
+                    log::debug!("Successfully set schema for entity type: {}", schema.entity_type);
+                }
+                Ok(Err(e)) => {
+                    log::error!("Failed to set schema for entity type {}: {:?}", schema.entity_type, e);
+                    return Err(format!("Failed to set schema for entity type {}: {:?}", schema.entity_type, e).into());
+                }
+                Err(_) => {
+                    log::error!("Timeout setting schema for entity type: {}", schema.entity_type);
+                    return Err(format!("Timeout setting schema for entity type: {}", schema.entity_type).into());
+                }
+            }
         }
 
+        log::info!("Schemas applied successfully");
+        
         // Create the initial tree structure if provided
         if let Some(tree) = tree_nodes {
+            log::info!("Creating entity tree structure...");
             match config::create_entity_tree(&mut store.data, &ctx, &tree, None).await {
                 Ok(entities) => {
                     log::info!("Successfully created {} entities from tree definition", entities.len());
@@ -108,14 +132,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Continue even if tree creation fails
                 }
             }
+        } else {
+            log::info!("No tree nodes to create");
         }
     }
 
+    log::info!("Creating network layer...");
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
     let network = Network::default();
 
+    log::info!("Creating raft instance...");
     // Create a local raft instance.
+    log::debug!("Calling Raft::new with node_id={}, config={:?}", node_id, config);
     let raft = openraft::Raft::new(
         node_id,
         config.clone(),
@@ -125,7 +154,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await
     .unwrap();
+    log::info!("Raft instance created successfully");
 
+    log::info!("Creating application...");
     // Create an application that will store all the instances created above, this will
     // later be used on the websocket services.
     let app = Arc::new(App {
@@ -134,6 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft,
         state_machine_store,
     });
+
+    log::info!("Application setup complete. Starting services...");
 
     // Start mDNS discovery if enabled
     if options.enable_discovery {
@@ -205,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    log::info!("Starting WebSocket server on {}...", ws_addr);
     // Start the websocket server.
     websocket::start_websocket_server(ws_addr, app).await.map_err(|e| e.into())
 }
