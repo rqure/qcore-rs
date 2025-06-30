@@ -37,7 +37,15 @@ struct PersistentConnection {
 impl PersistentConnection {
     async fn new(addr: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("ws://{}", addr);
-        let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
+        log::debug!("Attempting to connect to {}", url);
+        
+        // Add timeout to connection attempt
+        let (ws_stream, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(url)
+        ).await??;
+        
+        log::debug!("Successfully connected to {}", addr);
         let (ws_sender, mut ws_receiver) = ws_stream.split();
 
         let sender = Arc::new(Mutex::new(ws_sender));
@@ -50,38 +58,50 @@ impl PersistentConnection {
             while let Some(msg) = ws_receiver.next().await {
                 match msg {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                        if let Ok(ws_msg) = serde_json::from_str::<WebSocketMessage>(&text) {
-                            let request_id = match &ws_msg {
-                                WebSocketMessage::RaftVoteResponse { id, .. } => Some(id.clone()),
-                                WebSocketMessage::RaftAppendResponse { id, .. } => Some(id.clone()),
-                                WebSocketMessage::RaftSnapshotResponse { id, .. } => {
-                                    Some(id.clone())
-                                }
-                                WebSocketMessage::Error { id, .. } => Some(id.clone()),
-                                _ => None,
-                            };
+                        match serde_json::from_str::<WebSocketMessage>(&text) {
+                            Ok(ws_msg) => {
+                                let request_id = match &ws_msg {
+                                    WebSocketMessage::RaftVoteResponse { id, .. } => Some(id.clone()),
+                                    WebSocketMessage::RaftAppendResponse { id, .. } => Some(id.clone()),
+                                    WebSocketMessage::RaftSnapshotResponse { id, .. } => {
+                                        Some(id.clone())
+                                    }
+                                    WebSocketMessage::Error { id, .. } => Some(id.clone()),
+                                    _ => None,
+                                };
 
-                            if let Some(id) = request_id {
-                                let mut pending = pending_requests_clone.lock().await;
-                                if let Some(sender) = pending.remove(&id) {
-                                    let response_value =
-                                        serde_json::to_value(&ws_msg).unwrap_or_default();
-                                    let _ = sender.send(response_value);
+                                if let Some(id) = request_id {
+                                    let mut pending = pending_requests_clone.lock().await;
+                                    if let Some(sender) = pending.remove(&id) {
+                                        let response_value =
+                                            serde_json::to_value(&ws_msg).unwrap_or_default();
+                                        let _ = sender.send(response_value);
+                                    }
                                 }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to parse WebSocket message: {}", e);
                             }
                         }
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                        log::warn!("WebSocket connection closed");
+                        log::warn!("WebSocket connection closed by remote");
+                        // Cancel all pending requests
+                        let mut pending = pending_requests_clone.lock().await;
+                        pending.clear();
                         break;
                     }
                     Err(e) => {
-                        log::error!("WebSocket error: {}", e);
+                        log::error!("WebSocket error in receiver loop: {}", e);
+                        // Cancel all pending requests
+                        let mut pending = pending_requests_clone.lock().await;
+                        pending.clear();
                         break;
                     }
                     _ => {}
                 }
             }
+            log::debug!("WebSocket receiver loop terminated");
         });
 
         Ok(PersistentConnection {
@@ -116,7 +136,21 @@ impl PersistentConnection {
         }
 
         // Wait for response with timeout
-        let response = tokio::time::timeout(Duration::from_secs(30), response_receiver).await??;
+        let response = match tokio::time::timeout(Duration::from_secs(30), response_receiver).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                // Remove the pending request if the sender was dropped
+                let mut pending = self.pending_requests.lock().await;
+                pending.remove(&request_id);
+                return Err("Response channel closed".into());
+            }
+            Err(_) => {
+                // Timeout occurred, remove the pending request
+                let mut pending = self.pending_requests.lock().await;
+                pending.remove(&request_id);
+                return Err("Request timed out".into());
+            }
+        };
 
         // Extract the actual response from the WebSocket message
         match serde_json::from_value::<WebSocketMessage>(response)? {
@@ -156,6 +190,7 @@ impl PersistentConnection {
     }
 }
 
+#[derive(Clone)]
 pub struct Network {
     connections: Arc<RwLock<HashMap<NodeId, Arc<PersistentConnection>>>>,
 }
@@ -319,8 +354,14 @@ impl RaftNetworkFactory<TypeConfig> for Network {
     type Network = NetworkConnection;
 
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
+        // Pre-create the connection to fail fast if the node is unreachable
+        if let Err(e) = self.get_or_create_connection(target, &node.addr).await {
+            log::warn!("Failed to pre-create connection to node {}: {}", target, e);
+            // Continue anyway - the connection will be retried during actual RPC calls
+        }
+        
         NetworkConnection {
-            owner: Network::default(),
+            owner: self.clone(),
             target,
             target_node: node.clone(),
         }

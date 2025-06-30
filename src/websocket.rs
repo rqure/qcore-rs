@@ -169,28 +169,52 @@ async fn handle_websocket_message(
     match msg {
         // Raft internal messages
         WebSocketMessage::RaftVote { id, request } => {
-            let response = app.raft.vote(request).await;
-            let simplified_response = response.map_err(|e| e.to_string());
-            Some(WebSocketMessage::RaftVoteResponse {
-                id,
-                response: simplified_response,
-            })
+            match app.raft.vote(request).await {
+                Ok(response) => Some(WebSocketMessage::RaftVoteResponse {
+                    id,
+                    response: Ok(response),
+                }),
+                Err(e) => {
+                    let error_msg = format!("{:?}", e); // Use Debug to avoid potential Display panics
+                    log::error!("Vote request failed: {}", error_msg);
+                    Some(WebSocketMessage::RaftVoteResponse {
+                        id,
+                        response: Err(error_msg),
+                    })
+                }
+            }
         }
         WebSocketMessage::RaftAppend { id, request } => {
-            let response = app.raft.append_entries(request).await;
-            let simplified_response = response.map_err(|e| e.to_string());
-            Some(WebSocketMessage::RaftAppendResponse {
-                id,
-                response: simplified_response,
-            })
+            match app.raft.append_entries(request).await {
+                Ok(response) => Some(WebSocketMessage::RaftAppendResponse {
+                    id,
+                    response: Ok(response),
+                }),
+                Err(e) => {
+                    let error_msg = format!("{:?}", e); // Use Debug to avoid potential Display panics
+                    log::error!("Append request failed: {}", error_msg);
+                    Some(WebSocketMessage::RaftAppendResponse {
+                        id,
+                        response: Err(error_msg),
+                    })
+                }
+            }
         }
         WebSocketMessage::RaftSnapshot { id, request } => {
-            let response = app.raft.install_snapshot(request).await;
-            let simplified_response = response.map_err(|e| e.to_string());
-            Some(WebSocketMessage::RaftSnapshotResponse {
-                id,
-                response: simplified_response,
-            })
+            match app.raft.install_snapshot(request).await {
+                Ok(response) => Some(WebSocketMessage::RaftSnapshotResponse {
+                    id,
+                    response: Ok(response),
+                }),
+                Err(e) => {
+                    let error_msg = format!("{:?}", e); // Use Debug to avoid potential Display panics
+                    log::error!("Snapshot request failed: {}", error_msg);
+                    Some(WebSocketMessage::RaftSnapshotResponse {
+                        id,
+                        response: Err(error_msg),
+                    })
+                }
+            }
         }
 
         // Management API messages
