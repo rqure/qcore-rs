@@ -5,11 +5,14 @@ A distributed data store built with Rust and OpenRaft, featuring automatic node 
 ## Features
 
 - **Distributed Consensus**: Built on OpenRaft for reliable distributed consensus
+- **Persistent Storage**: Automatic persistence of Raft logs and snapshots to disk
+- **Node-Specific Data Directories**: Each node stores data in its own directory structure
 - **Automatic Node Discovery**: Uses mDNS for automatic peer discovery on local networks
 - **WebSocket API**: Real-time data access through WebSocket connections
 - **Schema Management**: Flexible entity and field schema system
 - **Data Types**: Support for various data types including strings, numbers, blobs, entity references, and lists
 - **Command-Line Client**: Easy-to-use client tool for interacting with the cluster
+- **Snapshot Management**: Automatic snapshot creation and cleanup to manage disk space
 
 ## Quick Start
 
@@ -22,10 +25,10 @@ Start multiple nodes with discovery enabled:
 cargo build --release
 
 # Terminal 1: Start first node
-RUST_LOG=info ./target/release/qcore-rs --id 1 --ws-addr 127.0.0.1:8080 --config-file schemas.yaml --enable-discovery --min-nodes 2 --auto-init
+RUST_LOG=info ./target/release/qcore-rs --id 1 --ws-addr 127.0.0.1:8080 --config-file schemas.yaml --enable-discovery --min-nodes 2 --auto-init --data-dir ./cluster_data
 
 # Terminal 2: Start second node  
-RUST_LOG=info ./target/release/qcore-rs --id 2 --ws-addr 127.0.0.1:8081 --config-file schemas.yaml --enable-discovery --min-nodes 2 --auto-init
+RUST_LOG=info ./target/release/qcore-rs --id 2 --ws-addr 127.0.0.1:8081 --config-file schemas.yaml --enable-discovery --min-nodes 2 --auto-init --data-dir ./cluster_data
 ```
 
 ### 2. Use the Client
@@ -219,3 +222,77 @@ INFO qcore_rs - Initializing cluster with nodes: {1: BasicNode { addr: "127.0.0.
 INFO qcore_rs - Cluster initialized successfully
 INFO qcore_rs::websocket - New WebSocket connection from: 127.0.0.1:xxxxx
 ```
+
+## Persistent Storage
+
+qcore-rs automatically persists all data to disk, ensuring durability across node restarts.
+
+### Data Directory Structure
+
+Each node creates its own data directory structure:
+
+```
+data_dir/
+└── node_<id>/
+    ├── logs/           # Raft log entries (one JSON file per entry)
+    │   ├── 1.json
+    │   ├── 2.json
+    │   └── ...
+    ├── snapshots/      # State machine snapshots
+    │   ├── snapshot_1688123456.json
+    │   └── ...
+    ├── vote.json       # Current vote state
+    └── committed.json  # Last committed log ID
+```
+
+### Configuration
+
+Use the `--data-dir` parameter to specify where data should be stored:
+
+```bash
+# Store data in a custom directory
+./target/release/qcore-rs --id 1 --ws-addr 127.0.0.1:8080 --data-dir ./my_cluster_data
+```
+
+#### Log Management Configuration
+
+Control log file growth with these options:
+
+```bash
+# Limit log files and size
+./target/release/qcore-rs --id 1 --ws-addr 127.0.0.1:8080 \
+  --max-log-files 500 \
+  --max-log-size-mb 50 \
+  --log-cleanup-interval 50
+```
+
+**Log Management Options:**
+- `--max-log-files`: Maximum number of log files to keep (default: 1000)
+- `--max-log-size-mb`: Maximum total size of log files in MB (default: 100)
+- `--log-cleanup-interval`: Check for cleanup every N log entries (default: 100)
+
+### Recovery
+
+When a node restarts, it automatically:
+
+1. **Loads Raft state**: Restores vote and committed log information
+2. **Replays log entries**: Recreates the state machine from persisted log entries
+3. **Loads latest snapshot**: If available, loads the most recent snapshot to speed up recovery
+4. **Rejoins cluster**: Reconnects with existing cluster members
+
+### Snapshot Management
+
+- Snapshots are automatically created during normal operation
+- Old snapshots are cleaned up automatically (keeps 5 most recent by default)
+- Snapshots include the complete state machine data for fast recovery
+
+### Data Safety
+
+- All writes are persisted before being acknowledged
+- Log entries are stored before being applied to the state machine  
+- Snapshots provide recovery points for large datasets
+- Each node maintains its own copy of all data for fault tolerance
+- **Bounded log growth**: Automatic cleanup prevents unbounded disk usage
+- **Configurable retention**: Control how many logs to keep and maximum size
+- **Size-based cleanup**: Removes oldest logs when size limits are exceeded
+- **Count-based cleanup**: Maintains a maximum number of log files

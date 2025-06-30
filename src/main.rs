@@ -27,6 +27,18 @@ pub struct Opt {
     #[clap(long, help = "Path to the YAML schema configuration file", default_value = "schemas.yaml")]
     pub config_file: Option<PathBuf>,
 
+    #[clap(long, help = "Data directory for persistent storage", default_value = "./raft_data")]
+    pub data_dir: PathBuf,
+
+    #[clap(long, help = "Maximum number of log files to keep", default_value = "1000")]
+    pub max_log_files: usize,
+
+    #[clap(long, help = "Maximum total size of log files in MB", default_value = "100")]
+    pub max_log_size_mb: u64,
+
+    #[clap(long, help = "How often to check for log cleanup (every N entries)", default_value = "100")]
+    pub log_cleanup_interval: u64,
+
     #[clap(long, help = "Enable automatic node discovery using mDNS")]
     pub enable_discovery: bool,
 
@@ -64,10 +76,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Arc::new(config.validate().unwrap());
 
+    // Create log store configuration
+    let log_config = store::LogStoreConfig {
+        max_log_files: options.max_log_files,
+        max_log_size_mb: options.max_log_size_mb,
+        cleanup_interval: options.log_cleanup_interval,
+    };
+
     // Create a instance of where the Raft logs will be stored.
-    let log_store = LogStore::default();
+    let log_store = LogStore::new_for_node_with_config(options.data_dir.clone(), node_id, log_config).map_err(|e| {
+        log::error!("Failed to create log store: {}", e);
+        e
+    })?;
+    
     // Create a instance of where the Raft data will be stored.
-    let state_machine_store = Arc::new(StateMachineStore::default());
+    let state_machine_store = Arc::new(StateMachineStore::new_for_node(options.data_dir.clone(), node_id).map_err(|e| {
+        log::error!("Failed to create state machine store: {}", e);
+        e
+    })?);
 
     {
         let mut store = state_machine_store.state_machine.write().await;
