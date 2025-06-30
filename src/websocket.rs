@@ -343,6 +343,34 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
         };
     }
 
+    // For write operations, check if we're the leader first
+    let metrics = app.raft.metrics().borrow().clone();
+    
+    // If we're not the leader and there is a leader, forward the request
+    if let Some(leader_id) = metrics.current_leader {
+        if leader_id != app.id {
+            // We're not the leader, try to forward the request
+            let leader_node = metrics.membership_config.nodes()
+                .find(|(id, _)| **id == leader_id)
+                .map(|(_, node)| node);
+                
+            if let Some(leader_node) = leader_node {
+                log::info!("Forwarding write request to leader {} at {}", leader_id, leader_node.addr);
+                match forward_request_to_leader(req.clone(), leader_id, app).await {
+                    Ok(response) => return response,
+                    Err(e) => {
+                        log::warn!("Failed to forward request to leader: {}, falling back to local Raft write", e);
+                        // Fall through to local Raft write attempt
+                    }
+                }
+            } else {
+                log::warn!("Leader node {} not found in membership config", leader_id);
+            }
+        }
+    } else {
+        log::debug!("No current leader or we are the leader, processing request locally");
+    }
+
     // For all other requests (write operations), forward to the Raft client
     match app.raft.client_write(req.clone()).await {
         Ok(response) => response.response().clone(),
@@ -369,5 +397,32 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
                 },
             }
         }
+    }
+}
+
+async fn forward_request_to_leader(
+    req: CommandRequest,
+    leader_id: u64,
+    app: &Arc<App>,
+) -> Result<CommandResponse, Box<dyn std::error::Error + Send + Sync>> {
+    // Get the leader's address from the membership configuration
+    let metrics = app.raft.metrics().borrow().clone();
+    
+    let leader_node = metrics.membership_config.nodes()
+        .find(|(id, _)| **id == leader_id)
+        .map(|(_, node)| node);
+        
+    if let Some(leader_node) = leader_node {
+        let leader_addr = &leader_node.addr;
+        
+        // Use the existing network to get or create a connection to the leader
+        let connection = app.network.get_or_create_connection(leader_id, leader_addr).await?;
+        
+        // Send the request using the persistent connection
+        let response = connection.send_application_request(req).await?;
+        
+        Ok(response)
+    } else {
+        Err(format!("Leader node {} not found in membership", leader_id).into())
     }
 }

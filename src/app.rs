@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::io::Cursor;
 
 use crate::store::{CommandRequest, CommandResponse, StateMachineStore};
+use crate::network::Network;
 
 pub type NodeId = u64;
 
@@ -30,4 +31,5 @@ pub struct App {
     pub addr: String,
     pub raft: Raft,
     pub state_machine_store: Arc<StateMachineStore>,
+    pub network: Network,
 }

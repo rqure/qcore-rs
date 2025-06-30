@@ -184,7 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft = openraft::Raft::new(
         node_id,
         config.clone(),
-        network,
+        network.clone(),
         log_store.clone(),
         state_machine_store.clone(),
     )
@@ -200,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         addr: ws_addr.clone(),
         raft,
         state_machine_store,
+        network,
     });
 
     log::info!("Application setup complete. Starting services...");

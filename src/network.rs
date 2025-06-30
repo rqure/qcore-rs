@@ -22,12 +22,13 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use crate::app::NodeId;
 use crate::app::TypeConfig;
 use crate::app::typ;
+use crate::store::{CommandRequest, CommandResponse};
 use crate::websocket::WebSocketMessage;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-struct PersistentConnection {
+pub struct PersistentConnection {
     sender: Arc<
         Mutex<futures_util::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>,
     >,
@@ -66,6 +67,7 @@ impl PersistentConnection {
                                     WebSocketMessage::RaftSnapshotResponse { id, .. } => {
                                         Some(id.clone())
                                     }
+                                    WebSocketMessage::PerformResponse { id, .. } => Some(id.clone()),
                                     WebSocketMessage::Error { id, .. } => Some(id.clone()),
                                     _ => None,
                                 };
@@ -110,7 +112,7 @@ impl PersistentConnection {
         })
     }
 
-    async fn send_request<Resp>(
+    pub async fn send_request<Resp>(
         &self,
         ws_message: WebSocketMessage,
         request_id: String,
@@ -188,6 +190,59 @@ impl PersistentConnection {
             _ => Err("Unexpected response type".into()),
         }
     }
+
+    pub async fn send_application_request(
+        &self,
+        request: CommandRequest,
+    ) -> Result<CommandResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        // Register the pending request
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.insert(request_id.clone(), response_sender);
+        }
+
+        // Create the application request message
+        let ws_message = WebSocketMessage::Perform {
+            id: request_id.clone(),
+            request,
+        };
+
+        // Send the message
+        let message_json = serde_json::to_string(&ws_message)?;
+        {
+            let mut sender = self.sender.lock().await;
+            sender
+                .send(tokio_tungstenite::tungstenite::Message::Text(message_json))
+                .await?;
+        }
+
+        // Wait for response with timeout
+        let response = match tokio::time::timeout(Duration::from_secs(30), response_receiver).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                // Remove the pending request if the sender was dropped
+                let mut pending = self.pending_requests.lock().await;
+                pending.remove(&request_id);
+                return Err("Response channel closed".into());
+            }
+            Err(_) => {
+                // Timeout occurred, remove the pending request
+                let mut pending = self.pending_requests.lock().await;
+                pending.remove(&request_id);
+                return Err("Request timed out".into());
+            }
+        };
+
+        // Extract the actual response from the WebSocket message
+        match serde_json::from_value::<WebSocketMessage>(response)? {
+            WebSocketMessage::PerformResponse { response, .. } => Ok(response),
+            WebSocketMessage::Error { error, .. } => Err(format!("Remote error: {}", error).into()),
+            _ => Err("Unexpected response type".into()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -204,7 +259,7 @@ impl Default for Network {
 }
 
 impl Network {
-    async fn get_or_create_connection(
+    pub async fn get_or_create_connection(
         &self,
         target: NodeId,
         addr: &str,
