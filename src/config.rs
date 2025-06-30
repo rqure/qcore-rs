@@ -65,6 +65,79 @@ impl From<YamlValue> for Value {
     }
 }
 
+impl YamlFieldSchema {
+    fn to_field_schema(&self, field_type: FieldType) -> Result<FieldSchema, Box<dyn std::error::Error>> {
+        let read_permission = self.read_permission.as_ref()
+            .and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok());
+        let write_permission = self.write_permission.as_ref()
+            .and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok());
+
+        let field_schema = match &self.default_value {
+            YamlValue::Bool(b) => FieldSchema::Bool {
+                field_type,
+                default_value: *b,
+                rank: self.rank,
+                read_permission,
+                write_permission,
+            },
+            YamlValue::Int(i) => FieldSchema::Int {
+                field_type,
+                default_value: *i,
+                rank: self.rank,
+                read_permission,
+                write_permission,
+            },
+            YamlValue::Float(f) => FieldSchema::Float {
+                field_type,
+                default_value: *f,
+                rank: self.rank,
+                read_permission,
+                write_permission,
+            },
+            YamlValue::String { String: s } => FieldSchema::String {
+                field_type,
+                default_value: s.clone(),
+                rank: self.rank,
+                read_permission,
+                write_permission,
+            },
+            YamlValue::EntityReference { EntityReference: e } => FieldSchema::EntityReference {
+                field_type,
+                default_value: e.as_ref().and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok()),
+                rank: self.rank,
+                read_permission,
+                write_permission,
+            },
+            YamlValue::EntityList { EntityList: list } => FieldSchema::EntityList {
+                field_type,
+                default_value: list.iter()
+                    .filter_map(|id| qlib_rs::EntityId::try_from(id.as_str()).ok())
+                    .collect(),
+                rank: self.rank,
+                read_permission,
+                write_permission,
+            },
+            YamlValue::Choice { Choice: c } => FieldSchema::Choice {
+                field_type,
+                default_value: *c,
+                rank: self.rank,
+                read_permission,
+                write_permission,
+                choices: self.choices.clone().unwrap_or_default(),
+            },
+            YamlValue::Blob { Blob: b } => FieldSchema::Blob {
+                field_type,
+                default_value: b.clone(),
+                rank: self.rank,
+                read_permission,
+                write_permission,
+            },
+        };
+
+        Ok(field_schema)
+    }
+}
+
 pub fn load_schemas_from_yaml(path: &PathBuf) -> Result<(Vec<EntitySchema<Single>>, Option<Vec<YamlEntityTreeNode>>), Box<dyn std::error::Error>> {
     let mut file = File::open(path)?;
     let mut contents = String::new();
@@ -85,15 +158,8 @@ pub fn load_schemas_from_yaml(path: &PathBuf) -> Result<(Vec<EntitySchema<Single
         
         for (field_name, yaml_field) in yaml_schema.fields {
             let field_type: FieldType = field_name.clone().into();
-            
-            schema.fields.insert(field_name.into(), FieldSchema {
-                field_type,
-                default_value: yaml_field.default_value.into(),
-                rank: yaml_field.rank,
-                read_permission: yaml_field.read_permission.and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok()),
-                write_permission: yaml_field.write_permission.and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok()),
-                choices: yaml_field.choices,
-            });
+            let field_schema = yaml_field.to_field_schema(field_type)?;
+            schema.fields.insert(field_name.into(), field_schema);
         }
         
         schemas.push(schema);
