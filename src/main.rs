@@ -89,11 +89,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
     
+    // Load existing state if available
+    if let Err(e) = log_store.load_existing_state().await {
+        log::warn!("Failed to load existing log state: {}", e);
+    }
+    
     // Create a instance of where the Raft data will be stored.
     let state_machine_store = Arc::new(StateMachineStore::new_for_node(options.data_dir.clone(), node_id).map_err(|e| {
         log::error!("Failed to create state machine store: {}", e);
         e
     })?);
+    
+    // Load existing state if available
+    if let Err(e) = state_machine_store.load_existing_state().await {
+        log::warn!("Failed to load existing state machine state: {}", e);
+    }
 
     {
         let mut store = state_machine_store.state_machine.write().await;

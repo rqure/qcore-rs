@@ -228,28 +228,24 @@ where
             config,
         };
         
-        // Load existing state if available
-        if let Err(e) = store.load_state() {
-            log::warn!("Failed to load existing log state: {}", e);
-        }
-        
         Ok(store)
     }
     
-    fn load_state(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load_existing_state(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.load_state().await
+    }
+    
+    async fn load_state(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let vote_path = self.data_dir.join("vote.json");
         let committed_path = self.data_dir.join("committed.json");
         let logs_dir = self.data_dir.join("logs");
-        
-        // Load synchronously during initialization
-        let inner = self.inner.clone();
         
         // Load vote state
         if vote_path.exists() {
             let vote_data = std::fs::read_to_string(&vote_path)?;
             if !vote_data.is_empty() {
                 let vote: Vote<C::NodeId> = serde_json::from_str(&vote_data)?;
-                let mut inner_guard = inner.blocking_lock();
+                let mut inner_guard = self.inner.lock().await;
                 inner_guard.vote = Some(vote);
             }
         }
@@ -259,14 +255,14 @@ where
             let committed_data = std::fs::read_to_string(&committed_path)?;
             if !committed_data.is_empty() {
                 let committed: LogId<C::NodeId> = serde_json::from_str(&committed_data)?;
-                let mut inner_guard = inner.blocking_lock();
+                let mut inner_guard = self.inner.lock().await;
                 inner_guard.committed = Some(committed);
             }
         }
         
         // Load log entries
         if logs_dir.exists() {
-            let mut inner_guard = inner.blocking_lock();
+            let mut inner_guard = self.inner.lock().await;
             for entry in std::fs::read_dir(&logs_dir)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -735,12 +731,11 @@ impl StateMachineStore {
             data_dir: data_dir.clone(),
         };
         
-        // Try to load the most recent snapshot
-        if let Err(e) = store.load_latest_snapshot() {
-            log::warn!("Failed to load latest snapshot: {}", e);
-        }
-        
         Ok(store)
+    }
+    
+    pub async fn load_existing_state(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.load_latest_snapshot().await
     }
     
     pub fn new_for_node(base_data_dir: PathBuf, node_id: u64) -> Result<Self, std::io::Error> {
@@ -748,7 +743,7 @@ impl StateMachineStore {
         Self::new(node_data_dir)
     }
     
-    fn load_latest_snapshot(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn load_latest_snapshot(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let snapshots_dir = self.data_dir.join("snapshots");
         if !snapshots_dir.exists() {
             return Ok(());
@@ -792,13 +787,13 @@ impl StateMachineStore {
             // Load the state machine data from the snapshot
             let state_machine_data: StateMachineData = serde_json::from_slice(&stored_snapshot.data)?;
             
-            // Update the state machine (blocking operation for startup)
-            let mut state_machine = self.state_machine.blocking_write();
+            // Update the state machine
+            let mut state_machine = self.state_machine.write().await;
             *state_machine = state_machine_data;
             drop(state_machine);
             
             // Update current snapshot
-            let mut current_snapshot = self.current_snapshot.blocking_write();
+            let mut current_snapshot = self.current_snapshot.write().await;
             *current_snapshot = Some(stored_snapshot);
             
             log::info!("Loaded snapshot from: {:?}", latest_snapshot_path);
