@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -170,63 +169,4 @@ pub async fn wait_for_leader(nodes: &[ClusterNode]) -> Option<&ClusterNode> {
     
     println!("❌ No leader elected after waiting");
     None
-}
-
-/// Check if a node is the current leader
-pub async fn is_leader(node: &ClusterNode) -> bool {
-    let metrics = node.app.raft.metrics().borrow().clone();
-    if let Some(leader_id) = metrics.current_leader {
-        leader_id == node.id
-    } else {
-        false
-    }
-}
-
-/// Get cluster membership from a node
-pub async fn get_cluster_membership(node: &ClusterNode) -> BTreeSet<u64> {
-    let metrics = node.app.raft.metrics().borrow().clone();
-    metrics.membership_config.membership().nodes().map(|(id, _)| *id).collect()
-}
-
-/// Wait for cluster to reach a stable state
-pub async fn wait_for_cluster_stability(nodes: &[ClusterNode]) -> bool {
-    let max_attempts = 30;
-    let sleep_duration = Duration::from_millis(1000);
-    
-    for attempt in 0..max_attempts {
-        let mut leader_count = 0;
-        let mut current_leader = None;
-        
-        // Check how many nodes think they are leader
-        for node in nodes {
-            if is_leader(node).await {
-                leader_count += 1;
-                current_leader = Some(node.id);
-            }
-        }
-        
-        if leader_count == 1 {
-            // Check that all nodes agree on the same leader
-            let mut consensus = true;
-            for node in nodes {
-                let metrics = node.app.raft.metrics().borrow().clone();
-                if metrics.current_leader != current_leader {
-                    consensus = false;
-                    break;
-                }
-            }
-            
-            if consensus {
-                println!("✅ Cluster is stable with leader {}", current_leader.unwrap());
-                return true;
-            }
-        }
-        
-        println!("⏳ Attempt {}/{}: waiting for cluster stability (leaders: {})", 
-                attempt + 1, max_attempts, leader_count);
-        sleep(sleep_duration).await;
-    }
-    
-    println!("❌ Cluster failed to reach stability");
-    false
 }
