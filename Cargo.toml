@@ -3,6 +3,14 @@ name = "qcore-rs"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "qcore_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qcore-rs"
+path = "src/main.rs"
+
 [[example]]
 name = "websocket_client"
 path = "examples/websocket_client.rs"

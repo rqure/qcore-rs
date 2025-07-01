@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::app::App;
 use crate::store::{CommandRequest, CommandResponse};
-use qlib_rs::{Context, NotifyConfig, NotifyToken, NotificationCallback, Notification};
+use qlib_rs::Context;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WebSocketMessage {
@@ -851,14 +851,14 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
         }
         CommandRequest::FieldExists { entity_id, field_type } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
-            let exists = state_machine.data.field_exists(&Context {}, entity_id, field_type);
+            let exists = state_machine.data.entity_field_exists(&Context {}, entity_id, field_type);
             return CommandResponse::FieldExists { response: exists };
         }
         CommandRequest::FindEntities { entity_type, parent_id: _, page_opts } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
             return match state_machine
                 .data
-                .find_entities(&Context {}, entity_type, page_opts.as_ref())
+                .find_entities(&Context {}, entity_type, page_opts.as_ref().cloned())
             {
                 Ok(result) => CommandResponse::FindEntities {
                     response: Ok(result),
@@ -872,7 +872,7 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
             let state_machine = app.state_machine_store.state_machine.read().await;
             return match state_machine
                 .data
-                .find_entities_exact(&Context {}, entity_type, page_opts.as_ref())
+                .find_entities_exact(&Context {}, entity_type, page_opts.as_ref().cloned())
             {
                 Ok(result) => CommandResponse::FindEntitiesExact {
                     response: Ok(result),
@@ -886,7 +886,7 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
             let state_machine = app.state_machine_store.state_machine.read().await;
             return match state_machine
                 .data
-                .get_entity_types(&Context {}, page_opts.as_ref())
+                .get_entity_types(&Context {}, page_opts.as_ref().cloned())
             {
                 Ok(result) => CommandResponse::GetEntityTypes {
                     response: Ok(result),

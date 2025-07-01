@@ -1142,7 +1142,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             sm.data.restore_snapshot(&ctx, snapshot.clone());
                             res.push(CommandResponse::RestoreSnapshot { error: None });
                         }
-                        CommandRequest::RegisterNotification { config } => {
+                        CommandRequest::RegisterNotification { config: _ } => {
                             // For now, we'll return an error since notification callbacks can't be serialized
                             // In a real implementation, you'd need a way to handle this
                             res.push(CommandResponse::RegisterNotification {
