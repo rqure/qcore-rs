@@ -633,6 +633,47 @@ pub enum CommandRequest {
     GetCompleteSchema {
         entity_type: qlib_rs::EntityType,
     },
+    SetFieldSchema {
+        entity_type: qlib_rs::EntityType,
+        field_type: qlib_rs::FieldType,
+        schema: qlib_rs::FieldSchema,
+    },
+    GetFieldSchema {
+        entity_type: qlib_rs::EntityType,
+        field_type: qlib_rs::FieldType,
+    },
+    EntityExists {
+        entity_id: qlib_rs::EntityId,
+    },
+    FieldExists {
+        entity_id: qlib_rs::EntityId,
+        field_type: qlib_rs::FieldType,
+    },
+    FindEntities {
+        entity_type: qlib_rs::EntityType,
+        parent_id: Option<qlib_rs::EntityId>,
+        page_opts: Option<qlib_rs::PageOpts>,
+    },
+    FindEntitiesExact {
+        entity_type: qlib_rs::EntityType,
+        parent_id: Option<qlib_rs::EntityId>,
+        page_opts: Option<qlib_rs::PageOpts>,
+    },
+    GetEntityTypes {
+        parent_type: Option<qlib_rs::EntityType>,
+        page_opts: Option<qlib_rs::PageOpts>,
+    },
+    TakeSnapshot,
+    RestoreSnapshot {
+        snapshot: qlib_rs::Snapshot,
+    },
+    RegisterNotification {
+        config: qlib_rs::NotifyConfig,
+    },
+    UnregisterNotification {
+        token: qlib_rs::NotifyToken,
+    },
+    GetNotificationConfigs,
 }
 
 /**
@@ -648,7 +689,7 @@ pub enum CommandResponse {
         error: Option<String>,
     },
     CreateEntity {
-        response: Option<qlib_rs::EntityId>,
+        response: Option<qlib_rs::Entity>,
         error: Option<String>,
     },
     DeleteEntity {
@@ -664,6 +705,43 @@ pub enum CommandResponse {
     GetCompleteSchema {
         response: Option<qlib_rs::EntitySchema<qlib_rs::Complete>>,
         error: Option<String>,
+    },
+    SetFieldSchema {
+        error: Option<String>,
+    },
+    GetFieldSchema {
+        response: Option<qlib_rs::FieldSchema>,
+        error: Option<String>,
+    },
+    EntityExists {
+        response: bool,
+    },
+    FieldExists {
+        response: bool,
+    },
+    FindEntities {
+        response: Result<qlib_rs::PageResult<qlib_rs::EntityId>, String>,
+    },
+    FindEntitiesExact {
+        response: Result<qlib_rs::PageResult<qlib_rs::EntityId>, String>,
+    },
+    GetEntityTypes {
+        response: Result<qlib_rs::PageResult<qlib_rs::EntityType>, String>,
+    },
+    TakeSnapshot {
+        response: qlib_rs::Snapshot,
+    },
+    RestoreSnapshot {
+        error: Option<String>,
+    },
+    RegisterNotification {
+        response: Result<qlib_rs::NotifyToken, String>,
+    },
+    UnregisterNotification {
+        response: bool,
+    },
+    GetNotificationConfigs {
+        response: Vec<(qlib_rs::NotifyToken, qlib_rs::NotifyConfig)>,
     },
     Blank {},
 }
@@ -961,7 +1039,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             ) {
                                 Ok(entity) => {
                                     res.push(CommandResponse::CreateEntity {
-                                        response: Some(entity.entity_id),
+                                        response: Some(entity),
                                         error: None,
                                     });
                                 }
@@ -1047,6 +1125,47 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                                     });
                                 }
                             }
+                        }
+                        CommandRequest::SetFieldSchema { entity_type, field_type, schema } => {
+                            match sm.data.set_field_schema(&ctx, entity_type, field_type, schema.clone()) {
+                                Ok(_) => {
+                                    res.push(CommandResponse::SetFieldSchema { error: None });
+                                }
+                                Err(e) => {
+                                    res.push(CommandResponse::SetFieldSchema {
+                                        error: Some(format!("Error setting field schema: {}", e)),
+                                    });
+                                }
+                            }
+                        }
+                        CommandRequest::RestoreSnapshot { snapshot } => {
+                            sm.data.restore_snapshot(&ctx, snapshot.clone());
+                            res.push(CommandResponse::RestoreSnapshot { error: None });
+                        }
+                        CommandRequest::RegisterNotification { config } => {
+                            // For now, we'll return an error since notification callbacks can't be serialized
+                            // In a real implementation, you'd need a way to handle this
+                            res.push(CommandResponse::RegisterNotification {
+                                response: Err("Notification registration not supported via Raft".to_string()),
+                            });
+                        }
+                        CommandRequest::UnregisterNotification { token } => {
+                            let success = sm.data.unregister_notification_by_token(token);
+                            res.push(CommandResponse::UnregisterNotification {
+                                response: success,
+                            });
+                        }
+                        // Read-only operations are handled directly and don't go through Raft
+                        CommandRequest::GetFieldSchema { .. } |
+                        CommandRequest::EntityExists { .. } |
+                        CommandRequest::FieldExists { .. } |
+                        CommandRequest::FindEntities { .. } |
+                        CommandRequest::FindEntitiesExact { .. } |
+                        CommandRequest::GetEntityTypes { .. } |
+                        CommandRequest::TakeSnapshot |
+                        CommandRequest::GetNotificationConfigs => {
+                            // These should not reach here as they are handled as read-only operations
+                            res.push(CommandResponse::Blank {});
                         }
                     }
                 }
