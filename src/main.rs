@@ -419,44 +419,30 @@ async fn initialize_single_node_cluster(
 }
 
 async fn is_fresh_cluster(app: &Arc<App>) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::store::{CommandRequest, CommandResponse};
+    // Wait a moment for the cluster to be ready
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     
-    // Check if any entity types exist in the store
-    // A fresh cluster should have no entity types
-    let request = CommandRequest::GetEntityTypes {
-        parent_type: None,
-        page_opts: Some(qlib_rs::PageOpts { 
-            limit: 1, 
-            cursor: None 
-        }),
-    };
+    // Check if any schemas exist in the store by directly accessing the state machine
+    // This avoids the Raft layer since GetSchema is a read-only operation
+    let entity_type = qlib_rs::EntityType::from("Object".to_string());
+    let ctx = qlib_rs::Context {};
     
-    match app.raft.client_write(request).await {
-        Ok(response) => {
-            match response.response() {
-                CommandResponse::GetEntityTypes { response: Ok(page_result) } => {
-                    // If there are no entity types, it's likely a fresh cluster
-                    let is_fresh = page_result.items.is_empty();
-                    log::debug!("Cluster freshness check: {} entity types found, is_fresh={}", 
-                               page_result.total, is_fresh);
-                    Ok(is_fresh)
-                }
-                CommandResponse::GetEntityTypes { response: Err(e) } => {
-                    log::warn!("Error checking entity types: {}", e);
-                    // If we can't check, assume it's not fresh to be safe
-                    Ok(false)
-                }
-                other => {
-                    log::warn!("Unexpected response when checking entity types: {:?}", other);
-                    // If we can't check, assume it's not fresh to be safe
-                    Ok(false)
-                }
-            }
+    // Access the state machine directly for read operations
+    let state_machine = app.state_machine_store.state_machine.read().await;
+    match state_machine.data.lock().unwrap().get_entity_schema(&ctx, &entity_type) {
+        Ok(_schema) => {
+            log::debug!("Found existing schema for 'Object', cluster is not fresh");
+            Ok(false)
         }
         Err(e) => {
-            log::warn!("Failed to check cluster freshness: {}", e);
-            // If we can't check, assume it's not fresh to be safe
-            Ok(false)
+            let error_msg = e.to_string();
+            if error_msg.contains("not found") || error_msg.contains("does not exist") {
+                log::debug!("No schema found for 'Object', cluster appears fresh");
+                Ok(true)
+            } else {
+                log::debug!("Error checking schema (but not 'not found'): {}, assuming not fresh", error_msg);
+                Ok(false)
+            }
         }
     }
 }
