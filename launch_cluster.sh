@@ -286,11 +286,11 @@ main() {
     
     # Keep script running and wait for user input
     print_info "Cluster is running. Press Ctrl+C to stop all nodes."
-    print_info "Monitoring node health every 5 seconds..."
+    print_info "Monitoring node health every 1 seconds..."
     
     # Monitor nodes and restart if needed
     while true; do
-        sleep 5
+        sleep 1
         
         # Check if any nodes have died (disable set -e temporarily)
         set +e

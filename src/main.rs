@@ -255,11 +255,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                 
                                 if discovered_nodes.is_empty() && auto_init && !initialized {
-                                    log::info!("No other nodes discovered, initializing as single-node cluster...");
-                                    if let Err(e) = initialize_single_node_cluster(&app_clone).await {
-                                        log::error!("Failed to initialize single-node cluster: {}", e);
-                                    } else {
-                                        log::info!("Single-node cluster initialized successfully");
+                                    // Check if cluster is already initialized before attempting initialization
+                                    if is_cluster_already_initialized(&app_clone).await {
+                                        log::info!("Cluster is already initialized, skipping initialization");
                                         initialized = true;
                                         
                                         // Initialize store with schemas only for fresh clusters
@@ -276,6 +274,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         } else {
                                             log::warn!("Could not determine if cluster is fresh, skipping schema initialization");
+                                        }
+                                    } else {
+                                        log::info!("No other nodes discovered, initializing as single-node cluster...");
+                                        if let Err(e) = initialize_single_node_cluster(&app_clone).await {
+                                            log::error!("Failed to initialize single-node cluster: {}", e);
+                                        } else {
+                                            log::info!("Single-node cluster initialized successfully");
+                                            initialized = true;
+                                            
+                                            // Initialize store with schemas only for fresh clusters
+                                            if let Ok(is_fresh) = is_fresh_cluster(&app_clone).await {
+                                                if is_fresh {
+                                                    log::info!("Detected fresh cluster, initializing with schemas...");
+                                                    if let Err(e) = initialize_store_with_schemas(&app_clone, &schemas_clone, &tree_nodes_clone).await {
+                                                        log::error!("Failed to initialize store with schemas: {}", e);
+                                                    } else {
+                                                        log::info!("Store initialized successfully with schemas");
+                                                    }
+                                                } else {
+                                                    log::info!("Cluster already has data, skipping schema initialization");
+                                                }
+                                            } else {
+                                                log::warn!("Could not determine if cluster is fresh, skipping schema initialization");
+                                            }
                                         }
                                     }
                                 }
@@ -325,13 +347,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        // Discovery is disabled, initialize as single-node cluster
-        log::info!("Discovery disabled, initializing as single-node cluster...");
-        if let Err(e) = initialize_single_node_cluster(&app).await {
-            log::error!("Failed to initialize single-node cluster: {}", e);
-            return Err(format!("Failed to initialize single-node cluster: {}", e).into());
+        // Discovery is disabled, check if cluster is already initialized
+        if is_cluster_already_initialized(&app).await {
+            log::info!("Cluster is already initialized, skipping initialization");
+        } else {
+            log::info!("Discovery disabled, initializing as single-node cluster...");
+            if let Err(e) = initialize_single_node_cluster(&app).await {
+                log::error!("Failed to initialize single-node cluster: {}", e);
+                return Err(format!("Failed to initialize single-node cluster: {}", e).into());
+            }
+            log::info!("Single-node cluster initialized successfully");
         }
-        log::info!("Single-node cluster initialized successfully");
         
         // Initialize store with schemas only for fresh clusters
         if let Ok(is_fresh) = is_fresh_cluster(&app).await {
@@ -418,10 +444,21 @@ async fn initialize_single_node_cluster(
     }
 }
 
-async fn is_fresh_cluster(app: &Arc<App>) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Wait a moment for the cluster to be ready
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    
+async fn is_cluster_already_initialized(app: &Arc<App>) -> bool {
+    // Use the built-in Raft method to check if the cluster is already initialized
+    match app.raft.is_initialized().await {
+        Ok(initialized) => {
+            log::debug!("Cluster initialization check: is_initialized={}", initialized);
+            initialized
+        }
+        Err(e) => {
+            log::warn!("Failed to check if cluster is initialized: {}, assuming not initialized", e);
+            false
+        }
+    }
+}
+
+async fn is_fresh_cluster(app: &Arc<App>) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {    
     // Check if any schemas exist in the store by directly accessing the state machine
     // This avoids the Raft layer since GetSchema is a read-only operation
     let entity_type = qlib_rs::EntityType::from("Object".to_string());

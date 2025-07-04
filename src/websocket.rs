@@ -295,7 +295,15 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, app: Arc<App>) {
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
-            log::error!("Failed to accept WebSocket connection: {}", e);
+            // Check if this is a common non-WebSocket connection attempt
+            let error_str = e.to_string();
+            if error_str.contains("Handshake not finished") || 
+               error_str.contains("Connection reset") ||
+               error_str.contains("protocol error") {
+                log::debug!("Non-WebSocket connection attempt from {}: {}", addr, e);
+            } else {
+                log::error!("Failed to accept WebSocket connection from {}: {}", addr, e);
+            }
             return;
         }
     };
@@ -355,11 +363,19 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, app: Arc<App>) {
                 log::warn!("Received binary message, ignoring");
             }
             Ok(Message::Close(_)) => {
-                log::info!("WebSocket connection closed by client");
+                log::info!("WebSocket connection closed by client: {}", addr);
                 break;
             }
             Err(e) => {
-                log::error!("WebSocket error: {}", e);
+                // Check if this is a common connection reset error
+                let error_str = e.to_string();
+                if error_str.contains("Connection reset") || 
+                   error_str.contains("without closing handshake") ||
+                   error_str.contains("protocol error") {
+                    log::debug!("WebSocket connection reset by client: {} - {}", addr, e);
+                } else {
+                    log::error!("WebSocket error from {}: {}", addr, e);
+                }
                 break;
             }
             _ => {}

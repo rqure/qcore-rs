@@ -205,7 +205,10 @@ impl MdnsDiscovery {
 impl Drop for MdnsDiscovery {
     fn drop(&mut self) {
         if let Err(e) = self.daemon.unregister(&self.service_name) {
-            log::warn!("Failed to unregister mDNS service on drop: {}", e);
+            // Use debug level instead of warn since this is common during shutdown
+            log::debug!("Failed to unregister mDNS service on drop: {}", e);
+        } else {
+            log::debug!("Successfully unregistered mDNS service: {}", self.service_name);
         }
     }
 }
