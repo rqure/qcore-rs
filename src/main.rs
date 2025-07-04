@@ -265,8 +265,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             } else {
-                                // No minimum nodes required, just listen for discoveries
+                                // No minimum nodes required - for single node clusters, initialize immediately
                                 log::info!("Discovery enabled with no minimum node requirement");
+                                
+                                // Wait a short time to see if we discover any other nodes
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                
+                                if discovered_nodes.is_empty() && auto_init && !initialized {
+                                    log::info!("No other nodes discovered, initializing as single-node cluster...");
+                                    if let Err(e) = initialize_single_node_cluster(&app_clone).await {
+                                        log::error!("Failed to initialize single-node cluster: {}", e);
+                                    } else {
+                                        log::info!("Single-node cluster initialized successfully");
+                                        initialized = true;
+                                    }
+                                }
                             }
                             
                             // Continue processing discovery events
@@ -296,6 +309,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::warn!("Failed to create mDNS discovery: {}. Continuing without discovery.", e);
             }
         }
+    } else {
+        // Discovery is disabled, initialize as single-node cluster
+        log::info!("Discovery disabled, initializing as single-node cluster...");
+        if let Err(e) = initialize_single_node_cluster(&app).await {
+            log::error!("Failed to initialize single-node cluster: {}", e);
+            return Err(format!("Failed to initialize single-node cluster: {}", e).into());
+        }
+        log::info!("Single-node cluster initialized successfully");
     }
 
     log::info!("Starting WebSocket server on {}...", ws_addr);
@@ -334,6 +355,33 @@ async fn initialize_cluster_with_nodes(
         }
         Err(e) => {
             log::error!("Failed to initialize cluster: {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+async fn initialize_single_node_cluster(
+    app: &Arc<App>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::BTreeMap;
+    use openraft::BasicNode;
+    
+    let mut node_map = BTreeMap::new();
+    
+    // Add only ourselves for a single-node cluster
+    let our_port = app.addr.split(':').nth(1).unwrap_or("8080");
+    let our_local_addr = format!("127.0.0.1:{}", our_port);
+    node_map.insert(app.id, BasicNode { addr: our_local_addr });
+    
+    log::info!("Initializing single-node cluster with node: {:?}", node_map);
+    
+    match app.raft.initialize(node_map).await {
+        Ok(_) => {
+            log::info!("Single-node cluster initialized successfully");
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("Failed to initialize single-node cluster: {}", e);
             Err(e.into())
         }
     }
