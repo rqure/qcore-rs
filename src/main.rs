@@ -1,5 +1,5 @@
 use clap::Parser;
-use qlib_rs::{Context};
+use qlib_rs::{Context, EntitySchema, Single};
 use std::path::PathBuf;
 
 mod app;
@@ -105,73 +105,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::warn!("Failed to load existing state machine state: {}", e);
     }
 
-    {
-        let store = state_machine_store.state_machine.write().await;
-
-        let ctx = Context {};
-        
-        // Load schemas from YAML if config file is provided, otherwise use defaults
-        let (schemas, tree_nodes) = if let Some(config_path) = options.config_file {
-            match config::load_schemas_from_yaml(&config_path) {
-                Ok((schemas, tree_nodes)) => {
-                    log::info!("Successfully loaded {} schemas from config file", schemas.len());
-                    (schemas, tree_nodes)
-                },
-                Err(err) => {
-                    log::error!("Failed to load schemas from config file: {}", err);
-                    return Err(format!("Failed to load schemas from config file: {}", err).into());
-                }
-            }
-        } else {
-            log::error!("No config file provided, using default schemas");
-            return Err("No config file provided".into());
-        };
-        
-        // Apply the schemas to the store
-        for (index, schema) in schemas.iter().enumerate() {
-            log::info!("Setting entity schema: {} ({}/{})", schema.entity_type, index + 1, schemas.len());
-            log::debug!("About to set schema for entity type: {}", schema.entity_type);
-            log::debug!("Schema details: inherit={:?}, fields_count={}", 
-                       schema.inherit, schema.fields.len());
-            
-            // Try to set the schema with error handling and timeout
-            let schema_future = async {
-                store.data.lock().unwrap().set_entity_schema(&ctx, &schema)
-            };
-            
-            match tokio::time::timeout(std::time::Duration::from_secs(5), schema_future).await {
-                Ok(Ok(_)) => {
-                    log::debug!("Successfully set schema for entity type: {}", schema.entity_type);
-                }
-                Ok(Err(e)) => {
-                    log::error!("Failed to set schema for entity type {}: {:?}", schema.entity_type, e);
-                    return Err(format!("Failed to set schema for entity type {}: {:?}", schema.entity_type, e).into());
-                }
-                Err(_) => {
-                    log::error!("Timeout setting schema for entity type: {}", schema.entity_type);
-                    return Err(format!("Timeout setting schema for entity type: {}", schema.entity_type).into());
-                }
+    // Load schema definitions from config file but don't apply them yet
+    // They will be applied during cluster initialization only for fresh clusters
+    let (schemas, tree_nodes) = if let Some(config_path) = options.config_file {
+        match config::load_schemas_from_yaml(&config_path) {
+            Ok((schemas, tree_nodes)) => {
+                log::info!("Successfully loaded {} schema definitions from config file", schemas.len());
+                (Some(schemas), tree_nodes)
+            },
+            Err(err) => {
+                log::error!("Failed to load schemas from config file: {}", err);
+                return Err(format!("Failed to load schemas from config file: {}", err).into());
             }
         }
-
-        log::info!("Schemas applied successfully");
-        
-        // Create the initial tree structure if provided
-        if let Some(tree) = tree_nodes {
-            log::info!("Creating entity tree structure...");
-            match config::create_entity_tree(&mut store.data.lock().unwrap(), &ctx, &tree, None).await {
-                Ok(entities) => {
-                    log::info!("Successfully created {} entities from tree definition", entities.len());
-                }
-                Err(err) => {
-                    log::error!("Failed to create entity tree: {}", err);
-                    // Continue even if tree creation fails
-                }
-            }
-        } else {
-            log::info!("No tree nodes to create");
-        }
-    }
+    } else {
+        log::info!("No config file provided, schemas will need to be set manually");
+        (None, None)
+    };
 
     log::info!("Creating network layer...");
     // Create the network layer that will connect and communicate the raft instances and
@@ -219,6 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let min_nodes = options.min_nodes;
                         let auto_init = options.auto_init;
                         let discovery_timeout = std::time::Duration::from_secs(options.discovery_timeout);
+                        let schemas_clone = schemas.clone();
+                        let tree_nodes_clone = tree_nodes.clone();
                         
                         // Spawn discovery handling task
                         tokio::spawn(async move {
@@ -235,16 +187,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Some(discovered_node) = discovery_rx.recv() => {
                                             discovered_nodes.push(discovered_node.clone());
                                             log::info!("Discovered node {} ({}/{})", discovered_node.node_id, discovered_nodes.len(), min_nodes);
-                                            
-                                            if discovered_nodes.len() >= min_nodes && auto_init && !initialized {
-                                                log::info!("Minimum nodes reached, auto-initializing cluster...");
-                                                if let Err(e) = initialize_cluster_with_nodes(&app_clone, &discovered_nodes).await {
-                                                    log::error!("Failed to initialize cluster: {}", e);
+                                                         if discovered_nodes.len() >= min_nodes && auto_init && !initialized {
+                                    log::info!("Minimum nodes reached, auto-initializing cluster...");
+                                    if let Err(e) = initialize_cluster_with_nodes(&app_clone, &discovered_nodes).await {
+                                        log::error!("Failed to initialize cluster: {}", e);
+                                    } else {
+                                        log::info!("Cluster initialized successfully");
+                                        initialized = true;
+                                        
+                                        // Initialize store with schemas only for fresh clusters
+                                        if let Ok(is_fresh) = is_fresh_cluster(&app_clone).await {
+                                            if is_fresh {
+                                                log::info!("Detected fresh cluster, initializing with schemas...");
+                                                if let Err(e) = initialize_store_with_schemas(&app_clone, &schemas_clone, &tree_nodes_clone).await {
+                                                    log::error!("Failed to initialize store with schemas: {}", e);
                                                 } else {
-                                                    log::info!("Cluster initialized successfully");
-                                                    initialized = true;
+                                                    log::info!("Store initialized successfully with schemas");
                                                 }
+                                            } else {
+                                                log::info!("Cluster already has data, skipping schema initialization");
                                             }
+                                        } else {
+                                            log::warn!("Could not determine if cluster is fresh, skipping schema initialization");
+                                        }
+                                    }
+                                }
                                         }
                                         _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                                             // Continue checking
@@ -261,6 +228,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         } else {
                                             log::info!("Cluster initialized successfully with available nodes");
                                             initialized = true;
+                                            
+                                            // Initialize store with schemas only for fresh clusters
+                                            if let Ok(is_fresh) = is_fresh_cluster(&app_clone).await {
+                                                if is_fresh {
+                                                    log::info!("Detected fresh cluster, initializing with schemas...");
+                                                    if let Err(e) = initialize_store_with_schemas(&app_clone, &schemas_clone, &tree_nodes_clone).await {
+                                                        log::error!("Failed to initialize store with schemas: {}", e);
+                                                    } else {
+                                                        log::info!("Store initialized successfully with schemas");
+                                                    }
+                                                } else {
+                                                    log::info!("Cluster already has data, skipping schema initialization");
+                                                }
+                                            } else {
+                                                log::warn!("Could not determine if cluster is fresh, skipping schema initialization");
+                                            }
                                         }
                                     }
                                 }
@@ -278,6 +261,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     } else {
                                         log::info!("Single-node cluster initialized successfully");
                                         initialized = true;
+                                        
+                                        // Initialize store with schemas only for fresh clusters
+                                        if let Ok(is_fresh) = is_fresh_cluster(&app_clone).await {
+                                            if is_fresh {
+                                                log::info!("Detected fresh cluster, initializing with schemas...");
+                                                if let Err(e) = initialize_store_with_schemas(&app_clone, &schemas_clone, &tree_nodes_clone).await {
+                                                    log::error!("Failed to initialize store with schemas: {}", e);
+                                                } else {
+                                                    log::info!("Store initialized successfully with schemas");
+                                                }
+                                            } else {
+                                                log::info!("Cluster already has data, skipping schema initialization");
+                                            }
+                                        } else {
+                                            log::warn!("Could not determine if cluster is fresh, skipping schema initialization");
+                                        }
                                     }
                                 }
                             }
@@ -295,6 +294,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     } else {
                                         log::info!("Cluster initialized successfully");
                                         initialized = true;
+                                        
+                                        // Initialize store with schemas only for fresh clusters
+                                        if let Ok(is_fresh) = is_fresh_cluster(&app_clone).await {
+                                            if is_fresh {
+                                                log::info!("Detected fresh cluster, initializing with schemas...");
+                                                if let Err(e) = initialize_store_with_schemas(&app_clone, &schemas_clone, &tree_nodes_clone).await {
+                                                    log::error!("Failed to initialize store with schemas: {}", e);
+                                                } else {
+                                                    log::info!("Store initialized successfully with schemas");
+                                                }
+                                            } else {
+                                                log::info!("Cluster already has data, skipping schema initialization");
+                                            }
+                                        } else {
+                                            log::warn!("Could not determine if cluster is fresh, skipping schema initialization");
+                                        }
                                     }
                                 }
                             }
@@ -317,6 +332,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("Failed to initialize single-node cluster: {}", e).into());
         }
         log::info!("Single-node cluster initialized successfully");
+        
+        // Initialize store with schemas only for fresh clusters
+        if let Ok(is_fresh) = is_fresh_cluster(&app).await {
+            if is_fresh {
+                log::info!("Detected fresh cluster, initializing with schemas...");
+                if let Err(e) = initialize_store_with_schemas(&app, &schemas, &tree_nodes).await {
+                    log::error!("Failed to initialize store with schemas: {}", e);
+                } else {
+                    log::info!("Store initialized successfully with schemas");
+                }
+            } else {
+                log::info!("Cluster already has data, skipping schema initialization");
+            }
+        } else {
+            log::warn!("Could not determine if cluster is fresh, skipping schema initialization");
+        }
     }
 
     log::info!("Starting WebSocket server on {}...", ws_addr);
@@ -385,4 +416,218 @@ async fn initialize_single_node_cluster(
             Err(e.into())
         }
     }
+}
+
+async fn is_fresh_cluster(app: &Arc<App>) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::store::{CommandRequest, CommandResponse};
+    
+    // Check if any entity types exist in the store
+    // A fresh cluster should have no entity types
+    let request = CommandRequest::GetEntityTypes {
+        parent_type: None,
+        page_opts: Some(qlib_rs::PageOpts { 
+            limit: 1, 
+            cursor: None 
+        }),
+    };
+    
+    match app.raft.client_write(request).await {
+        Ok(response) => {
+            match response.response() {
+                CommandResponse::GetEntityTypes { response: Ok(page_result) } => {
+                    // If there are no entity types, it's likely a fresh cluster
+                    let is_fresh = page_result.items.is_empty();
+                    log::debug!("Cluster freshness check: {} entity types found, is_fresh={}", 
+                               page_result.total, is_fresh);
+                    Ok(is_fresh)
+                }
+                CommandResponse::GetEntityTypes { response: Err(e) } => {
+                    log::warn!("Error checking entity types: {}", e);
+                    // If we can't check, assume it's not fresh to be safe
+                    Ok(false)
+                }
+                other => {
+                    log::warn!("Unexpected response when checking entity types: {:?}", other);
+                    // If we can't check, assume it's not fresh to be safe
+                    Ok(false)
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to check cluster freshness: {}", e);
+            // If we can't check, assume it's not fresh to be safe
+            Ok(false)
+        }
+    }
+}
+
+async fn initialize_store_with_schemas(
+    app: &Arc<App>,
+    schemas: &Option<Vec<EntitySchema<Single>>>,
+    tree_nodes: &Option<Vec<config::YamlEntityTreeNode>>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::store::{CommandRequest, CommandResponse};
+    
+    let ctx = Context {};
+    
+    // Apply schemas if provided
+    if let Some(schemas) = schemas {
+        log::info!("Initializing store with {} schemas via Raft...", schemas.len());
+        
+        for (index, schema) in schemas.iter().enumerate() {
+            log::info!("Setting entity schema via Raft: {} ({}/{})", schema.entity_type, index + 1, schemas.len());
+            
+            // Create a Raft command to set the schema
+            let request = CommandRequest::SetSchema {
+                entity_schema: schema.clone(),
+            };
+            
+            match app.raft.client_write(request).await {
+                Ok(response) => {
+                    match response.response() {
+                        CommandResponse::SetSchema { error: None } => {
+                            log::info!("Successfully set schema for entity type: {}", schema.entity_type);
+                        }
+                        CommandResponse::SetSchema { error: Some(e) } => {
+                            log::error!("Failed to set schema for entity type {}: {}", schema.entity_type, e);
+                            return Err(format!("Failed to set schema for entity type {}: {}", schema.entity_type, e).into());
+                        }
+                        other => {
+                            log::error!("Unexpected response when setting schema for {}: {:?}", schema.entity_type, other);
+                            return Err(format!("Unexpected response when setting schema for {}: {:?}", schema.entity_type, other).into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to set schema for entity type {} via Raft: {}", schema.entity_type, e);
+                    return Err(format!("Failed to set schema for entity type {} via Raft: {}", schema.entity_type, e).into());
+                }
+            }
+        }
+        
+        log::info!("All schemas applied successfully via Raft");
+    }
+    
+    // Create initial entity tree if provided
+    if let Some(tree) = tree_nodes {
+        log::info!("Creating entity tree structure via Raft...");
+        
+        // Create entities using Raft commands
+        match create_entity_tree_via_raft(app, &ctx, tree, None).await {
+            Ok(entities) => {
+                log::info!("Successfully created {} entities from tree definition via Raft", entities.len());
+            }
+            Err(err) => {
+                log::error!("Failed to create entity tree via Raft: {}", err);
+                return Err(format!("Failed to create entity tree via Raft: {}", err).into());
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+async fn create_entity_tree_via_raft(
+    app: &Arc<App>,
+    _ctx: &Context,
+    tree_nodes: &[config::YamlEntityTreeNode],
+    parent_id: Option<qlib_rs::EntityId>
+) -> Result<Vec<qlib_rs::EntityId>, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::store::{CommandRequest, CommandResponse};
+    
+    let mut created_entities = Vec::new();
+    
+    for node in tree_nodes {
+        // Convert string to EntityType
+        let entity_type = qlib_rs::EntityType::from(node.entity_type.clone());
+        
+        // Create entity via Raft command
+        let request = CommandRequest::CreateEntity {
+            entity_type,
+            parent_id: parent_id.clone(),
+            name: node.name.clone(),
+        };
+        
+        match app.raft.client_write(request).await {
+            Ok(response) => {
+                match response.response() {
+                    CommandResponse::CreateEntity { response: Some(entity), error: None } => {
+                        let entity_id = entity.entity_id.clone();
+                        log::info!("Successfully created entity {} of type {}", entity_id, node.entity_type);
+                        created_entities.push(entity_id.clone());
+                        
+                        // Set attributes if provided using UpdateEntity
+                        if let Some(attributes) = &node.attributes {
+                            let mut requests = Vec::new();
+                            for (field_name, value) in attributes {
+                                let field_type = qlib_rs::FieldType::from(field_name.clone());
+                                requests.push(qlib_rs::Request::Write {
+                                    entity_id: entity_id.clone(),
+                                    field_type,
+                                    value: Some(value.clone().into()),
+                                    push_condition: qlib_rs::PushCondition::Always,
+                                    adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                                    write_time: None,
+                                    writer_id: None,
+                                });
+                            }
+                            
+                            if !requests.is_empty() {
+                                let update_request = CommandRequest::UpdateEntity { request: requests };
+                                match app.raft.client_write(update_request).await {
+                                    Ok(update_response) => {
+                                        match update_response.response() {
+                                            CommandResponse::UpdateEntity { error: None, .. } => {
+                                                log::debug!("Set attributes for entity {}", entity_id);
+                                            }
+                                            CommandResponse::UpdateEntity { error: Some(e), .. } => {
+                                                log::error!("Failed to set attributes for entity {}: {}", entity_id, e);
+                                            }
+                                            other => {
+                                                log::warn!("Unexpected response when setting attributes for entity {}: {:?}", entity_id, other);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to set attributes for entity {}: {}", entity_id, e);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Create children recursively if provided
+                        if let Some(children) = &node.children {
+                            let child_result = Box::pin(create_entity_tree_via_raft(app, _ctx, children, Some(entity_id.clone()))).await;
+                            match child_result {
+                                Ok(child_entities) => {
+                                    created_entities.extend(child_entities);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to create children for entity {}: {}", entity_id, e);
+                                }
+                            }
+                        }
+                    }
+                    CommandResponse::CreateEntity { response: None, error: Some(e) } => {
+                        log::error!("Failed to create entity {}: {}", node.name, e);
+                        return Err(format!("Failed to create entity {}: {}", node.name, e).into());
+                    }
+                    CommandResponse::CreateEntity { response: None, error: None } => {
+                        log::error!("Unexpected empty response when creating entity {}", node.name);
+                        return Err(format!("Unexpected empty response when creating entity {}", node.name).into());
+                    }
+                    other => {
+                        log::error!("Unexpected response when creating entity {}: {:?}", node.name, other);
+                        return Err(format!("Unexpected response when creating entity {}: {:?}", node.name, other).into());
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to create entity {} via Raft: {}", node.name, e);
+                return Err(format!("Failed to create entity {} via Raft: {}", node.name, e).into());
+            }
+        }
+    }
+    
+    Ok(created_entities)
 }

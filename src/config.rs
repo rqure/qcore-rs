@@ -1,6 +1,6 @@
 use std::{fs::File, path::PathBuf};
 use std::io::Read;
-use qlib_rs::{Context, EntitySchema, FieldSchema, FieldType, Single, Value};
+use qlib_rs::{EntitySchema, FieldSchema, FieldType, Single, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -40,12 +40,12 @@ pub struct YamlSchemaConfig {
     tree: Option<Vec<YamlEntityTreeNode>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct YamlEntityTreeNode {
-    entity_type: String,
-    name: String,
-    children: Option<Vec<YamlEntityTreeNode>>,
-    attributes: Option<HashMap<String, YamlValue>>,
+    pub entity_type: String,
+    pub name: String,
+    pub children: Option<Vec<YamlEntityTreeNode>>,
+    pub attributes: Option<HashMap<String, YamlValue>>,
 }
 
 impl From<YamlValue> for Value {
@@ -176,57 +176,4 @@ pub fn load_schemas_from_yaml(path: &PathBuf) -> Result<(Vec<EntitySchema<Single
     });
     
     Ok((schemas, config.tree))
-}
-
-/// Create entities based on the tree definition
-pub async fn create_entity_tree(
-    store: &mut qlib_rs::Store,
-    ctx: &Context,
-    tree_nodes: &Vec<YamlEntityTreeNode>,
-    parent_id: Option<qlib_rs::EntityId>
-) -> Result<Vec<qlib_rs::EntityId>, Box<dyn std::error::Error>> {
-    let mut created_entities = Vec::new();
-    let mut work_queue = Vec::new();
-    
-    // Initialize work queue with root nodes
-    for node in tree_nodes {
-        work_queue.push((node, parent_id.clone()));
-    }
-    
-    // Process nodes iteratively to avoid async recursion issues
-    while let Some((node, current_parent_id)) = work_queue.pop() {
-        // Create the entity
-        let entity = store.create_entity(ctx, &node.entity_type.clone().into(), current_parent_id, &node.name)?;
-        let entity_id = entity.entity_id;
-        
-        // Set additional attributes if specified
-        if let Some(attrs) = &node.attributes {
-            let mut requests = Vec::new();
-            for (field_name, value) in attrs {
-                requests.push(qlib_rs::Request::Write {
-                    entity_id: entity_id.clone(),
-                    field_type: field_name.clone().into(),
-                    value: Some(value.clone().into()),
-                    push_condition: qlib_rs::PushCondition::Always,
-                    adjust_behavior: qlib_rs::AdjustBehavior::Set,
-                    write_time: None,
-                    writer_id: None,
-                });
-            }
-            if !requests.is_empty() {
-                store.perform(ctx, &mut requests)?;
-            }
-        }
-        
-        // Add children to work queue for processing
-        if let Some(children) = &node.children {
-            for child in children {
-                work_queue.push((child, Some(entity_id.clone())));
-            }
-        }
-        
-        created_entities.push(entity_id);
-    }
-    
-    Ok(created_entities)
 }
