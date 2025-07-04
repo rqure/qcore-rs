@@ -42,7 +42,7 @@ pub struct Opt {
     #[clap(long, help = "Enable automatic node discovery using mDNS")]
     pub enable_discovery: bool,
 
-    #[clap(long, help = "Minimum number of nodes to wait for during discovery", default_value = "1")]
+    #[clap(long, help = "Minimum number of nodes to wait for during discovery", default_value = "0")]
     pub min_nodes: usize,
 
     #[clap(long, help = "Timeout in seconds to wait for node discovery", default_value = "30")]

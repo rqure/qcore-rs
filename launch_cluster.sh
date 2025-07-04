@@ -116,6 +116,7 @@ launch_node() {
     local node_id=$1
     local port=$2
     local data_dir="./cluster_data/node_$node_id"
+    MIN_NODES=$((NUM_NODES - 1))
     
     # Create data directory
     mkdir -p "$data_dir"
@@ -134,7 +135,7 @@ launch_node() {
         --ws-addr "127.0.0.1:$port" \
         --data-dir "$data_dir" \
         --enable-discovery \
-        --min-nodes $NUM_NODES \
+        --min-nodes $MIN_NODES \
         --discovery-timeout 60 \
         --auto-init \
         > "./cluster_data/node_${node_id}.log" 2>&1 &
