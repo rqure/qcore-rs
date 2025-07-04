@@ -1,93 +1,5 @@
 use clap::{Parser, Subcommand};
-use futures_util::{SinkExt, StreamExt};
-use qlib_rs::{EntityId, EntityType, FieldType, Value, Request, AdjustBehavior, PushCondition};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{Mutex, oneshot};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use uuid::Uuid;
-
-// Import the message types from the main crate
-#[derive(Debug, Serialize, Deserialize)]
-pub enum WebSocketMessage {
-    // Application API messages
-    Perform {
-        id: String,
-        request: CommandRequest,
-    },
-    PerformResponse {
-        id: String,
-        response: CommandResponse,
-    },
-    
-    // Management API messages
-    GetMetrics {
-        id: String,
-    },
-    GetMetricsResponse {
-        id: String,
-        response: openraft::RaftMetrics<u64, openraft::BasicNode>,
-    },
-    
-    // Connection management
-    Error {
-        id: String,
-        error: String,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum CommandRequest {
-    UpdateEntity {
-        request: Vec<Request>,
-    },
-    CreateEntity {
-        entity_type: EntityType,
-        parent_id: Option<EntityId>,
-        name: String,
-    },
-    DeleteEntity {
-        entity_id: EntityId,
-    },
-    SetSchema {
-        entity_schema: qlib_rs::EntitySchema<qlib_rs::Single>,
-    },
-    GetSchema {
-        entity_type: EntityType,
-    },
-    GetCompleteSchema {
-        entity_type: EntityType,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum CommandResponse {
-    UpdateEntity {
-        response: Vec<Request>,
-        error: Option<String>,
-    },
-    CreateEntity {
-        response: Option<EntityId>,
-        error: Option<String>,
-    },
-    DeleteEntity {
-        error: Option<String>,
-    },
-    SetSchema {
-        error: Option<String>,
-    },
-    GetSchema {
-        response: Option<qlib_rs::EntitySchema<qlib_rs::Single>>,
-        error: Option<String>,
-    },
-    GetCompleteSchema {
-        response: Option<qlib_rs::EntitySchema<qlib_rs::Complete>>,
-        error: Option<String>,
-    },
-    Blank {},
-}
+use qlib_rs::{Context, EntityId, EntityType, FieldType, Value, Request, AdjustBehavior, PushCondition, StoreProxy};
 
 #[derive(Parser)]
 #[command(name = "qcore-client")]
@@ -137,7 +49,7 @@ enum Commands {
         /// Entity ID to delete
         entity_id: String,
     },
-    /// Get cluster metrics
+    /// Get cluster metrics (Note: Not available through StoreProxy)
     Metrics,
     /// List entities of a given type
     List {
@@ -155,264 +67,14 @@ enum Commands {
         #[arg(short, long)]
         complete: bool,
     },
-}
-
-pub struct QCoreClient {
-    ws_sender: futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>
-        >,
-        Message
-    >,
-    pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
-}
-
-impl QCoreClient {
-    pub async fn connect(address: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let url = format!("ws://{}", address);
-        println!("Connecting to {}", url);
-        
-        let (ws_stream, _) = connect_async(url).await?;
-        let (ws_sender, mut ws_receiver) = ws_stream.split();
-        
-        let pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        
-        // Spawn task to handle responses
-        let pending_clone = pending_requests.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = ws_receiver.next().await {
-                if let Ok(Message::Text(text)) = msg {
-                    if let Ok(ws_msg) = serde_json::from_str::<WebSocketMessage>(&text) {
-                        match ws_msg {
-                            WebSocketMessage::PerformResponse { id, response } => {
-                                let mut pending = pending_clone.lock().await;
-                                if let Some(sender) = pending.remove(&id) {
-                                    let _ = sender.send(serde_json::to_value(response).unwrap());
-                                }
-                            }
-                            WebSocketMessage::GetMetricsResponse { id, response } => {
-                                let mut pending = pending_clone.lock().await;
-                                if let Some(sender) = pending.remove(&id) {
-                                    let _ = sender.send(serde_json::to_value(response).unwrap());
-                                }
-                            }
-                            WebSocketMessage::Error { id, error } => {
-                                println!("Error: {}", error);
-                                let mut pending = pending_clone.lock().await;
-                                if let Some(sender) = pending.remove(&id) {
-                                    let _ = sender.send(serde_json::Value::Null);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        });
-        
-        Ok(Self {
-            ws_sender,
-            pending_requests,
-        })
-    }
-    
-    pub async fn send_request<T>(&mut self, msg: WebSocketMessage) -> Result<T, Box<dyn std::error::Error>>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let id = match &msg {
-            WebSocketMessage::Perform { id, .. } => id.clone(),
-            WebSocketMessage::GetMetrics { id } => id.clone(),
-            _ => return Err("Invalid message type".into()),
-        };
-        
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut pending = self.pending_requests.lock().await;
-            pending.insert(id.clone(), sender);
-        }
-        
-        let message_json = serde_json::to_string(&msg)?;
-        self.ws_sender.send(Message::Text(message_json)).await?;
-        
-        let response = tokio::time::timeout(Duration::from_secs(30), receiver).await??;
-        Ok(serde_json::from_value(response)?)
-    }
-    
-    pub async fn read_field(&mut self, entity_id: &str, field: &str) -> Result<Request, Box<dyn std::error::Error>> {
-        let entity_id = EntityId::try_from(entity_id)?;
-        let field_type = FieldType::from(field);
-        
-        let request = Request::Read {
-            entity_id,
-            field_type,
-            value: None,
-            write_time: None,
-            writer_id: None,
-        };
-        
-        let msg = WebSocketMessage::Perform {
-            id: Uuid::new_v4().to_string(),
-            request: CommandRequest::UpdateEntity {
-                request: vec![request],
-            },
-        };
-        
-        let response: CommandResponse = self.send_request(msg).await?;
-        
-        match response {
-            CommandResponse::UpdateEntity { response, error } => {
-                if let Some(err) = error {
-                    return Err(err.into());
-                }
-                if let Some(req) = response.into_iter().next() {
-                    Ok(req)
-                } else {
-                    Err("No response received".into())
-                }
-            }
-            _ => Err("Unexpected response type".into()),
-        }
-    }
-    
-    pub async fn write_field(&mut self, entity_id: &str, field: &str, value: Value, behavior: AdjustBehavior) -> Result<(), Box<dyn std::error::Error>> {
-        let entity_id = EntityId::try_from(entity_id)?;
-        let field_type = FieldType::from(field);
-        
-        let request = Request::Write {
-            entity_id,
-            field_type,
-            value: Some(value),
-            push_condition: PushCondition::Always,
-            adjust_behavior: behavior,
-            write_time: None,
-            writer_id: None,
-        };
-        
-        let msg = WebSocketMessage::Perform {
-            id: Uuid::new_v4().to_string(),
-            request: CommandRequest::UpdateEntity {
-                request: vec![request],
-            },
-        };
-        
-        let response: CommandResponse = self.send_request(msg).await?;
-        
-        match response {
-            CommandResponse::UpdateEntity { error, .. } => {
-                if let Some(err) = error {
-                    return Err(err.into());
-                }
-                Ok(())
-            }
-            _ => Err("Unexpected response type".into()),
-        }
-    }
-    
-    pub async fn create_entity(&mut self, entity_type: &str, parent_id: Option<&str>, name: &str) -> Result<EntityId, Box<dyn std::error::Error>> {
-        let entity_type = EntityType::from(entity_type);
-        let parent_id = if let Some(p) = parent_id {
-            Some(EntityId::try_from(p)?)
-        } else {
-            None
-        };
-        
-        let msg = WebSocketMessage::Perform {
-            id: Uuid::new_v4().to_string(),
-            request: CommandRequest::CreateEntity {
-                entity_type,
-                parent_id,
-                name: name.to_string(),
-            },
-        };
-        
-        let response: CommandResponse = self.send_request(msg).await?;
-        
-        match response {
-            CommandResponse::CreateEntity { response, error } => {
-                if let Some(err) = error {
-                    return Err(err.into());
-                }
-                if let Some(entity_id) = response {
-                    Ok(entity_id)
-                } else {
-                    Err("No entity ID returned".into())
-                }
-            }
-            _ => Err("Unexpected response type".into()),
-        }
-    }
-    
-    pub async fn delete_entity(&mut self, entity_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let entity_id = EntityId::try_from(entity_id)?;
-        
-        let msg = WebSocketMessage::Perform {
-            id: Uuid::new_v4().to_string(),
-            request: CommandRequest::DeleteEntity { entity_id },
-        };
-        
-        let response: CommandResponse = self.send_request(msg).await?;
-        
-        match response {
-            CommandResponse::DeleteEntity { error } => {
-                if let Some(err) = error {
-                    return Err(err.into());
-                }
-                Ok(())
-            }
-            _ => Err("Unexpected response type".into()),
-        }
-    }
-    
-    pub async fn get_metrics(&mut self) -> Result<openraft::RaftMetrics<u64, openraft::BasicNode>, Box<dyn std::error::Error>> {
-        let msg = WebSocketMessage::GetMetrics {
-            id: Uuid::new_v4().to_string(),
-        };
-        
-        self.send_request(msg).await
-    }
-    
-    pub async fn get_schema(&mut self, entity_type: &str, complete: bool) -> Result<String, Box<dyn std::error::Error>> {
-        let entity_type = EntityType::from(entity_type);
-        
-        let request = if complete {
-            CommandRequest::GetCompleteSchema { entity_type }
-        } else {
-            CommandRequest::GetSchema { entity_type }
-        };
-        
-        let msg = WebSocketMessage::Perform {
-            id: Uuid::new_v4().to_string(),
-            request,
-        };
-        
-        let response: CommandResponse = self.send_request(msg).await?;
-        
-        match response {
-            CommandResponse::GetSchema { response, error } => {
-                if let Some(err) = error {
-                    return Err(err.into());
-                }
-                if let Some(schema) = response {
-                    Ok(serde_json::to_string_pretty(&schema)?)
-                } else {
-                    Err("No schema returned".into())
-                }
-            }
-            CommandResponse::GetCompleteSchema { response, error } => {
-                if let Some(err) = error {
-                    return Err(err.into());
-                }
-                if let Some(schema) = response {
-                    Ok(serde_json::to_string_pretty(&schema)?)
-                } else {
-                    Err("No schema returned".into())
-                }
-            }
-            _ => Err("Unexpected response type".into()),
-        }
-    }
+    /// Execute a script on the cluster
+    Script {
+        /// Script content to execute (Rhai syntax)
+        script: String,
+        /// Load script from file instead
+        #[arg(short, long)]
+        file: Option<String>,
+    },
 }
 
 fn parse_value(value_str: &str) -> Result<Value, Box<dyn std::error::Error>> {
@@ -471,15 +133,31 @@ fn parse_adjust_behavior(behavior: &str) -> Result<AdjustBehavior, Box<dyn std::
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     
-    let mut client = QCoreClient::connect(&cli.address).await?;
+    let url = format!("ws://{}", cli.address);
+    println!("Connecting to {}", url);
+    
+    let store_proxy = StoreProxy::connect(&url).await
+        .map_err(|e| format!("Failed to connect to store: {}", e))?;
+    let ctx = Context {};
     
     match cli.command {
         Commands::Read { entity_id, field } => {
             println!("Reading field '{}' from entity '{}'", field, entity_id);
             
-            match client.read_field(&entity_id, &field).await {
-                Ok(request) => {
-                    if let Request::Read { value, .. } = request {
+            let entity_id = EntityId::try_from(entity_id.as_str())?;
+            let field_type = FieldType::from(field.as_str());
+            
+            let mut requests = vec![Request::Read {
+                entity_id,
+                field_type,
+                value: None,
+                write_time: None,
+                writer_id: None,
+            }];
+            
+            match store_proxy.perform(&ctx, &mut requests).await {
+                Ok(()) => {
+                    if let Some(Request::Read { value, .. }) = requests.first() {
                         if let Some(val) = value {
                             println!("Value: {}", serde_json::to_string_pretty(&val)?);
                         } else {
@@ -496,9 +174,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let parsed_value = parse_value(&value)?;
             let adjust_behavior = parse_adjust_behavior(&behavior)?;
+            let entity_id = EntityId::try_from(entity_id.as_str())?;
+            let field_type = FieldType::from(field.as_str());
             
-            match client.write_field(&entity_id, &field, parsed_value, adjust_behavior).await {
-                Ok(()) => println!("Successfully wrote value"),
+            let mut requests = vec![Request::Write {
+                entity_id,
+                field_type,
+                value: Some(parsed_value),
+                push_condition: PushCondition::Always,
+                adjust_behavior,
+                write_time: None,
+                writer_id: None,
+            }];
+            
+            match store_proxy.perform(&ctx, &mut requests).await {
+                Ok(_) => println!("Successfully wrote value"),
                 Err(e) => println!("Error writing field: {}", e),
             }
         }
@@ -506,8 +196,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Create { entity_type, parent, name } => {
             println!("Creating entity of type '{}' with name '{}'", entity_type, name);
             
-            match client.create_entity(&entity_type, parent.as_deref(), &name).await {
-                Ok(entity_id) => println!("Created entity: {}", entity_id),
+            let entity_type = EntityType::from(entity_type.as_str());
+            let parent_id = if let Some(p) = parent {
+                Some(EntityId::try_from(p.as_str())?)
+            } else {
+                None
+            };
+            
+            match store_proxy.create_entity(&ctx, &entity_type, parent_id, &name).await {
+                Ok(entity) => println!("Created entity: {}", entity.entity_id),
                 Err(e) => println!("Error creating entity: {}", e),
             }
         }
@@ -515,43 +212,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Delete { entity_id } => {
             println!("Deleting entity '{}'", entity_id);
             
-            match client.delete_entity(&entity_id).await {
+            let entity_id = EntityId::try_from(entity_id.as_str())?;
+            
+            match store_proxy.delete_entity(&ctx, &entity_id).await {
                 Ok(()) => println!("Successfully deleted entity"),
                 Err(e) => println!("Error deleting entity: {}", e),
             }
         }
         
         Commands::Metrics => {
-            println!("Fetching cluster metrics...");
-            
-            match client.get_metrics().await {
-                Ok(metrics) => {
-                    println!("Cluster Metrics:");
-                    println!("  Current Leader: {:?}", metrics.current_leader);
-                    println!("  Current Term: {}", metrics.current_term);
-                    println!("  State: {:?}", metrics.state);
-                    println!("  Last Log Index: {:?}", metrics.last_log_index);
-                    println!("  Last Applied: {:?}", metrics.last_applied);
-                    println!("  Membership: {:?}", metrics.membership_config);
-                }
-                Err(e) => println!("Error fetching metrics: {}", e),
-            }
+            println!("Cluster metrics are not available through StoreProxy.");
+            println!("This feature requires direct access to the cluster's Raft metrics.");
         }
         
         Commands::List { entity_type, limit: _limit } => {
             println!("Listing entities of type '{}'", entity_type);
-            println!("Note: List functionality requires additional implementation on the server side");
+            
+            let entity_type = EntityType::from(entity_type.as_str());
+            
+            match store_proxy.find_entities(&ctx, &entity_type, None, None).await {
+                Ok(page_result) => {
+                    println!("Found {} entities:", page_result.items.len());
+                    for entity_id in page_result.items {
+                        println!("  {}", entity_id);
+                    }
+                    if page_result.next_cursor.is_some() {
+                        println!("  ... and more (use pagination to see all)");
+                    }
+                }
+                Err(e) => println!("Error listing entities: {}", e),
+            }
         }
         
         Commands::Schema { entity_type, complete } => {
             println!("Fetching schema for entity type '{}'", entity_type);
             
-            match client.get_schema(&entity_type, complete).await {
-                Ok(schema) => {
-                    println!("Schema:");
-                    println!("{}", schema);
+            let entity_type = EntityType::from(entity_type.as_str());
+            
+            if complete {
+                match store_proxy.get_complete_entity_schema(&ctx, &entity_type).await {
+                    Ok(schema) => {
+                        println!("Complete Schema:");
+                        println!("{}", serde_json::to_string_pretty(&schema)?);
+                    }
+                    Err(e) => println!("Error fetching complete schema: {}", e),
                 }
-                Err(e) => println!("Error fetching schema: {}", e),
+            } else {
+                match store_proxy.get_entity_schema(&ctx, &entity_type).await {
+                    Ok(Some(schema)) => {
+                        println!("Schema:");
+                        println!("{}", serde_json::to_string_pretty(&schema)?);
+                    }
+                    Ok(None) => println!("No schema found for entity type '{}'", entity_type),
+                    Err(e) => println!("Error fetching schema: {}", e),
+                }
+            }
+        }
+        
+        Commands::Script { script, file } => {
+            let script_content = if let Some(file_path) = file {
+                println!("Loading script from file: {}", file_path);
+                std::fs::read_to_string(&file_path)
+                    .map_err(|e| format!("Failed to read script file: {}", e))?
+            } else {
+                script
+            };
+            
+            println!("Executing script on cluster...");
+            
+            match store_proxy.execute_script(&ctx, &script_content).await {
+                Ok(result) => {
+                    println!("Script execution completed.");
+                    println!("Result: {}", result);
+                }
+                Err(e) => println!("Error executing script: {}", e),
             }
         }
     }

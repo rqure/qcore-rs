@@ -93,7 +93,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<qlib_rs::Entity, String>,
     },
-    
+
     StoreDeleteEntity {
         id: String,
         entity_id: qlib_rs::EntityId,
@@ -102,7 +102,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<(), String>,
     },
-    
+
     StoreSetEntitySchema {
         id: String,
         schema: qlib_rs::EntitySchema<qlib_rs::Single>,
@@ -111,7 +111,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<(), String>,
     },
-    
+
     StoreGetEntitySchema {
         id: String,
         entity_type: qlib_rs::EntityType,
@@ -120,7 +120,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<Option<qlib_rs::EntitySchema<qlib_rs::Single>>, String>,
     },
-    
+
     StoreGetCompleteEntitySchema {
         id: String,
         entity_type: qlib_rs::EntityType,
@@ -129,7 +129,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<qlib_rs::EntitySchema<qlib_rs::Complete>, String>,
     },
-    
+
     StoreSetFieldSchema {
         id: String,
         entity_type: qlib_rs::EntityType,
@@ -140,7 +140,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<(), String>,
     },
-    
+
     StoreGetFieldSchema {
         id: String,
         entity_type: qlib_rs::EntityType,
@@ -150,7 +150,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<Option<qlib_rs::FieldSchema>, String>,
     },
-    
+
     StoreEntityExists {
         id: String,
         entity_id: qlib_rs::EntityId,
@@ -159,7 +159,7 @@ pub enum WebSocketMessage {
         id: String,
         response: bool,
     },
-    
+
     StoreFieldExists {
         id: String,
         entity_id: qlib_rs::EntityId,
@@ -169,7 +169,7 @@ pub enum WebSocketMessage {
         id: String,
         response: bool,
     },
-    
+
     StorePerform {
         id: String,
         requests: Vec<qlib_rs::Request>,
@@ -178,7 +178,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<Vec<qlib_rs::Request>, String>,
     },
-    
+
     StoreFindEntities {
         id: String,
         entity_type: qlib_rs::EntityType,
@@ -189,7 +189,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<qlib_rs::PageResult<qlib_rs::EntityId>, String>,
     },
-    
+
     StoreFindEntitiesExact {
         id: String,
         entity_type: qlib_rs::EntityType,
@@ -200,7 +200,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<qlib_rs::PageResult<qlib_rs::EntityId>, String>,
     },
-    
+
     StoreGetEntityTypes {
         id: String,
         parent_type: Option<qlib_rs::EntityType>,
@@ -210,7 +210,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<qlib_rs::PageResult<qlib_rs::EntityType>, String>,
     },
-    
+
     StoreTakeSnapshot {
         id: String,
     },
@@ -218,7 +218,7 @@ pub enum WebSocketMessage {
         id: String,
         response: qlib_rs::Snapshot,
     },
-    
+
     StoreRestoreSnapshot {
         id: String,
         snapshot: qlib_rs::Snapshot,
@@ -227,7 +227,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<(), String>,
     },
-    
+
     // Notification support
     StoreRegisterNotification {
         id: String,
@@ -237,7 +237,7 @@ pub enum WebSocketMessage {
         id: String,
         response: Result<qlib_rs::NotifyToken, String>,
     },
-    
+
     StoreUnregisterNotification {
         id: String,
         token: qlib_rs::NotifyToken,
@@ -246,7 +246,7 @@ pub enum WebSocketMessage {
         id: String,
         response: bool,
     },
-    
+
     StoreGetNotificationConfigs {
         id: String,
     },
@@ -254,10 +254,20 @@ pub enum WebSocketMessage {
         id: String,
         response: Vec<(qlib_rs::NotifyToken, qlib_rs::NotifyConfig)>,
     },
-    
+
     // Notification delivery
     StoreNotification {
         notification: qlib_rs::Notification,
+    },
+
+    // Script execution
+    StoreExecuteScript {
+        id: String,
+        script: String,
+    },
+    StoreExecuteScriptResponse {
+        id: String,
+        response: Result<bool, String>,
     },
 
     // Connection management
@@ -294,8 +304,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, app: Arc<App>) {
 
     while let Some(msg) = ws_receiver.next().await {
         match msg {
-            Ok(Message::Text(text)) => match serde_json::from_str::<WebSocketMessage>(&text) {
-                Ok(ws_msg) => {
+            Ok(Message::Text(text)) => {
+                // Try to parse as WebSocketMessage first
+                if let Ok(ws_msg) = serde_json::from_str::<WebSocketMessage>(&text) {
                     let response = handle_websocket_message(ws_msg, &app).await;
                     if let Some(response_msg) = response {
                         match serde_json::to_string(&response_msg) {
@@ -311,17 +322,35 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, app: Arc<App>) {
                         }
                     }
                 }
-                Err(e) => {
-                    log::error!("Failed to parse WebSocket message: {}", e);
+                // Try to parse as StoreMessage (for StoreProxy compatibility)
+                else if let Ok(store_msg) = serde_json::from_str::<qlib_rs::StoreMessage>(&text) {
+                    let response = handle_store_message(store_msg, &app).await;
+                    if let Some(response_msg) = response {
+                        match serde_json::to_string(&response_msg) {
+                            Ok(response_text) => {
+                                if let Err(e) = ws_sender.send(Message::Text(response_text)).await {
+                                    log::error!("Failed to send StoreMessage response: {}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to serialize StoreMessage response: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    log::error!(
+                        "Failed to parse message as either WebSocketMessage or StoreMessage"
+                    );
                     let error_msg = WebSocketMessage::Error {
                         id: Uuid::new_v4().to_string(),
-                        error: format!("Failed to parse message: {}", e),
+                        error: "Failed to parse message".to_string(),
                     };
                     if let Ok(error_text) = serde_json::to_string(&error_msg) {
                         let _ = ws_sender.send(Message::Text(error_text)).await;
                     }
                 }
-            },
+            }
             Ok(Message::Binary(_)) => {
                 log::warn!("Received binary message, ignoring");
             }
@@ -461,8 +490,17 @@ async fn handle_websocket_message(
         }
 
         // Store proxy messages - handle direct store operations
-        WebSocketMessage::StoreCreateEntity { id, entity_type, parent_id, name } => {
-            let request = CommandRequest::CreateEntity { entity_type, parent_id, name };
+        WebSocketMessage::StoreCreateEntity {
+            id,
+            entity_type,
+            parent_id,
+            name,
+        } => {
+            let request = CommandRequest::CreateEntity {
+                entity_type,
+                parent_id,
+                name,
+            };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::CreateEntity { response, error } => {
@@ -515,7 +553,9 @@ async fn handle_websocket_message(
         }
 
         WebSocketMessage::StoreSetEntitySchema { id, schema } => {
-            let request = CommandRequest::SetSchema { entity_schema: schema };
+            let request = CommandRequest::SetSchema {
+                entity_schema: schema,
+            };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::SetSchema { error } => {
@@ -605,8 +645,15 @@ async fn handle_websocket_message(
             }
         }
 
-        WebSocketMessage::StoreFieldExists { id, entity_id, field_type } => {
-            let request = CommandRequest::FieldExists { entity_id, field_type };
+        WebSocketMessage::StoreFieldExists {
+            id,
+            entity_id,
+            field_type,
+        } => {
+            let request = CommandRequest::FieldExists {
+                entity_id,
+                field_type,
+            };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::FieldExists { response } => {
@@ -643,8 +690,17 @@ async fn handle_websocket_message(
             }
         }
 
-        WebSocketMessage::StoreFindEntities { id, entity_type, parent_id, page_opts } => {
-            let request = CommandRequest::FindEntities { entity_type, parent_id, page_opts };
+        WebSocketMessage::StoreFindEntities {
+            id,
+            entity_type,
+            parent_id,
+            page_opts,
+        } => {
+            let request = CommandRequest::FindEntities {
+                entity_type,
+                parent_id,
+                page_opts,
+            };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::FindEntities { response } => {
@@ -657,8 +713,17 @@ async fn handle_websocket_message(
             }
         }
 
-        WebSocketMessage::StoreFindEntitiesExact { id, entity_type, parent_id, page_opts } => {
-            let request = CommandRequest::FindEntitiesExact { entity_type, parent_id, page_opts };
+        WebSocketMessage::StoreFindEntitiesExact {
+            id,
+            entity_type,
+            parent_id,
+            page_opts,
+        } => {
+            let request = CommandRequest::FindEntitiesExact {
+                entity_type,
+                parent_id,
+                page_opts,
+            };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::FindEntitiesExact { response } => {
@@ -671,8 +736,15 @@ async fn handle_websocket_message(
             }
         }
 
-        WebSocketMessage::StoreGetEntityTypes { id, parent_type, page_opts } => {
-            let request = CommandRequest::GetEntityTypes { parent_type, page_opts };
+        WebSocketMessage::StoreGetEntityTypes {
+            id,
+            parent_type,
+            page_opts,
+        } => {
+            let request = CommandRequest::GetEntityTypes {
+                parent_type,
+                page_opts,
+            };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::GetEntityTypes { response } => {
@@ -768,6 +840,30 @@ async fn handle_websocket_message(
             }
         }
 
+        WebSocketMessage::StoreExecuteScript { id, script } => {
+            let request = CommandRequest::ExecuteScript { script };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::ExecuteScript { response, error } => {
+                    if let Some(err) = error {
+                        Some(WebSocketMessage::StoreExecuteScriptResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(WebSocketMessage::StoreExecuteScriptResponse {
+                            id,
+                            response: Ok(response),
+                        })
+                    }
+                }
+                _ => Some(WebSocketMessage::StoreExecuteScriptResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+
         // Response messages don't need handling here as they're sent by the client
         _ => None,
     }
@@ -783,8 +879,13 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
                 .all(|r| matches!(r, qlib_rs::Request::Read { .. }))
             {
                 let mut store_req = request.clone();
-                let mut state_machine = app.state_machine_store.state_machine.write().await;
-                return match state_machine.data.perform(&Context {}, &mut store_req) {
+                let state_machine = app.state_machine_store.state_machine.write().await;
+                return match state_machine
+                    .data
+                    .lock()
+                    .unwrap()
+                    .perform(&Context {}, &mut store_req)
+                {
                     Ok(_) => CommandResponse::UpdateEntity {
                         response: store_req,
                         error: None,
@@ -800,6 +901,8 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
             let state_machine = app.state_machine_store.state_machine.read().await;
             return match state_machine
                 .data
+                .lock()
+                .unwrap()
                 .get_entity_schema(&Context {}, entity_type)
             {
                 Ok(schema) => CommandResponse::GetSchema {
@@ -816,6 +919,8 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
             let state_machine = app.state_machine_store.state_machine.read().await;
             return match state_machine
                 .data
+                .lock()
+                .unwrap()
                 .get_complete_entity_schema(&Context {}, entity_type)
             {
                 Ok(schema) => CommandResponse::GetCompleteSchema {
@@ -828,12 +933,16 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
                 },
             };
         }
-        CommandRequest::GetFieldSchema { entity_type, field_type } => {
+        CommandRequest::GetFieldSchema {
+            entity_type,
+            field_type,
+        } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
-            return match state_machine
-                .data
-                .get_field_schema(&Context {}, entity_type, field_type)
-            {
+            return match state_machine.data.lock().unwrap().get_field_schema(
+                &Context {},
+                entity_type,
+                field_type,
+            ) {
                 Ok(schema) => CommandResponse::GetFieldSchema {
                     response: Some(schema),
                     error: None,
@@ -846,20 +955,36 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
         }
         CommandRequest::EntityExists { entity_id } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
-            let exists = state_machine.data.entity_exists(&Context {}, entity_id);
+            let exists = state_machine
+                .data
+                .lock()
+                .unwrap()
+                .entity_exists(&Context {}, entity_id);
             return CommandResponse::EntityExists { response: exists };
         }
-        CommandRequest::FieldExists { entity_id, field_type } => {
+        CommandRequest::FieldExists {
+            entity_id,
+            field_type,
+        } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
-            let exists = state_machine.data.entity_field_exists(&Context {}, entity_id, field_type);
+            let exists = state_machine.data.lock().unwrap().entity_field_exists(
+                &Context {},
+                entity_id,
+                field_type,
+            );
             return CommandResponse::FieldExists { response: exists };
         }
-        CommandRequest::FindEntities { entity_type, parent_id: _, page_opts } => {
+        CommandRequest::FindEntities {
+            entity_type,
+            parent_id: _,
+            page_opts,
+        } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
-            return match state_machine
-                .data
-                .find_entities(&Context {}, entity_type, page_opts.as_ref().cloned())
-            {
+            return match state_machine.data.lock().unwrap().find_entities(
+                &Context {},
+                entity_type,
+                page_opts.as_ref().cloned(),
+            ) {
                 Ok(result) => CommandResponse::FindEntities {
                     response: Ok(result),
                 },
@@ -868,12 +993,17 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
                 },
             };
         }
-        CommandRequest::FindEntitiesExact { entity_type, parent_id: _, page_opts } => {
+        CommandRequest::FindEntitiesExact {
+            entity_type,
+            parent_id: _,
+            page_opts,
+        } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
-            return match state_machine
-                .data
-                .find_entities_exact(&Context {}, entity_type, page_opts.as_ref().cloned())
-            {
+            return match state_machine.data.lock().unwrap().find_entities_exact(
+                &Context {},
+                entity_type,
+                page_opts.as_ref().cloned(),
+            ) {
                 Ok(result) => CommandResponse::FindEntitiesExact {
                     response: Ok(result),
                 },
@@ -882,10 +1012,15 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
                 },
             };
         }
-        CommandRequest::GetEntityTypes { parent_type: _, page_opts } => {
+        CommandRequest::GetEntityTypes {
+            parent_type: _,
+            page_opts,
+        } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
             return match state_machine
                 .data
+                .lock()
+                .unwrap()
                 .get_entity_types(&Context {}, page_opts.as_ref().cloned())
             {
                 Ok(result) => CommandResponse::GetEntityTypes {
@@ -898,17 +1033,21 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
         }
         CommandRequest::TakeSnapshot => {
             let state_machine = app.state_machine_store.state_machine.read().await;
-            let snapshot = state_machine.data.take_snapshot(&Context {});
-            return CommandResponse::TakeSnapshot {
-                response: snapshot,
-            };
+            let snapshot = state_machine
+                .data
+                .lock()
+                .unwrap()
+                .take_snapshot(&Context {});
+            return CommandResponse::TakeSnapshot { response: snapshot };
         }
         CommandRequest::GetNotificationConfigs => {
             let state_machine = app.state_machine_store.state_machine.read().await;
-            let configs = state_machine.data.get_notification_configs(&Context {});
-            return CommandResponse::GetNotificationConfigs {
-                response: configs,
-            };
+            let configs = state_machine
+                .data
+                .lock()
+                .unwrap()
+                .get_notification_configs(&Context {});
+            return CommandResponse::GetNotificationConfigs { response: configs };
         }
         _ => {
             // Fall through to write operations handling below
@@ -917,21 +1056,30 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
 
     // For write operations, check if we're the leader first
     let metrics = app.raft.metrics().borrow().clone();
-    
+
     // If we're not the leader and there is a leader, forward the request
     if let Some(leader_id) = metrics.current_leader {
         if leader_id != app.id {
             // We're not the leader, try to forward the request
-            let leader_node = metrics.membership_config.nodes()
+            let leader_node = metrics
+                .membership_config
+                .nodes()
                 .find(|(id, _)| **id == leader_id)
                 .map(|(_, node)| node);
-                
+
             if let Some(leader_node) = leader_node {
-                log::info!("Forwarding write request to leader {} at {}", leader_id, leader_node.addr);
+                log::info!(
+                    "Forwarding write request to leader {} at {}",
+                    leader_id,
+                    leader_node.addr
+                );
                 match forward_request_to_leader(req.clone(), leader_id, app).await {
                     Ok(response) => return response,
                     Err(e) => {
-                        log::warn!("Failed to forward request to leader: {}, falling back to local Raft write", e);
+                        log::warn!(
+                            "Failed to forward request to leader: {}, falling back to local Raft write",
+                            e
+                        );
                         // Fall through to local Raft write attempt
                     }
                 }
@@ -979,22 +1127,64 @@ async fn forward_request_to_leader(
 ) -> Result<CommandResponse, Box<dyn std::error::Error + Send + Sync>> {
     // Get the leader's address from the membership configuration
     let metrics = app.raft.metrics().borrow().clone();
-    
-    let leader_node = metrics.membership_config.nodes()
+
+    let leader_node = metrics
+        .membership_config
+        .nodes()
         .find(|(id, _)| **id == leader_id)
         .map(|(_, node)| node);
-        
+
     if let Some(leader_node) = leader_node {
         let leader_addr = &leader_node.addr;
-        
+
         // Use the existing network to get or create a connection to the leader
-        let connection = app.network.get_or_create_connection(leader_id, leader_addr).await?;
-        
+        let connection = app
+            .network
+            .get_or_create_connection(leader_id, leader_addr)
+            .await?;
+
         // Send the request using the persistent connection
         let response = connection.send_application_request(req).await?;
-        
+
         Ok(response)
     } else {
         Err(format!("Leader node {} not found in membership", leader_id).into())
+    }
+}
+
+/// Handle StoreMessage format (for StoreProxy compatibility)
+async fn handle_store_message(
+    msg: qlib_rs::StoreMessage,
+    app: &Arc<App>,
+) -> Option<qlib_rs::StoreMessage> {
+    match msg {
+        qlib_rs::StoreMessage::ExecuteScript { id, script } => {
+            let request = CommandRequest::ExecuteScript { script };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::ExecuteScript { response, error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::ExecuteScriptResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::ExecuteScriptResponse {
+                            id,
+                            response: Ok(response),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::ExecuteScriptResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        // For now, only handle ExecuteScript. Other StoreMessage variants would need similar handling.
+        _ => {
+            log::warn!("Unhandled StoreMessage variant: {:?}", msg);
+            None
+        }
     }
 }

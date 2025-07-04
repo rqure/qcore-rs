@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::path::PathBuf;
+use std::sync::Mutex as SyncMutex;
 
 use openraft::BasicNode;
 use openraft::Entry;
@@ -18,6 +20,7 @@ use openraft::StorageIOError;
 use openraft::StoredMembership;
 use openraft::storage::RaftStateMachine;
 use openraft::storage::Snapshot;
+use qlib_rs::ScriptingEngine;
 use qlib_rs::Store;
 use serde::Deserialize;
 use serde::Serialize;
@@ -674,6 +677,9 @@ pub enum CommandRequest {
         token: qlib_rs::NotifyToken,
     },
     GetNotificationConfigs,
+    ExecuteScript {
+        script: String,
+    },
 }
 
 /**
@@ -743,6 +749,10 @@ pub enum CommandResponse {
     GetNotificationConfigs {
         response: Vec<(qlib_rs::NotifyToken, qlib_rs::NotifyConfig)>,
     },
+    ExecuteScript {
+        response: bool,
+        error: Option<String>,
+    },
     Blank {},
 }
 
@@ -766,7 +776,7 @@ pub struct StateMachineData {
     pub last_membership: StoredMembership<NodeId, BasicNode>,
 
     /// Application data.
-    pub data: Store,
+    pub data: Arc<SyncMutex<Store>>,
 }
 
 /// Defines a state machine for the Raft cluster. This state machine represents a copy of the
@@ -953,7 +963,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         // Serialize the data of the state machine.
         let state_machine = self.state_machine.read().await;
-        let data = serde_json::to_vec(&state_machine.data)
+        let data = serde_json::to_vec(state_machine.data.lock().unwrap().deref())
             .map_err(|e| StorageIOError::read_state_machine(&e))?;
 
         let last_applied_log = state_machine.last_applied_log;
@@ -1031,7 +1041,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             parent_id,
                             name,
                         } => {
-                            match sm.data.create_entity(
+                            match sm.data.lock().unwrap().create_entity(
                                 &ctx,
                                 entity_type,
                                 parent_id.clone(),
@@ -1052,7 +1062,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             }
                         }
                         CommandRequest::DeleteEntity { entity_id } => {
-                            match sm.data.delete_entity(&ctx, entity_id) {
+                            match sm.data.lock().unwrap().delete_entity(&ctx, entity_id) {
                                 Ok(_) => {
                                     res.push(CommandResponse::DeleteEntity { error: None });
                                 }
@@ -1064,7 +1074,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             }
                         }
                         CommandRequest::SetSchema { entity_schema } => {
-                            match sm.data.set_entity_schema(&ctx, entity_schema) {
+                            match sm.data.lock().unwrap().set_entity_schema(&ctx, entity_schema) {
                                 Ok(_) => {
                                     res.push(CommandResponse::SetSchema { error: None });
                                 }
@@ -1078,7 +1088,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                         CommandRequest::UpdateEntity { request } => {
                             // Apply the request to the state machine.
                             let mut req = request.clone();
-                            match sm.data.perform(&ctx, &mut req) {
+                            match sm.data.lock().unwrap().perform(&ctx, &mut req) {
                                 Ok(_) => {
                                     res.push(CommandResponse::UpdateEntity {
                                         response: req,
@@ -1092,7 +1102,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             }
                         }
                         CommandRequest::GetSchema { entity_type } => {
-                            match sm.data.get_entity_schema(&ctx, entity_type) {
+                            match sm.data.lock().unwrap().get_entity_schema(&ctx, entity_type) {
                                 Ok(schema) => {
                                     res.push(CommandResponse::GetSchema {
                                         response: Some(schema),
@@ -1108,7 +1118,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             }
                         }
                         CommandRequest::GetCompleteSchema { entity_type } => {
-                            match sm.data.get_complete_entity_schema(&ctx, entity_type) {
+                            match sm.data.lock().unwrap().get_complete_entity_schema(&ctx, entity_type) {
                                 Ok(schema) => {
                                     res.push(CommandResponse::GetCompleteSchema {
                                         response: Some(schema),
@@ -1127,7 +1137,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             }
                         }
                         CommandRequest::SetFieldSchema { entity_type, field_type, schema } => {
-                            match sm.data.set_field_schema(&ctx, entity_type, field_type, schema.clone()) {
+                            match sm.data.lock().unwrap().set_field_schema(&ctx, entity_type, field_type, schema.clone()) {
                                 Ok(_) => {
                                     res.push(CommandResponse::SetFieldSchema { error: None });
                                 }
@@ -1139,7 +1149,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             }
                         }
                         CommandRequest::RestoreSnapshot { snapshot } => {
-                            sm.data.restore_snapshot(&ctx, snapshot.clone());
+                            sm.data.lock().unwrap().restore_snapshot(&ctx, snapshot.clone());
                             res.push(CommandResponse::RestoreSnapshot { error: None });
                         }
                         CommandRequest::RegisterNotification { config: _ } => {
@@ -1150,10 +1160,28 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                             });
                         }
                         CommandRequest::UnregisterNotification { token } => {
-                            let success = sm.data.unregister_notification_by_token(token);
+                            let success = sm.data.lock().unwrap().unregister_notification_by_token(token);
                             res.push(CommandResponse::UnregisterNotification {
                                 response: success,
                             });
+                        }
+                        CommandRequest::ExecuteScript { script } => {
+                            let engine = ScriptingEngine::new(sm.data.clone());
+
+                            match engine.execute(script.as_str()) {
+                                Ok(result) => {
+                                    res.push(CommandResponse::ExecuteScript {
+                                        response: result,
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    res.push(CommandResponse::ExecuteScript {
+                                        response: false,
+                                        error: Some(format!("{}", e)),
+                                    });
+                                }
+                            }
                         }
                         // Read-only operations are handled directly and don't go through Raft
                         CommandRequest::GetFieldSchema { .. } |
@@ -1195,12 +1223,14 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         };
 
         // Update the state machine.
-        let updated_state_machine_data = serde_json::from_slice(&new_snapshot.data)
+        let updated_state_machine_data: Store = serde_json::from_slice(&new_snapshot.data)
             .map_err(|e| StorageIOError::read_snapshot(Some(new_snapshot.meta.signature()), &e))?;
+
+        let store = Arc::new(SyncMutex::new(updated_state_machine_data));
         let updated_state_machine = StateMachineData {
             last_applied_log: meta.last_log_id,
             last_membership: meta.last_membership.clone(),
-            data: updated_state_machine_data,
+            data: store,
         };
         let mut state_machine = self.state_machine.write().await;
         *state_machine = updated_state_machine;

@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let mut store = state_machine_store.state_machine.write().await;
+        let store = state_machine_store.state_machine.write().await;
 
         let ctx = Context {};
         
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             // Try to set the schema with error handling and timeout
             let schema_future = async {
-                store.data.set_entity_schema(&ctx, &schema)
+                store.data.lock().unwrap().set_entity_schema(&ctx, &schema)
             };
             
             match tokio::time::timeout(std::time::Duration::from_secs(5), schema_future).await {
@@ -159,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create the initial tree structure if provided
         if let Some(tree) = tree_nodes {
             log::info!("Creating entity tree structure...");
-            match config::create_entity_tree(&mut store.data, &ctx, &tree, None).await {
+            match config::create_entity_tree(&mut store.data.lock().unwrap(), &ctx, &tree, None).await {
                 Ok(entities) => {
                     log::info!("Successfully created {} entities from tree definition", entities.len());
                 }
