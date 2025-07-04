@@ -11,10 +11,6 @@ path = "src/lib.rs"
 name = "qcore-rs"
 path = "src/main.rs"
 
-[[example]]
-name = "websocket_client"
-path = "examples/websocket_client.rs"
-
 [dependencies]
 actix-web = "4.11.0"
 actix-web-actors = "4.3.1"
