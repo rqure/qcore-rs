@@ -1,7 +1,7 @@
 use clap::Parser;
 use qlib_rs::{Context, EntitySchema, Single};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod app;
@@ -92,6 +92,7 @@ async fn create_app(options: &Opt) -> Result<Arc<App>> {
         raft,
         state_machine_store,
         network,
+        discovery: Mutex::new(None),
     }))
 }
 
@@ -195,6 +196,12 @@ async fn setup_cluster_with_discovery(
         auto_init: options.auto_init,
         timeout: Duration::from_secs(options.discovery_timeout),
     };
+    
+    // Store the discovery instance in the App to keep it alive
+    {
+        let mut discovery_guard = app.discovery.lock().unwrap();
+        *discovery_guard = Some(discovery.clone());
+    }
     
     spawn_discovery_handler(app.clone(), discovery_rx, discovery_config, schemas_and_tree.clone()).await;
     

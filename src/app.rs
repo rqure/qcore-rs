@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::io::Cursor;
 
 use crate::store::{CommandRequest, CommandResponse, StateMachineStore};
@@ -32,4 +33,5 @@ pub struct App {
     pub raft: Raft,
     pub state_machine_store: Arc<StateMachineStore>,
     pub network: Network,
+    pub discovery: Mutex<Option<Arc<crate::discovery::MdnsDiscovery>>>,
 }
