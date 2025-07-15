@@ -26,7 +26,7 @@ pub struct Opt {
     pub ws_addr: String,
 
     #[clap(long, help = "Path to the YAML schema configuration file", default_value = "schemas.yaml")]
-    pub config_file: Option<PathBuf>,
+    pub config_file: PathBuf,
 
     #[clap(long, help = "Data directory for persistent storage", default_value = "./raft_data")]
     pub data_dir: PathBuf,
@@ -149,23 +149,15 @@ async fn create_state_machine_store(options: &Opt) -> Result<Arc<StateMachineSto
 
 type SchemasAndTree = (Option<Vec<EntitySchema<Single>>>, Option<Vec<config::YamlEntityTreeNode>>);
 
-fn load_schemas(config_file: &Option<PathBuf>) -> Result<SchemasAndTree> {
-    match config_file {
-        Some(config_path) => {
-            let (schemas, tree_nodes) = config::load_schemas_from_yaml(config_path)
-                .map_err(|e| {
-                    log::error!("Failed to load schemas from config file: {}", e);
-                    format!("Failed to load schemas from config file: {}", e)
-                })?;
-            
-            log::info!("Successfully loaded {} schema definitions from config file", schemas.len());
-            Ok((Some(schemas), tree_nodes))
-        }
-        None => {
-            log::info!("No config file provided, schemas will need to be set manually");
-            Ok((None, None))
-        }
-    }
+fn load_schemas(config_file: &PathBuf) -> Result<SchemasAndTree> {
+    let (schemas, tree_nodes) = config::load_schemas_from_yaml(config_file)
+        .map_err(|e| {
+            log::error!("Failed to load schemas from config file: {}", e);
+            format!("Failed to load schemas from config file: {}", e)
+        })?;
+    
+    log::info!("Successfully loaded {} schema definitions from config file", schemas.len());
+    Ok((Some(schemas), tree_nodes))
 }
 
 async fn setup_cluster(
@@ -483,27 +475,51 @@ async fn is_cluster_already_initialized(app: &Arc<App>) -> bool {
 }
 
 async fn is_fresh_cluster(app: &Arc<App>) -> Result<bool> {    
-    // Check if any schemas exist in the store by directly accessing the state machine
-    // This avoids the Raft layer since GetSchema is a read-only operation
-    let entity_type = qlib_rs::EntityType::from("Object".to_string());
+    // Check if there are any entities in the store at all
+    // This avoids checking specific schemas and just looks for actual data
     let ctx = qlib_rs::Context {};
     
     // Access the state machine directly for read operations
     let state_machine = app.state_machine_store.state_machine.read().await;
-    match state_machine.data.lock().unwrap().get_entity_schema(&ctx, &entity_type) {
-        Ok(_schema) => {
-            log::debug!("Found existing schema for 'Object', cluster is not fresh");
-            Ok(false)
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            if error_msg.contains("not found") || error_msg.contains("does not exist") {
-                log::debug!("No schema found for 'Object', cluster appears fresh");
+    
+    // Try to get all entity types - if this fails or returns empty, cluster is fresh
+    match state_machine.data.lock().unwrap().get_entity_types(&ctx, None) {
+        Ok(entity_types) => {
+            if entity_types.items.is_empty() {
+                log::debug!("No entity types found, cluster is fresh");
                 Ok(true)
             } else {
-                log::debug!("Error checking schema (but not 'not found'): {}, assuming not fresh", error_msg);
-                Ok(false)
+                log::debug!("Found {} entity types, checking for entities", entity_types.items.len());
+                
+                // Check if any of these entity types have actual entities
+                let mut has_entities = false;
+                for entity_type in entity_types.items {
+                    match state_machine.data.lock().unwrap().find_entities(&ctx, &entity_type, None) {
+                        Ok(entities) => {
+                            if !entities.items.is_empty() {
+                                log::debug!("Found {} entities of type {}, cluster is not fresh", entities.items.len(), entity_type);
+                                has_entities = true;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            // Ignore errors, might be schema issues
+                            continue;
+                        }
+                    }
+                }
+                
+                if has_entities {
+                    Ok(false)
+                } else {
+                    log::debug!("No entities found in any type, cluster is fresh");
+                    Ok(true)
+                }
             }
+        }
+        Err(e) => {
+            log::debug!("Error getting entity types: {}, assuming cluster is fresh", e);
+            Ok(true)
         }
     }
 }
