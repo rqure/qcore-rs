@@ -1174,6 +1174,334 @@ async fn handle_store_message(
     app: &Arc<App>,
 ) -> Option<qlib_rs::StoreMessage> {
     match msg {
+        qlib_rs::StoreMessage::CreateEntity { id, entity_type, parent_id, name } => {
+            let request = CommandRequest::CreateEntity { entity_type, parent_id, name };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::CreateEntity { response, error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::CreateEntityResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else if let Some(entity) = response {
+                        Some(qlib_rs::StoreMessage::CreateEntityResponse {
+                            id,
+                            response: Ok(entity),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::CreateEntityResponse {
+                            id,
+                            response: Err("No entity returned".to_string()),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::CreateEntityResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::DeleteEntity { id, entity_id } => {
+            let request = CommandRequest::DeleteEntity { entity_id };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::DeleteEntity { error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::DeleteEntityResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::DeleteEntityResponse {
+                            id,
+                            response: Ok(()),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::DeleteEntityResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::SetEntitySchema { id, schema } => {
+            let request = CommandRequest::SetSchema { entity_schema: schema };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::SetSchema { error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::SetEntitySchemaResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::SetEntitySchemaResponse {
+                            id,
+                            response: Ok(()),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::SetEntitySchemaResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::GetEntitySchema { id, entity_type } => {
+            let request = CommandRequest::GetSchema { entity_type };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::GetSchema { response, error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::GetEntitySchemaResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::GetEntitySchemaResponse {
+                            id,
+                            response: Ok(response),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::GetEntitySchemaResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
+            let request = CommandRequest::GetCompleteSchema { entity_type };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::GetCompleteSchema { response, error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::GetCompleteEntitySchemaResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else if let Some(schema) = response {
+                        Some(qlib_rs::StoreMessage::GetCompleteEntitySchemaResponse {
+                            id,
+                            response: Ok(schema),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::GetCompleteEntitySchemaResponse {
+                            id,
+                            response: Err("No schema returned".to_string()),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::GetCompleteEntitySchemaResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::SetFieldSchema { id, entity_type, field_type, schema } => {
+            let request = CommandRequest::SetFieldSchema { entity_type, field_type, schema };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::SetFieldSchema { error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::SetFieldSchemaResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::SetFieldSchemaResponse {
+                            id,
+                            response: Ok(()),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::SetFieldSchemaResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
+            let request = CommandRequest::GetFieldSchema { entity_type, field_type };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::GetFieldSchema { response, error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::GetFieldSchemaResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::GetFieldSchemaResponse {
+                            id,
+                            response: Ok(response),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::GetFieldSchemaResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::EntityExists { id, entity_id } => {
+            let request = CommandRequest::EntityExists { entity_id };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::EntityExists { response } => {
+                    Some(qlib_rs::StoreMessage::EntityExistsResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::EntityExistsResponse { id, response: false }),
+            }
+        }
+        qlib_rs::StoreMessage::FieldExists { id, entity_id, field_type } => {
+            let request = CommandRequest::FieldExists { entity_id, field_type };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::FieldExists { response } => {
+                    Some(qlib_rs::StoreMessage::FieldExistsResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::FieldExistsResponse { id, response: false }),
+            }
+        }
+        qlib_rs::StoreMessage::Perform { id, requests } => {
+            let request = CommandRequest::UpdateEntity { request: requests };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::UpdateEntity { response, error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::PerformResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::PerformResponse {
+                            id,
+                            response: Ok(response),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::PerformResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::FindEntities { id, entity_type, parent_id, page_opts } => {
+            let request = CommandRequest::FindEntities { entity_type, parent_id, page_opts };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::FindEntities { response } => {
+                    Some(qlib_rs::StoreMessage::FindEntitiesResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::FindEntitiesResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::FindEntitiesExact { id, entity_type, parent_id, page_opts } => {
+            let request = CommandRequest::FindEntitiesExact { entity_type, parent_id, page_opts };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::FindEntitiesExact { response } => {
+                    Some(qlib_rs::StoreMessage::FindEntitiesExactResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::FindEntitiesExactResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::GetEntityTypes { id, parent_type, page_opts } => {
+            let request = CommandRequest::GetEntityTypes { parent_type, page_opts };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::GetEntityTypes { response } => {
+                    Some(qlib_rs::StoreMessage::GetEntityTypesResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::GetEntityTypesResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::TakeSnapshot { id } => {
+            let request = CommandRequest::TakeSnapshot;
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::TakeSnapshot { response } => {
+                    Some(qlib_rs::StoreMessage::TakeSnapshotResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::TakeSnapshotResponse {
+                    id,
+                    response: qlib_rs::Snapshot::default(),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::RestoreSnapshot { id, snapshot } => {
+            let request = CommandRequest::RestoreSnapshot { snapshot };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::RestoreSnapshot { error } => {
+                    if let Some(err) = error {
+                        Some(qlib_rs::StoreMessage::RestoreSnapshotResponse {
+                            id,
+                            response: Err(err),
+                        })
+                    } else {
+                        Some(qlib_rs::StoreMessage::RestoreSnapshotResponse {
+                            id,
+                            response: Ok(()),
+                        })
+                    }
+                }
+                _ => Some(qlib_rs::StoreMessage::RestoreSnapshotResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::RegisterNotification { id, config } => {
+            let request = CommandRequest::RegisterNotification { config };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::RegisterNotification { response } => {
+                    Some(qlib_rs::StoreMessage::RegisterNotificationResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::RegisterNotificationResponse {
+                    id,
+                    response: Err("Unexpected response type".to_string()),
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::UnregisterNotification { id, token } => {
+            let request = CommandRequest::UnregisterNotification { token };
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::UnregisterNotification { response } => {
+                    Some(qlib_rs::StoreMessage::UnregisterNotificationResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::UnregisterNotificationResponse {
+                    id,
+                    response: false,
+                }),
+            }
+        }
+        qlib_rs::StoreMessage::GetNotificationConfigs { id } => {
+            let request = CommandRequest::GetNotificationConfigs;
+            let response = handle_perform_request(request, app).await;
+            match response {
+                CommandResponse::GetNotificationConfigs { response } => {
+                    Some(qlib_rs::StoreMessage::GetNotificationConfigsResponse { id, response })
+                }
+                _ => Some(qlib_rs::StoreMessage::GetNotificationConfigsResponse {
+                    id,
+                    response: Vec::new(),
+                }),
+            }
+        }
         qlib_rs::StoreMessage::ExecuteScript { id, script } => {
             let request = CommandRequest::ExecuteScript { script };
             let response = handle_perform_request(request, app).await;
@@ -1197,10 +1525,7 @@ async fn handle_store_message(
                 }),
             }
         }
-        // For now, only handle ExecuteScript. Other StoreMessage variants would need similar handling.
-        _ => {
-            log::warn!("Unhandled StoreMessage variant: {:?}", msg);
-            None
-        }
+        // Response messages and notifications don't need handling here
+        _ => None,
     }
 }
