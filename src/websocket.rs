@@ -182,7 +182,6 @@ pub enum WebSocketMessage {
     StoreFindEntities {
         id: String,
         entity_type: qlib_rs::EntityType,
-        parent_id: Option<qlib_rs::EntityId>,
         page_opts: Option<qlib_rs::PageOpts>,
     },
     StoreFindEntitiesResponse {
@@ -193,7 +192,6 @@ pub enum WebSocketMessage {
     StoreFindEntitiesExact {
         id: String,
         entity_type: qlib_rs::EntityType,
-        parent_id: Option<qlib_rs::EntityId>,
         page_opts: Option<qlib_rs::PageOpts>,
     },
     StoreFindEntitiesExactResponse {
@@ -203,7 +201,6 @@ pub enum WebSocketMessage {
 
     StoreGetEntityTypes {
         id: String,
-        parent_type: Option<qlib_rs::EntityType>,
         page_opts: Option<qlib_rs::PageOpts>,
     },
     StoreGetEntityTypesResponse {
@@ -709,12 +706,11 @@ async fn handle_websocket_message(
         WebSocketMessage::StoreFindEntities {
             id,
             entity_type,
-            parent_id,
             page_opts,
+            ..
         } => {
             let request = CommandRequest::FindEntities {
                 entity_type,
-                parent_id,
                 page_opts,
             };
             let response = handle_perform_request(request, app).await;
@@ -732,12 +728,11 @@ async fn handle_websocket_message(
         WebSocketMessage::StoreFindEntitiesExact {
             id,
             entity_type,
-            parent_id,
             page_opts,
+            ..
         } => {
             let request = CommandRequest::FindEntitiesExact {
                 entity_type,
-                parent_id,
                 page_opts,
             };
             let response = handle_perform_request(request, app).await;
@@ -754,11 +749,10 @@ async fn handle_websocket_message(
 
         WebSocketMessage::StoreGetEntityTypes {
             id,
-            parent_type,
             page_opts,
+            ..
         } => {
             let request = CommandRequest::GetEntityTypes {
-                parent_type,
                 page_opts,
             };
             let response = handle_perform_request(request, app).await;
@@ -992,7 +986,6 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
         }
         CommandRequest::FindEntities {
             entity_type,
-            parent_id: _,
             page_opts,
         } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
@@ -1011,7 +1004,6 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
         }
         CommandRequest::FindEntitiesExact {
             entity_type,
-            parent_id: _,
             page_opts,
         } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
@@ -1029,7 +1021,6 @@ async fn handle_perform_request(req: CommandRequest, app: &Arc<App>) -> CommandR
             };
         }
         CommandRequest::GetEntityTypes {
-            parent_type: _,
             page_opts,
         } => {
             let state_machine = app.state_machine_store.state_machine.read().await;
@@ -1388,8 +1379,8 @@ async fn handle_store_message(
                 }),
             }
         }
-        qlib_rs::StoreMessage::FindEntities { id, entity_type, parent_id, page_opts } => {
-            let request = CommandRequest::FindEntities { entity_type, parent_id, page_opts };
+        qlib_rs::StoreMessage::FindEntities { id, entity_type, page_opts, .. } => {
+            let request = CommandRequest::FindEntities { entity_type, page_opts };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::FindEntities { response } => {
@@ -1401,8 +1392,8 @@ async fn handle_store_message(
                 }),
             }
         }
-        qlib_rs::StoreMessage::FindEntitiesExact { id, entity_type, parent_id, page_opts } => {
-            let request = CommandRequest::FindEntitiesExact { entity_type, parent_id, page_opts };
+        qlib_rs::StoreMessage::FindEntitiesExact { id, entity_type, page_opts, .. } => {
+            let request = CommandRequest::FindEntitiesExact { entity_type, page_opts };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::FindEntitiesExact { response } => {
@@ -1414,8 +1405,8 @@ async fn handle_store_message(
                 }),
             }
         }
-        qlib_rs::StoreMessage::GetEntityTypes { id, parent_type, page_opts } => {
-            let request = CommandRequest::GetEntityTypes { parent_type, page_opts };
+        qlib_rs::StoreMessage::GetEntityTypes { id, page_opts, .. } => {
+            let request = CommandRequest::GetEntityTypes { page_opts };
             let response = handle_perform_request(request, app).await;
             match response {
                 CommandResponse::GetEntityTypes { response } => {

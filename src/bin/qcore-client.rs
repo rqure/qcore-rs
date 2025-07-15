@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let entity_type = EntityType::from(entity_type.as_str());
             
-            match store_proxy.find_entities(&ctx, &entity_type, None, None).await {
+            match store_proxy.find_entities(&ctx, &entity_type, None).await {
                 Ok(page_result) => {
                     println!("Found {} entities:", page_result.items.len());
                     for entity_id in page_result.items {

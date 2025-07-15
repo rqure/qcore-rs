@@ -654,16 +654,13 @@ pub enum CommandRequest {
     },
     FindEntities {
         entity_type: qlib_rs::EntityType,
-        parent_id: Option<qlib_rs::EntityId>,
         page_opts: Option<qlib_rs::PageOpts>,
     },
     FindEntitiesExact {
         entity_type: qlib_rs::EntityType,
-        parent_id: Option<qlib_rs::EntityId>,
         page_opts: Option<qlib_rs::PageOpts>,
     },
     GetEntityTypes {
-        parent_type: Option<qlib_rs::EntityType>,
         page_opts: Option<qlib_rs::PageOpts>,
     },
     TakeSnapshot,
