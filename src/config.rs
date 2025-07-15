@@ -21,8 +21,8 @@ pub enum YamlValue {
     Int(i64),
     Float(f64),
     String { String: String },
-    EntityReference { EntityReference: Option<String> },
     EntityList { EntityList: Vec<String> },
+    EntityReference { EntityReference: Option<String> },
     Choice { Choice: i64 },
     Blob { Blob: Vec<u8> },
 }
