@@ -8,8 +8,6 @@ use std::collections::HashMap;
 pub struct YamlFieldSchema {
     default_value: YamlValue,
     rank: i64,
-    read_permission: Option<String>,
-    write_permission: Option<String>,
     choices: Option<Vec<String>>,
 }
 
@@ -67,46 +65,31 @@ impl From<YamlValue> for Value {
 
 impl YamlFieldSchema {
     fn to_field_schema(&self, field_type: FieldType) -> Result<FieldSchema, Box<dyn std::error::Error>> {
-        let read_permission = self.read_permission.as_ref()
-            .and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok());
-        let write_permission = self.write_permission.as_ref()
-            .and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok());
-
         let field_schema = match &self.default_value {
             YamlValue::Bool(b) => FieldSchema::Bool {
                 field_type,
                 default_value: *b,
                 rank: self.rank,
-                read_permission,
-                write_permission,
             },
             YamlValue::Int(i) => FieldSchema::Int {
                 field_type,
                 default_value: *i,
                 rank: self.rank,
-                read_permission,
-                write_permission,
             },
             YamlValue::Float(f) => FieldSchema::Float {
                 field_type,
                 default_value: *f,
                 rank: self.rank,
-                read_permission,
-                write_permission,
             },
             YamlValue::String { String: s } => FieldSchema::String {
                 field_type,
                 default_value: s.clone(),
                 rank: self.rank,
-                read_permission,
-                write_permission,
             },
             YamlValue::EntityReference { EntityReference: e } => FieldSchema::EntityReference {
                 field_type,
                 default_value: e.as_ref().and_then(|id| qlib_rs::EntityId::try_from(id.as_str()).ok()),
                 rank: self.rank,
-                read_permission,
-                write_permission,
             },
             YamlValue::EntityList { EntityList: list } => FieldSchema::EntityList {
                 field_type,
@@ -114,23 +97,17 @@ impl YamlFieldSchema {
                     .filter_map(|id| qlib_rs::EntityId::try_from(id.as_str()).ok())
                     .collect(),
                 rank: self.rank,
-                read_permission,
-                write_permission,
             },
             YamlValue::Choice { Choice: c } => FieldSchema::Choice {
                 field_type,
                 default_value: *c,
                 rank: self.rank,
-                read_permission,
-                write_permission,
                 choices: self.choices.clone().unwrap_or_default(),
             },
             YamlValue::Blob { Blob: b } => FieldSchema::Blob {
                 field_type,
                 default_value: b.clone(),
                 rank: self.rank,
-                read_permission,
-                write_permission,
             },
         };
 

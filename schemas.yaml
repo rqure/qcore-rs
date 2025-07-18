@@ -6,22 +6,16 @@ schemas:
         default_value:
           String: ""
         rank: 0
-        read_permission: null
-        write_permission: null
         choices: null
       Parent:
         default_value:
           EntityReference: null
         rank: 1
-        read_permission: null
-        write_permission: null
         choices: null
       Children:
         default_value:
           EntityList: []
         rank: 2
-        read_permission: null
-        write_permission: null
         choices: null
 
   - entity_type: Root
@@ -35,8 +29,6 @@ schemas:
         default_value:
           String: ""
         rank: 3
-        read_permission: null
-        write_permission: null
         choices: null
 
   - entity_type: User
@@ -46,15 +38,11 @@ schemas:
         default_value:
           String: ""
         rank: 3
-        read_permission: null
-        write_permission: null
         choices: null
       Active:
         default_value:
           Bool: true
         rank: 4
-        read_permission: null
-        write_permission: null
         choices: null
 
 tree:
