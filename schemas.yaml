@@ -39,10 +39,35 @@ schemas:
           String: ""
         rank: 3
         choices: null
+      Password:
+        default_value:
+          String: ""
+        rank: 4
+        choices: null
       Active:
         default_value:
           Bool: true
-        rank: 4
+        rank: 5
+        choices: null
+      LastLogin:
+        default_value:
+          Timestamp: "1970-01-01T00:00:00Z"
+        rank: 6
+        choices: null
+      CreatedAt:
+        default_value:
+          Timestamp: "1970-01-01T00:00:00Z"
+        rank: 7
+        choices: null
+      FailedAttempts:
+        default_value:
+          Int: 0
+        rank: 8
+        choices: null
+      LockedUntil:
+        default_value:
+          Timestamp: "1970-01-01T00:00:00Z"
+        rank: 9
         choices: null
 
 tree:
