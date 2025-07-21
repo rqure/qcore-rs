@@ -70,6 +70,41 @@ schemas:
         rank: 9
         choices: null
 
+  - entity_type: Permission
+    inherit: Object
+    fields:
+      TestFn:
+        default_value:
+          String: "return true"
+        rank: 3
+        choices: null
+
+  - entity_type: AuthorizationRule
+    inherit: Object
+    fields:
+      Scope:
+        default_value:
+          Choice: "Global"
+        rank: 3
+        choices:
+          - "Global"
+          - "Entity"
+      ResourceType:
+        default_value:
+          String: ""
+        rank: 4
+        choices: null
+      ResourceField:
+        default_value:
+          String: ""
+        rank: 5
+        choices: null
+      Permission:
+        default_value:
+          EntityReference: null
+        rank: 6
+        choices: null
+
 tree:
   - entity_type: Root
     name: "Root"
@@ -98,3 +133,19 @@ tree:
         children:
           - entity_type: Folder
             name: "Config"
+      - entity_type: Folder
+        name: "Security"
+        attributes:
+          Description:
+            String: "Security configuration including permissions and authorization rules"
+        children:
+          - entity_type: Folder
+            name: "Permissions"
+            attributes:
+              Description:
+                String: "Permission definitions for access control"
+          - entity_type: Folder
+            name: "AuthorizationRules"
+            attributes:
+              Description:
+                String: "Authorization rules mapping subjects to permissions"
