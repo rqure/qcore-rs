@@ -12,21 +12,10 @@ name = "qcore-rs"
 path = "src/main.rs"
 
 [dependencies]
-actix-web = "4.11.0"
-actix-web-actors = "4.3.1"
-clap = "4.5.40"
-env_logger = "0.11.8"
-log = "0.4.27"
-openraft = { version="0.9.20", features = ["serde", "storage-v2"] }
 qlib-rs = { "path"="../qlib-rs" }
-reqwest = { version = "0.12.20", features = ["json"] }
 serde = "1.0.219"
 serde_json = "1.0.140"
-serde_yaml = "0.9.34"
 tokio = "1.45.1"
 tokio-stream = "0.1.17"
 tokio-tungstenite = "0.21"
-futures-util = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
-mdns-sd = "0.11"
-hostname = "0.4"
