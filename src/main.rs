@@ -7,7 +7,7 @@ use clap::Parser;
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashSet;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 /// Configuration passed via CLI arguments
@@ -37,6 +37,30 @@ struct Config {
     /// Interval in seconds to retry connecting to peers
     #[arg(long, default_value_t = 30)]
     peer_reconnect_interval_secs: u64,
+}
+
+/// Application state that is shared across all tasks
+#[derive(Debug)]
+struct AppState {
+    /// Configuration
+    config: Config,
+    
+    /// Set of currently connected peer addresses
+    connected_outbound_peers: HashSet<String>,
+
+    /// Set of currently connected inbound peer addresses
+    connected_inbound_peers: HashSet<String>,
+}
+
+impl AppState {
+    /// Create a new AppState with the given configuration
+    fn new(config: Config) -> Self {
+        Self {
+            config,
+            connected_outbound_peers: HashSet::new(),
+            connected_inbound_peers: HashSet::new(),
+        }
+    }
 }
 
 /// Handle a single peer WebSocket connection
@@ -159,8 +183,12 @@ async fn handle_outbound_peer_connection(peer_addr: &str) -> Result<()> {
 }
 
 /// Start the peer WebSocket server task
-async fn start_inbound_peer_server(config: Arc<Config>) -> Result<()> {
-    let addr = format!("0.0.0.0:{}", config.peer_port);
+async fn start_inbound_peer_server(app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let addr = {
+        let state = app_state.read().await;
+        format!("0.0.0.0:{}", state.config.peer_port)
+    };
+    
     let listener = TcpListener::bind(&addr).await?;
     info!("Peer WebSocket server listening on {}", addr);
     
@@ -182,17 +210,23 @@ async fn start_inbound_peer_server(config: Arc<Config>) -> Result<()> {
 }
 
 /// Manage outbound peer connections - connects to configured peers and maintains connections
-async fn manage_outbound_peer_connections(config: Arc<Config>, connected_peers: Arc<Mutex<HashSet<String>>>) -> Result<()> {
+async fn manage_outbound_peer_connections(app_state: Arc<RwLock<AppState>>) -> Result<()> {
     info!("Starting outbound peer connection manager");
     
-    let mut interval = tokio::time::interval(Duration::from_secs(config.peer_reconnect_interval_secs));
+    let reconnect_interval = {
+        let state = app_state.read().await;
+        Duration::from_secs(state.config.peer_reconnect_interval_secs)
+    };
+    
+    let mut interval = tokio::time::interval(reconnect_interval);
     
     loop {
         interval.tick().await;
         
         let peers_to_connect = {
-            let connected = connected_peers.lock().await;
-            config.peer_addresses.iter()
+            let state = app_state.read().await;
+            let connected = &state.connected_outbound_peers;
+            state.config.peer_addresses.iter()
                 .filter(|addr| !connected.contains(*addr))
                 .cloned()
                 .collect::<Vec<_>>()
@@ -202,12 +236,13 @@ async fn manage_outbound_peer_connections(config: Arc<Config>, connected_peers: 
             info!("Attempting to connect to unconnected peer: {}", peer_addr);
             
             let peer_addr_clone = peer_addr.clone();
-            let connected_peers_clone = Arc::clone(&connected_peers);
+            let app_state_clone = Arc::clone(&app_state);
             
             tokio::spawn(async move {
                 // Mark as connected before attempting (optimistic)
                 {
-                    let mut connected = connected_peers_clone.lock().await;
+                    let mut state = app_state_clone.write().await;
+                    let connected = &mut state.connected_outbound_peers;
                     connected.insert(peer_addr_clone.clone());
                 }
                 
@@ -216,13 +251,15 @@ async fn manage_outbound_peer_connections(config: Arc<Config>, connected_peers: 
                     error!("Failed to connect to peer {}: {}", peer_addr_clone, e);
                     
                     // Remove from connected set on failure
-                    let mut connected = connected_peers_clone.lock().await;
+                    let mut state = app_state_clone.write().await;
+                    let connected = &mut state.connected_outbound_peers;
                     connected.remove(&peer_addr_clone);
                 } else {
                     info!("Connection to peer {} ended", peer_addr_clone);
                     
                     // Remove from connected set when connection ends
-                    let mut connected = connected_peers_clone.lock().await;
+                    let mut state = app_state_clone.write().await;
+                    let connected = &mut state.connected_outbound_peers;
                     connected.remove(&peer_addr_clone);
                 }
             });
@@ -231,7 +268,7 @@ async fn manage_outbound_peer_connections(config: Arc<Config>, connected_peers: 
 }
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Arc::new(Config::parse());
+    let config = Config::parse();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -243,22 +280,21 @@ async fn main() -> Result<()> {
 
     info!(?config, "Starting Core service with configuration");
 
-    // Shared state for tracking connected peers
-    let connected_peers = Arc::new(Mutex::new(HashSet::new()));
+    // Create shared application state
+    let app_state = Arc::new(RwLock::new(AppState::new(config)));
 
     // Start the peer WebSocket server task
-    let config_clone = Arc::clone(&config);
+    let app_state_clone = Arc::clone(&app_state);
     let peer_server_task = tokio::spawn(async move {
-        if let Err(e) = start_inbound_peer_server(config_clone).await {
+        if let Err(e) = start_inbound_peer_server(app_state_clone).await {
             error!("Peer server failed: {}", e);
         }
     });
 
     // Start the outbound peer connection manager task
-    let config_clone = Arc::clone(&config);
-    let connected_peers_clone = Arc::clone(&connected_peers);
+    let app_state_clone = Arc::clone(&app_state);
     let outbound_peer_task = tokio::spawn(async move {
-        if let Err(e) = manage_outbound_peer_connections(config_clone, connected_peers_clone).await {
+        if let Err(e) = manage_outbound_peer_connections(app_state_clone).await {
             error!("Outbound peer connection manager failed: {}", e);
         }
     });
