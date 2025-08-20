@@ -1,3 +1,4 @@
+use qlib_rs::{Snowflake, Store};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
@@ -50,6 +51,9 @@ struct AppState {
 
     /// Set of currently connected inbound peer addresses
     connected_inbound_peers: HashSet<String>,
+
+    // Data store
+    store: Arc<RwLock<Store>>,
 }
 
 impl AppState {
@@ -59,6 +63,7 @@ impl AppState {
             config,
             connected_outbound_peers: HashSet::new(),
             connected_inbound_peers: HashSet::new(),
+            store: Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new())))),
         }
     }
 }
