@@ -7,7 +7,7 @@ use clap::Parser;
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashSet;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use std::time::Duration;
 
 /// Configuration passed via CLI arguments
@@ -64,11 +64,17 @@ impl AppState {
 }
 
 /// Handle a single peer WebSocket connection
-async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAddr) -> Result<()> {
+async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAddr, app_state: Arc<RwLock<AppState>>) -> Result<()> {
     info!("New peer connection from: {}", peer_addr);
     
     let ws_stream = accept_async(stream).await?;
     debug!("WebSocket connection established with peer: {}", peer_addr);
+    
+    // Add peer to connected inbound peers
+    {
+        let mut state = app_state.write().await;
+        state.connected_inbound_peers.insert(peer_addr.to_string());
+    }
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
@@ -116,6 +122,12 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
                 break;
             }
         }
+    }
+    
+    // Remove peer from connected inbound peers when connection ends
+    {
+        let mut state = app_state.write().await;
+        state.connected_inbound_peers.remove(&peer_addr.to_string());
     }
     
     info!("Peer connection closed: {}", peer_addr);
@@ -195,8 +207,9 @@ async fn start_inbound_peer_server(app_state: Arc<RwLock<AppState>>) -> Result<(
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                let app_state_clone = Arc::clone(&app_state);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr).await {
+                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr, app_state_clone).await {
                         error!("Error handling peer connection from {}: {}", peer_addr, e);
                     }
                 });
