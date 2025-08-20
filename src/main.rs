@@ -29,7 +29,7 @@ struct Config {
 }
 
 /// Handle a single peer WebSocket connection
-async fn handle_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAddr) -> Result<()> {
+async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAddr) -> Result<()> {
     info!("New peer connection from: {}", peer_addr);
     
     let ws_stream = accept_async(stream).await?;
@@ -88,7 +88,7 @@ async fn handle_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAd
 }
 
 /// Start the peer WebSocket server task
-async fn start_peer_server(config: Arc<Config>) -> Result<()> {
+async fn start_inbound_peer_server(config: Arc<Config>) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.peer_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Peer WebSocket server listening on {}", addr);
@@ -97,7 +97,7 @@ async fn start_peer_server(config: Arc<Config>) -> Result<()> {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 tokio::spawn(async move {
-                    if let Err(e) = handle_peer_connection(stream, peer_addr).await {
+                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr).await {
                         error!("Error handling peer connection from {}: {}", peer_addr, e);
                     }
                 });
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
     // Start the peer WebSocket server task
     let config_clone = Arc::clone(&config);
     let peer_server_task = tokio::spawn(async move {
-        if let Err(e) = start_peer_server(config_clone).await {
+        if let Err(e) = start_inbound_peer_server(config_clone).await {
             error!("Peer server failed: {}", e);
         }
     });
