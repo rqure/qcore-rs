@@ -1,4 +1,4 @@
-use qlib_rs::{Snowflake, Store};
+use qlib_rs::{Snowflake, Store, StoreMessage};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
@@ -27,7 +27,7 @@ struct Config {
     #[arg(long, default_value_t = 9000)]
     peer_port: u16,
 
-    /// Port for client communication
+    /// Port for client communication (StoreProxy clients)
     #[arg(long, default_value_t = 9100)]
     client_port: u16,
 
@@ -199,6 +199,354 @@ async fn handle_outbound_peer_connection(peer_addr: &str) -> Result<()> {
     Ok(())
 }
 
+/// Handle a single client WebSocket connection that uses StoreProxy protocol
+async fn handle_client_connection(stream: TcpStream, client_addr: std::net::SocketAddr, app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    info!("New client connection from: {}", client_addr);
+    
+    let ws_stream = accept_async(stream).await?;
+    debug!("WebSocket connection established with client: {}", client_addr);
+    
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    
+    // Handle incoming messages from client
+    while let Some(msg) = ws_receiver.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                debug!("Received text from client {}: {}", client_addr, text);
+                
+                // Parse the StoreMessage
+                match serde_json::from_str::<StoreMessage>(&text) {
+                    Ok(store_msg) => {
+                        // Process the message and generate response
+                        let response_msg = process_store_message(store_msg, &app_state).await;
+                        
+                        // Send response back to client
+                        let response_text = match serde_json::to_string(&response_msg) {
+                            Ok(text) => text,
+                            Err(e) => {
+                                error!("Failed to serialize response: {}", e);
+                                continue;
+                            }
+                        };
+                        
+                        if let Err(e) = ws_sender.send(Message::Text(response_text)).await {
+                            error!("Failed to send response to client {}: {}", client_addr, e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse StoreMessage from client {}: {}", client_addr, e);
+                        // Send error response
+                        let error_msg = StoreMessage::Error {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            error: format!("Failed to parse message: {}", e),
+                        };
+                        if let Ok(error_text) = serde_json::to_string(&error_msg) {
+                            let _ = ws_sender.send(Message::Text(error_text)).await;
+                        }
+                    }
+                }
+            }
+            Ok(Message::Binary(_data)) => {
+                debug!("Received binary data from client {}", client_addr);
+                // For now, we only handle text messages for StoreProxy protocol
+            }
+            Ok(Message::Ping(payload)) => {
+                debug!("Received ping from client: {}", client_addr);
+                if let Err(e) = ws_sender.send(Message::Pong(payload)).await {
+                    error!("Failed to send pong to client {}: {}", client_addr, e);
+                    break;
+                }
+            }
+            Ok(Message::Pong(_)) => {
+                debug!("Received pong from client: {}", client_addr);
+            }
+            Ok(Message::Close(_)) => {
+                info!("Client {} closed connection", client_addr);
+                break;
+            }
+            Ok(Message::Frame(_)) => {
+                debug!("Received raw frame from client: {}", client_addr);
+            }
+            Err(e) => {
+                error!("WebSocket error with client {}: {}", client_addr, e);
+                break;
+            }
+        }
+    }
+    
+    info!("Client connection closed: {}", client_addr);
+    Ok(())
+}
+
+/// Process a StoreMessage and generate the appropriate response
+async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<AppState>>) -> StoreMessage {
+    let mut state = app_state.write().await;
+    let store = &mut state.store;
+    let mut store_guard = store.write().await;
+    
+    match message {
+        StoreMessage::CreateEntity { id, entity_type, parent_id, name } => {
+            match store_guard.create_entity(&entity_type, parent_id, &name).await {
+                Ok(entity) => StoreMessage::CreateEntityResponse {
+                    id,
+                    response: Ok(entity),
+                },
+                Err(e) => StoreMessage::CreateEntityResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::DeleteEntity { id, entity_id } => {
+            match store_guard.delete_entity(&entity_id).await {
+                Ok(()) => StoreMessage::DeleteEntityResponse {
+                    id,
+                    response: Ok(()),
+                },
+                Err(e) => StoreMessage::DeleteEntityResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::SetEntitySchema { id, schema } => {
+            match store_guard.set_entity_schema(&schema).await {
+                Ok(()) => StoreMessage::SetEntitySchemaResponse {
+                    id,
+                    response: Ok(()),
+                },
+                Err(e) => StoreMessage::SetEntitySchemaResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::GetEntitySchema { id, entity_type } => {
+            match store_guard.get_entity_schema(&entity_type).await {
+                Ok(schema) => StoreMessage::GetEntitySchemaResponse {
+                    id,
+                    response: Ok(Some(schema)),
+                },
+                Err(e) => StoreMessage::GetEntitySchemaResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
+            match store_guard.get_complete_entity_schema(&entity_type).await {
+                Ok(schema) => StoreMessage::GetCompleteEntitySchemaResponse {
+                    id,
+                    response: Ok(schema),
+                },
+                Err(e) => StoreMessage::GetCompleteEntitySchemaResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::SetFieldSchema { id, entity_type, field_type, schema } => {
+            match store_guard.set_field_schema(&entity_type, &field_type, schema).await {
+                Ok(()) => StoreMessage::SetFieldSchemaResponse {
+                    id,
+                    response: Ok(()),
+                },
+                Err(e) => StoreMessage::SetFieldSchemaResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
+            match store_guard.get_field_schema(&entity_type, &field_type).await {
+                Ok(schema) => StoreMessage::GetFieldSchemaResponse {
+                    id,
+                    response: Ok(Some(schema)),
+                },
+                Err(e) => StoreMessage::GetFieldSchemaResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::EntityExists { id, entity_id } => {
+            let exists = store_guard.entity_exists(&entity_id).await;
+            StoreMessage::EntityExistsResponse {
+                id,
+                response: exists,
+            }
+        }
+        
+        StoreMessage::FieldExists { id, entity_type, field_type } => {
+            let exists = store_guard.field_exists(&entity_type, &field_type).await;
+            StoreMessage::FieldExistsResponse {
+                id,
+                response: exists,
+            }
+        }
+        
+        StoreMessage::Perform { id, mut requests } => {
+            match store_guard.perform(&mut requests).await {
+                Ok(()) => StoreMessage::PerformResponse {
+                    id,
+                    response: Ok(requests),
+                },
+                Err(e) => StoreMessage::PerformResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::FindEntities { id, entity_type, page_opts } => {
+            match store_guard.find_entities_paginated(&entity_type, page_opts).await {
+                Ok(result) => StoreMessage::FindEntitiesResponse {
+                    id,
+                    response: Ok(result),
+                },
+                Err(e) => StoreMessage::FindEntitiesResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::FindEntitiesExact { id, entity_type, page_opts } => {
+            match store_guard.find_entities_exact(&entity_type, page_opts).await {
+                Ok(result) => StoreMessage::FindEntitiesExactResponse {
+                    id,
+                    response: Ok(result),
+                },
+                Err(e) => StoreMessage::FindEntitiesExactResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::GetEntityTypes { id, page_opts } => {
+            match store_guard.get_entity_types_paginated(page_opts).await {
+                Ok(result) => StoreMessage::GetEntityTypesResponse {
+                    id,
+                    response: Ok(result),
+                },
+                Err(e) => StoreMessage::GetEntityTypesResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::TakeSnapshot { id } => {
+            let snapshot = store_guard.take_snapshot();
+            StoreMessage::TakeSnapshotResponse {
+                id,
+                response: snapshot,
+            }
+        }
+        
+        StoreMessage::RestoreSnapshot { id, snapshot } => {
+            store_guard.restore_snapshot(snapshot);
+            StoreMessage::RestoreSnapshotResponse {
+                id,
+                response: Ok(()),
+            }
+        }
+        
+        StoreMessage::RegisterNotification { id, config: _ } => {
+            // For now, we'll implement a simple notification registration
+            // In a full implementation, you'd want to handle the notification sender properly
+            StoreMessage::RegisterNotificationResponse {
+                id,
+                response: Ok(()),
+            }
+        }
+        
+        StoreMessage::UnregisterNotification { id, config: _config } => {
+            // For now, we'll implement a simple notification unregistration
+            StoreMessage::UnregisterNotificationResponse {
+                id,
+                response: true,
+            }
+        }
+        
+        // These message types should not be received by the server
+        StoreMessage::CreateEntityResponse { id, .. } |
+        StoreMessage::DeleteEntityResponse { id, .. } |
+        StoreMessage::SetEntitySchemaResponse { id, .. } |
+        StoreMessage::GetEntitySchemaResponse { id, .. } |
+        StoreMessage::GetCompleteEntitySchemaResponse { id, .. } |
+        StoreMessage::SetFieldSchemaResponse { id, .. } |
+        StoreMessage::GetFieldSchemaResponse { id, .. } |
+        StoreMessage::EntityExistsResponse { id, .. } |
+        StoreMessage::FieldExistsResponse { id, .. } |
+        StoreMessage::PerformResponse { id, .. } |
+        StoreMessage::FindEntitiesResponse { id, .. } |
+        StoreMessage::FindEntitiesExactResponse { id, .. } |
+        StoreMessage::GetEntityTypesResponse { id, .. } |
+        StoreMessage::TakeSnapshotResponse { id, .. } |
+        StoreMessage::RestoreSnapshotResponse { id, .. } |
+        StoreMessage::RegisterNotificationResponse { id, .. } |
+        StoreMessage::UnregisterNotificationResponse { id, .. } => {
+            StoreMessage::Error {
+                id,
+                error: "Received response message on server - this should not happen".to_string(),
+            }
+        }
+        
+        StoreMessage::Notification { .. } => {
+            StoreMessage::Error {
+                id: uuid::Uuid::new_v4().to_string(),
+                error: "Received notification message on server - this should not happen".to_string(),
+            }
+        }
+        
+        StoreMessage::Error { id, error } => {
+            warn!("Received error message from client: {} - {}", id, error);
+            StoreMessage::Error {
+                id: uuid::Uuid::new_v4().to_string(),
+                error: "Server received error message from client".to_string(),
+            }
+        }
+    }
+}
+
+/// Start the client WebSocket server task
+async fn start_client_server(app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let addr = {
+        let state = app_state.read().await;
+        format!("0.0.0.0:{}", state.config.client_port)
+    };
+    
+    let listener = TcpListener::bind(&addr).await?;
+    info!("Client WebSocket server listening on {}", addr);
+    
+    loop {
+        match listener.accept().await {
+            Ok((stream, client_addr)) => {
+                let app_state_clone = Arc::clone(&app_state);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_client_connection(stream, client_addr, app_state_clone).await {
+                        error!("Error handling client connection from {}: {}", client_addr, e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Failed to accept client connection: {}", e);
+                // Continue listening despite individual connection errors
+            }
+        }
+    }
+}
+
 /// Start the peer WebSocket server task
 async fn start_inbound_peer_server(app_state: Arc<RwLock<AppState>>) -> Result<()> {
     let addr = {
@@ -309,6 +657,14 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start the client WebSocket server task
+    let app_state_clone = Arc::clone(&app_state);
+    let client_server_task = tokio::spawn(async move {
+        if let Err(e) = start_client_server(app_state_clone).await {
+            error!("Client server failed: {}", e);
+        }
+    });
+
     // Start the outbound peer connection manager task
     let app_state_clone = Arc::clone(&app_state);
     let outbound_peer_task = tokio::spawn(async move {
@@ -321,8 +677,9 @@ async fn main() -> Result<()> {
     signal::ctrl_c().await?;
     warn!("Received shutdown signal. Stopping Core service...");
 
-    // Abort both tasks
+    // Abort all tasks
     peer_server_task.abort();
+    client_server_task.abort();
     outbound_peer_task.abort();
 
     Ok(())
