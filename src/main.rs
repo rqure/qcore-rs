@@ -29,7 +29,10 @@ async fn main() -> Result<()> {
     let config = Config::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter("core_service=debug,tokio=info")
+        .with_env_filter(
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "qcore_rs=info,tokio=warn".to_string())
+        )
         .with_target(false)
         .init();
 
