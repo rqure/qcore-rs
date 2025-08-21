@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::collections::{HashSet, HashMap};
 use tokio::sync::RwLock;
 use std::time::Duration;
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::{File, OpenOptions, create_dir_all};
 use tokio::io::AsyncWriteExt;
 use std::path::PathBuf;
 
@@ -22,6 +22,10 @@ struct Config {
     /// Machine ID (unique identifier for this instance)
     #[arg(long)]
     machine: String,
+
+    /// Data directory for storing WAL files and other persistent data
+    #[arg(long, default_value = "./data")]
+    data_dir: String,
 
     /// Maximum WAL file size in bytes
     #[arg(long, default_value_t = 1024 * 1024)]
@@ -703,11 +707,15 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
     if state.current_wal_file.is_none() || 
        state.current_wal_size + serialized_len > state.config.wal_max_file_size {
         
-        // Create new WAL file
-        let wal_filename = format!("wal_{:010}.log", state.wal_file_counter);
-        let wal_path = PathBuf::from(&wal_filename);
+        // Create WAL directory if it doesn't exist
+        let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
+        create_dir_all(&wal_dir).await?;
         
-        info!("Creating new WAL file: {}", wal_filename);
+        // Create new WAL file in the wal directory
+        let wal_filename = format!("wal_{:010}.log", state.wal_file_counter);
+        let wal_path = wal_dir.join(&wal_filename);
+        
+        info!("Creating new WAL file: {}", wal_path.display());
         
         let file = OpenOptions::new()
             .create(true)
