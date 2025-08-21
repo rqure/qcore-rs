@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::collections::{HashSet, HashMap};
 use tokio::sync::RwLock;
 use std::time::Duration;
-use tokio::fs::{File, OpenOptions, create_dir_all};
+use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
 use tokio::io::AsyncWriteExt;
 use std::path::PathBuf;
 
@@ -30,6 +30,10 @@ struct Config {
     /// Maximum WAL file size in bytes
     #[arg(long, default_value_t = 1024 * 1024)]
     wal_max_file_size: usize,
+
+    /// Maximum number of WAL files to keep
+    #[arg(long, default_value_t = 30)]
+    wal_max_files: usize,
 
     /// Snapshot interval in seconds
     #[arg(long, default_value_t = 30)]
@@ -695,6 +699,40 @@ async fn consume_write_channel(app_state: Arc<RwLock<AppState>>) -> Result<()> {
     }
 }
 
+/// Clean up old WAL files, keeping only the most recent max_files
+async fn cleanup_old_wal_files(wal_dir: &PathBuf, max_files: usize) -> Result<()> {
+    let mut entries = read_dir(wal_dir).await?;
+    let mut wal_files = Vec::new();
+    
+    // Collect all WAL files
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if let Some(filename) = path.file_name() {
+            if let Some(filename_str) = filename.to_str() {
+                if filename_str.starts_with("wal_") && filename_str.ends_with(".log") {
+                    wal_files.push(path);
+                }
+            }
+        }
+    }
+    
+    // Sort files by name (which corresponds to creation order due to counter)
+    wal_files.sort();
+    
+    // Remove old files if we have more than max_files
+    if wal_files.len() > max_files {
+        let files_to_remove = wal_files.len() - max_files;
+        for i in 0..files_to_remove {
+            info!("Removing old WAL file: {}", wal_files[i].display());
+            if let Err(e) = remove_file(&wal_files[i]).await {
+                error!("Failed to remove old WAL file {}: {}", wal_files[i].display(), e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 /// Write a request to the WAL file
 async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<AppState>>) -> Result<()> {
     let mut state = app_state.write().await;
@@ -726,6 +764,12 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
         state.current_wal_file = Some(file);
         state.current_wal_size = 0;
         state.wal_file_counter += 1;
+        
+        // Clean up old WAL files if we exceed the maximum
+        let max_files = state.config.wal_max_files;
+        if let Err(e) = cleanup_old_wal_files(&wal_dir, max_files).await {
+            error!("Failed to clean up old WAL files: {}", e);
+        }
     }
     
     // Write to WAL file
