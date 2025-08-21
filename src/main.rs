@@ -57,6 +57,9 @@ struct AppState {
     /// Set of currently connected inbound peer addresses
     connected_inbound_peers: HashSet<String>,
 
+    /// Connected clients with message senders
+    connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
+
     // Data store
     store: Arc<RwLock<Store>>,
 }
@@ -68,6 +71,7 @@ impl AppState {
             config,
             connected_outbound_peers: HashMap::new(),
             connected_inbound_peers: HashSet::new(),
+            connected_clients: HashMap::new(),
             store: Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new())))),
         }
     }
@@ -221,7 +225,35 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     let ws_stream = accept_async(stream).await?;
     debug!("WebSocket connection established with client: {}", client_addr);
     
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let (ws_sender, mut ws_receiver) = ws_stream.split();
+    
+    // Create a channel for sending messages to this client
+    let (tx, rx) = mpsc::unbounded_channel::<Message>();
+    
+    // Store the sender in the connected_clients HashMap
+    {
+        let mut state = app_state.write().await;
+        state.connected_clients.insert(client_addr.to_string(), tx.clone());
+    }
+    
+    // Spawn a task to handle outgoing messages to the client
+    let client_addr_clone = client_addr.to_string();
+    let app_state_clone = Arc::clone(&app_state);
+    let outgoing_task = tokio::spawn(async move {
+        let mut ws_sender = ws_sender;
+        let mut rx = rx;
+        
+        while let Some(message) = rx.recv().await {
+            if let Err(e) = ws_sender.send(message).await {
+                error!("Failed to send message to client {}: {}", client_addr_clone, e);
+                break;
+            }
+        }
+        
+        // Remove client from connected_clients when outgoing task ends
+        let mut state = app_state_clone.write().await;
+        state.connected_clients.remove(&client_addr_clone);
+    });
     
     // Handle incoming messages from client
     while let Some(msg) = ws_receiver.next().await {
@@ -235,7 +267,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                         // Process the message and generate response
                         let response_msg = process_store_message(store_msg, &app_state).await;
                         
-                        // Send response back to client
+                        // Send response back to client using the channel
                         let response_text = match serde_json::to_string(&response_msg) {
                             Ok(text) => text,
                             Err(e) => {
@@ -244,7 +276,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                             }
                         };
                         
-                        if let Err(e) = ws_sender.send(Message::Text(response_text)).await {
+                        if let Err(e) = tx.send(Message::Text(response_text)) {
                             error!("Failed to send response to client {}: {}", client_addr, e);
                             break;
                         }
@@ -257,7 +289,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                             error: format!("Failed to parse message: {}", e),
                         };
                         if let Ok(error_text) = serde_json::to_string(&error_msg) {
-                            let _ = ws_sender.send(Message::Text(error_text)).await;
+                            let _ = tx.send(Message::Text(error_text));
                         }
                     }
                 }
@@ -268,7 +300,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
             }
             Ok(Message::Ping(payload)) => {
                 debug!("Received ping from client: {}", client_addr);
-                if let Err(e) = ws_sender.send(Message::Pong(payload)).await {
+                if let Err(e) = tx.send(Message::Pong(payload)) {
                     error!("Failed to send pong to client {}: {}", client_addr, e);
                     break;
                 }
@@ -289,6 +321,15 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
             }
         }
     }
+    
+    // Remove client from connected_clients when connection ends
+    {
+        let mut state = app_state.write().await;
+        state.connected_clients.remove(&client_addr.to_string());
+    }
+    
+    // Abort the outgoing task
+    outgoing_task.abort();
     
     info!("Client connection closed: {}", client_addr);
     Ok(())
