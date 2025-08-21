@@ -342,45 +342,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
     let mut store_guard = store.write().await;
     
     match message {
-        StoreMessage::CreateEntity { id, entity_type, parent_id, name } => {
-            match store_guard.create_entity(&entity_type, parent_id, &name).await {
-                Ok(entity) => StoreMessage::CreateEntityResponse {
-                    id,
-                    response: Ok(entity),
-                },
-                Err(e) => StoreMessage::CreateEntityResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::DeleteEntity { id, entity_id } => {
-            match store_guard.delete_entity(&entity_id).await {
-                Ok(()) => StoreMessage::DeleteEntityResponse {
-                    id,
-                    response: Ok(()),
-                },
-                Err(e) => StoreMessage::DeleteEntityResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::SetEntitySchema { id, schema } => {
-            match store_guard.set_entity_schema(&schema).await {
-                Ok(()) => StoreMessage::SetEntitySchemaResponse {
-                    id,
-                    response: Ok(()),
-                },
-                Err(e) => StoreMessage::SetEntitySchemaResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
         StoreMessage::GetEntitySchema { id, entity_type } => {
             match store_guard.get_entity_schema(&entity_type).await {
                 Ok(schema) => StoreMessage::GetEntitySchemaResponse {
@@ -535,9 +496,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
         }
         
         // These message types should not be received by the server
-        StoreMessage::CreateEntityResponse { id, .. } |
-        StoreMessage::DeleteEntityResponse { id, .. } |
-        StoreMessage::SetEntitySchemaResponse { id, .. } |
         StoreMessage::GetEntitySchemaResponse { id, .. } |
         StoreMessage::GetCompleteEntitySchemaResponse { id, .. } |
         StoreMessage::SetFieldSchemaResponse { id, .. } |
