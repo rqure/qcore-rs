@@ -3,11 +3,12 @@ use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tracing::{info, warn, error, debug};
 use clap::Parser;
 use anyhow::Result;
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use tokio::sync::RwLock;
 use std::time::Duration;
 
@@ -46,8 +47,8 @@ struct AppState {
     /// Configuration
     config: Config,
     
-    /// Set of currently connected peer addresses
-    connected_outbound_peers: HashSet<String>,
+    /// Connected outbound peers with message senders
+    connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
 
     /// Set of currently connected inbound peer addresses
     connected_inbound_peers: HashSet<String>,
@@ -61,7 +62,7 @@ impl AppState {
     fn new(config: Config) -> Self {
         Self {
             config,
-            connected_outbound_peers: HashSet::new(),
+            connected_outbound_peers: HashMap::new(),
             connected_inbound_peers: HashSet::new(),
             store: Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new())))),
         }
@@ -140,7 +141,7 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
 }
 
 /// Handle a single outbound peer WebSocket connection
-async fn handle_outbound_peer_connection(peer_addr: &str) -> Result<()> {
+async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<AppState>>) -> Result<()> {
     info!("Attempting to connect to peer: {}", peer_addr);
     
     let ws_url = format!("ws://{}", peer_addr);
@@ -149,33 +150,41 @@ async fn handle_outbound_peer_connection(peer_addr: &str) -> Result<()> {
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
+    // Create a channel for sending messages to this peer
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    
+    // Store the sender in the connected_outbound_peers HashMap
+    {
+        let mut state = app_state.write().await;
+        state.connected_outbound_peers.insert(peer_addr.to_string(), tx);
+    }
+    
     // Send introduction message to peer
     let intro_msg = Message::Text(format!("{{\"type\":\"introduction\",\"message\":\"Hello from QOS Core Service\",\"peer_id\":\"{}\"}}", uuid::Uuid::new_v4()));
     ws_sender.send(intro_msg).await?;
+    
+    // Spawn a task to handle outgoing messages
+    let peer_addr_clone = peer_addr.to_string();
+    let outgoing_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if let Err(e) = ws_sender.send(message).await {
+                error!("Failed to send message to peer {}: {}", peer_addr_clone, e);
+                break;
+            }
+        }
+    });
     
     // Handle incoming messages from peer
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 debug!("Received text from outbound peer {}: {}", peer_addr, text);
-                
-                // For now, just acknowledge - this would be replaced with actual peer protocol handling
-                let response = Message::Text(format!("{{\"type\":\"ack\",\"data\":\"received\"}}"));
-                if let Err(e) = ws_sender.send(response).await {
-                    error!("Failed to send response to outbound peer {}: {}", peer_addr, e);
-                    break;
-                }
             }
             Ok(Message::Binary(data)) => {
                 debug!("Received binary data from outbound peer {}: {} bytes", peer_addr, data.len());
-                // Handle binary messages - could be used for efficient data transfer
             }
-            Ok(Message::Ping(payload)) => {
+            Ok(Message::Ping(_)) => {
                 debug!("Received ping from outbound peer: {}", peer_addr);
-                if let Err(e) = ws_sender.send(Message::Pong(payload)).await {
-                    error!("Failed to send pong to outbound peer {}: {}", peer_addr, e);
-                    break;
-                }
             }
             Ok(Message::Pong(_)) => {
                 debug!("Received pong from outbound peer: {}", peer_addr);
@@ -194,6 +203,12 @@ async fn handle_outbound_peer_connection(peer_addr: &str) -> Result<()> {
             }
         }
     }
+    
+    {
+        let mut state = app_state.write().await;
+        state.connected_outbound_peers.remove(peer_addr);
+    }
+    outgoing_task.abort();
     
     info!("Outbound peer connection closed: {}", peer_addr);
     Ok(())
@@ -593,7 +608,7 @@ async fn manage_outbound_peer_connections(app_state: Arc<RwLock<AppState>>) -> R
             let state = app_state.read().await;
             let connected = &state.connected_outbound_peers;
             state.config.peer_addresses.iter()
-                .filter(|addr| !connected.contains(*addr))
+                .filter(|addr| !connected.contains_key(*addr))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -605,15 +620,8 @@ async fn manage_outbound_peer_connections(app_state: Arc<RwLock<AppState>>) -> R
             let app_state_clone = Arc::clone(&app_state);
             
             tokio::spawn(async move {
-                // Mark as connected before attempting (optimistic)
-                {
-                    let mut state = app_state_clone.write().await;
-                    let connected = &mut state.connected_outbound_peers;
-                    connected.insert(peer_addr_clone.clone());
-                }
-                
                 // Attempt connection
-                if let Err(e) = handle_outbound_peer_connection(&peer_addr_clone).await {
+                if let Err(e) = handle_outbound_peer_connection(&peer_addr_clone, app_state_clone.clone()).await {
                     error!("Failed to connect to peer {}: {}", peer_addr_clone, e);
                     
                     // Remove from connected set on failure
