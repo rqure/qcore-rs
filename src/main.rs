@@ -16,6 +16,10 @@ use std::time::Duration;
 #[derive(Parser, Clone, Debug)]
 #[command(name = "core-service", about = "QOS Core Service runtime datastore")]
 struct Config {
+    /// Machine ID (unique identifier for this instance)
+    #[arg(long)]
+    machine: String,
+
     /// Maximum WAL file size in bytes
     #[arg(long, default_value_t = 1024 * 1024)]
     wal_max_file_size: usize,
