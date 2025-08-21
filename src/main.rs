@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::collections::{HashSet, HashMap};
 use tokio::sync::RwLock;
 use std::time::Duration;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::AsyncWriteExt;
+use std::path::PathBuf;
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -62,6 +65,15 @@ struct AppState {
 
     // Data store
     store: Arc<RwLock<Store>>,
+    
+    /// Current WAL file handle
+    current_wal_file: Option<File>,
+    
+    /// Current WAL file size in bytes
+    current_wal_size: usize,
+    
+    /// WAL file counter for generating unique filenames
+    wal_file_counter: u64,
 }
 
 impl AppState {
@@ -73,6 +85,9 @@ impl AppState {
             connected_inbound_peers: HashSet::new(),
             connected_clients: HashMap::new(),
             store: Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new())))),
+            current_wal_file: None,
+            current_wal_size: 0,
+            wal_file_counter: 0,
         }
     }
 }
@@ -639,6 +654,88 @@ async fn manage_outbound_peer_connections(app_state: Arc<RwLock<AppState>>) -> R
         }
     }
 }
+
+/// Consume and process requests from the store's write channel
+async fn consume_write_channel(app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    info!("Starting write channel consumer");
+    
+    // Get a clone of the write channel receiver
+    let receiver = {
+        let state = app_state.read().await;
+        let store = &state.store;
+        let store_guard = store.read().await;
+        store_guard.get_write_channel_receiver()
+    };
+    
+    loop {
+        // Wait for a request from the write channel without holding any store locks
+        let request = {
+            let mut receiver_guard = receiver.lock().await;
+            receiver_guard.recv().await
+        };
+        
+        match request {
+            Some(request) => {
+                debug!("Writing request to WAL: {:?}", request);
+                
+                // Write request to WAL file - the request has already been applied to the store
+                if let Err(e) = write_request_to_wal(&request, app_state.clone()).await {
+                    error!("Failed to write request to WAL: {}", e);
+                }
+            }
+            None => {
+                warn!("Write channel closed, stopping consumer");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Write a request to the WAL file
+async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let mut state = app_state.write().await;
+    
+    // Serialize the request to JSON
+    let serialized = serde_json::to_vec(request)?;
+    let serialized_len = serialized.len();
+    
+    // Check if we need to create a new WAL file
+    if state.current_wal_file.is_none() || 
+       state.current_wal_size + serialized_len > state.config.wal_max_file_size {
+        
+        // Create new WAL file
+        let wal_filename = format!("wal_{:010}.log", state.wal_file_counter);
+        let wal_path = PathBuf::from(&wal_filename);
+        
+        info!("Creating new WAL file: {}", wal_filename);
+        
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)
+            .await?;
+            
+        state.current_wal_file = Some(file);
+        state.current_wal_size = 0;
+        state.wal_file_counter += 1;
+    }
+    
+    // Write to WAL file
+    if let Some(ref mut wal_file) = state.current_wal_file {
+        // Write length prefix (4 bytes) followed by the serialized data
+        let len_bytes = (serialized_len as u32).to_le_bytes();
+        wal_file.write_all(&len_bytes).await?;
+        wal_file.write_all(&serialized).await?;
+        wal_file.flush().await?;
+        
+        state.current_wal_size += 4 + serialized_len;
+        
+        debug!("Wrote {} bytes to WAL file", serialized_len + 4);
+    }
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
@@ -655,6 +752,14 @@ async fn main() -> Result<()> {
 
     // Create shared application state
     let app_state = Arc::new(RwLock::new(AppState::new(config)));
+
+    // Start the write channel consumer task
+    let app_state_clone = Arc::clone(&app_state);
+    let write_channel_task = tokio::spawn(async move {
+        if let Err(e) = consume_write_channel(app_state_clone).await {
+            error!("Write channel consumer failed: {}", e);
+        }
+    });
 
     // Start the peer WebSocket server task
     let app_state_clone = Arc::clone(&app_state);
@@ -685,6 +790,7 @@ async fn main() -> Result<()> {
     warn!("Received shutdown signal. Stopping Core service...");
 
     // Abort all tasks
+    write_channel_task.abort();
     peer_server_task.abort();
     client_server_task.abort();
     outbound_peer_task.abort();
