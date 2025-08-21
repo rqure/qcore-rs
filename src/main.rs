@@ -163,10 +163,6 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
         state.connected_outbound_peers.insert(peer_addr.to_string(), tx);
     }
     
-    // Send introduction message to peer
-    let intro_msg = Message::Text(format!("{{\"type\":\"introduction\",\"message\":\"Hello from QOS Core Service\",\"peer_id\":\"{}\"}}", uuid::Uuid::new_v4()));
-    ws_sender.send(intro_msg).await?;
-    
     // Spawn a task to handle outgoing messages
     let peer_addr_clone = peer_addr.to_string();
     let outgoing_task = tokio::spawn(async move {
