@@ -391,19 +391,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
             }
         }
         
-        StoreMessage::SetFieldSchema { id, entity_type, field_type, schema } => {
-            match store_guard.set_field_schema(&entity_type, &field_type, schema).await {
-                Ok(()) => StoreMessage::SetFieldSchemaResponse {
-                    id,
-                    response: Ok(()),
-                },
-                Err(e) => StoreMessage::SetFieldSchemaResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
         StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
             match store_guard.get_field_schema(&entity_type, &field_type).await {
                 Ok(schema) => StoreMessage::GetFieldSchemaResponse {
@@ -521,7 +508,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
         // These message types should not be received by the server
         StoreMessage::GetEntitySchemaResponse { id, .. } |
         StoreMessage::GetCompleteEntitySchemaResponse { id, .. } |
-        StoreMessage::SetFieldSchemaResponse { id, .. } |
         StoreMessage::GetFieldSchemaResponse { id, .. } |
         StoreMessage::EntityExistsResponse { id, .. } |
         StoreMessage::FieldExistsResponse { id, .. } |
