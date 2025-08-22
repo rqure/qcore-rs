@@ -361,9 +361,10 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
 /// Process a StoreMessage and generate the appropriate response
 async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<AppState>>) -> StoreMessage {
     let mut state = app_state.write().await;
+    let machine = state.config.machine.clone();
     let store = &mut state.store;
     let mut store_guard = store.write().await;
-    
+
     match message {
         StoreMessage::GetEntitySchema { id, entity_type } => {
             match store_guard.get_entity_schema(&entity_type).await {
@@ -421,6 +422,10 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
         }
         
         StoreMessage::Perform { id, mut requests } => {
+            requests.iter_mut().for_each(|req| {
+                req.try_set_originator(machine.clone());
+            });
+
             match store_guard.perform(&mut requests).await {
                 Ok(()) => StoreMessage::PerformResponse {
                     id,
