@@ -110,6 +110,8 @@ impl AppState {
 
 /// Handle a single peer WebSocket connection
 async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAddr, app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let machine = app_state.read().await.config.machine.clone();
+
     info!("New peer connection from: {}", peer_addr);
     
     let ws_stream = accept_async(stream).await?;
@@ -122,10 +124,6 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     }
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    
-    // Send welcome message to peer
-    let welcome_msg = Message::Text(format!("{{\"type\":\"welcome\",\"message\":\"Connected to QOS Core Service\",\"peer_id\":\"{}\"}}", uuid::Uuid::new_v4()));
-    ws_sender.send(welcome_msg).await?;
     
     // Handle incoming messages from peer
     while let Some(msg) = ws_receiver.next().await {
@@ -140,16 +138,18 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
                         
                         // Apply the request to our store if it doesn't already have an originator
                         // (to avoid infinite loops) and ensure the current timestamp is preserved
-                        if request.originator().is_some() {
-                            let mut state = app_state.write().await;
-                            let store = &mut state.store;
-                            let mut store_guard = store.write().await;
-                            
-                            let mut requests = vec![request];
-                            if let Err(e) = store_guard.perform(&mut requests).await {
-                                error!("Failed to apply sync request from peer {}: {}", peer_addr, e);
-                            } else {
-                                debug!("Successfully applied sync request from peer {}", peer_addr);
+                        if let Some(originator) = request.originator() {
+                            if *originator != machine {
+                                let mut state = app_state.write().await;
+                                let store = &mut state.store;
+                                let mut store_guard = store.write().await;
+                                
+                                let mut requests = vec![request];
+                                if let Err(e) = store_guard.perform(&mut requests).await {
+                                    error!("Failed to apply sync request from peer {}: {}", peer_addr, e);
+                                } else {
+                                    debug!("Successfully applied sync request from peer {}", peer_addr);
+                                }
                             }
                         } else {
                             debug!("Ignoring request without originator from peer {}", peer_addr);
