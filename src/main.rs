@@ -133,11 +133,39 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
             Ok(Message::Text(text)) => {
                 debug!("Received text from peer {}: {}", peer_addr, text);
                 
-                // Echo back for now - this would be replaced with actual peer protocol handling
-                let response = Message::Text(format!("{{\"type\":\"echo\",\"data\":{}}}", text));
-                if let Err(e) = ws_sender.send(response).await {
-                    error!("Failed to send response to peer {}: {}", peer_addr, e);
-                    break;
+                // Try to parse as a Request for synchronization
+                match serde_json::from_str::<qlib_rs::Request>(&text) {
+                    Ok(request) => {
+                        debug!("Received sync request from peer {}: {:?}", peer_addr, request);
+                        
+                        // Apply the request to our store if it doesn't already have an originator
+                        // (to avoid infinite loops) and ensure the current timestamp is preserved
+                        if request.originator().is_some() {
+                            let mut state = app_state.write().await;
+                            let store = &mut state.store;
+                            let mut store_guard = store.write().await;
+                            
+                            let mut requests = vec![request];
+                            if let Err(e) = store_guard.perform(&mut requests).await {
+                                error!("Failed to apply sync request from peer {}: {}", peer_addr, e);
+                            } else {
+                                debug!("Successfully applied sync request from peer {}", peer_addr);
+                            }
+                        } else {
+                            debug!("Ignoring request without originator from peer {}", peer_addr);
+                        }
+                    }
+                    Err(_) => {
+                        // Not a sync request, treat as regular peer message
+                        debug!("Received non-sync message from peer {}", peer_addr);
+                        
+                        // Echo back for now - this would be replaced with actual peer protocol handling
+                        let response = Message::Text(format!("{{\"type\":\"echo\",\"data\":{}}}", text));
+                        if let Err(e) = ws_sender.send(response).await {
+                            error!("Failed to send response to peer {}: {}", peer_addr, e);
+                            break;
+                        }
+                    }
                 }
             }
             Ok(Message::Binary(data)) => {
@@ -214,6 +242,34 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
         match msg {
             Ok(Message::Text(text)) => {
                 debug!("Received text from outbound peer {}: {}", peer_addr, text);
+                
+                // Try to parse as a Request for synchronization
+                match serde_json::from_str::<qlib_rs::Request>(&text) {
+                    Ok(request) => {
+                        debug!("Received sync request from outbound peer {}: {:?}", peer_addr, request);
+                        
+                        // Apply the request to our store if it doesn't already have an originator
+                        // (to avoid infinite loops) and ensure the current timestamp is preserved
+                        if request.originator().is_some() {
+                            let mut state = app_state.write().await;
+                            let store = &mut state.store;
+                            let mut store_guard = store.write().await;
+                            
+                            let mut requests = vec![request];
+                            if let Err(e) = store_guard.perform(&mut requests).await {
+                                error!("Failed to apply sync request from outbound peer {}: {}", peer_addr, e);
+                            } else {
+                                debug!("Successfully applied sync request from outbound peer {}", peer_addr);
+                            }
+                        } else {
+                            debug!("Ignoring request without originator from outbound peer {}", peer_addr);
+                        }
+                    }
+                    Err(_) => {
+                        // Not a sync request, treat as regular peer message
+                        debug!("Received non-sync message from outbound peer {}", peer_addr);
+                    }
+                }
             }
             Ok(Message::Binary(data)) => {
                 debug!("Received binary data from outbound peer {}: {} bytes", peer_addr, data.len());
@@ -688,6 +744,45 @@ async fn consume_write_channel(app_state: Arc<RwLock<AppState>>) -> Result<()> {
                 // Write request to WAL file - the request has already been applied to the store
                 if let Err(e) = write_request_to_wal(&request, app_state.clone()).await {
                     error!("Failed to write request to WAL: {}", e);
+                }
+                
+                // Check if this request originated from the current machine
+                let current_machine = {
+                    let state = app_state.read().await;
+                    state.config.machine.clone()
+                };
+                
+                // If the request originated from this machine, send it to peers for synchronization
+                if let Some(originator) = request.originator() {
+                    if originator == &current_machine {
+                        debug!("Sending request to peers for synchronization: {:?}", request);
+                        
+                        // Send to all connected outbound peers
+                        let peers_to_notify = {
+                            let state = app_state.read().await;
+                            state.connected_outbound_peers.clone()
+                        };
+                        
+                        // Serialize the request to JSON for transmission
+                        match serde_json::to_string(&request) {
+                            Ok(request_json) => {
+                                let message = Message::Text(request_json);
+                                
+                                for (peer_addr, sender) in peers_to_notify {
+                                    if let Err(e) = sender.send(message.clone()) {
+                                        warn!("Failed to send request to peer {}: {}", peer_addr, e);
+                                    } else {
+                                        debug!("Sent request to peer: {}", peer_addr);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to serialize request for peer synchronization: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    debug!("Request has no originator, not sending to peers");
                 }
             }
             None => {
