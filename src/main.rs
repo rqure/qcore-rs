@@ -12,7 +12,7 @@ use std::collections::{HashSet, HashMap};
 use tokio::sync::RwLock;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::path::PathBuf;
 
 /// Configuration passed via CLI arguments
@@ -35,9 +35,9 @@ struct Config {
     #[arg(long, default_value_t = 30)]
     wal_max_files: usize,
 
-    /// Snapshot interval in seconds
-    #[arg(long, default_value_t = 30)]
-    snapshot_interval_secs: u64,
+    /// Number of WAL file rollovers before taking a snapshot
+    #[arg(long, default_value_t = 3)]
+    snapshot_wal_interval: u64,
 
     /// Port for peer-to-peer communication
     #[arg(long, default_value_t = 9000)]
@@ -82,6 +82,12 @@ struct AppState {
     
     /// WAL file counter for generating unique filenames
     wal_file_counter: u64,
+    
+    /// Snapshot file counter for generating unique filenames
+    snapshot_file_counter: u64,
+    
+    /// Number of WAL files created since last snapshot
+    wal_files_since_snapshot: u64,
 }
 
 impl AppState {
@@ -96,6 +102,8 @@ impl AppState {
             current_wal_file: None,
             current_wal_size: 0,
             wal_file_counter: 0,
+            snapshot_file_counter: 0,
+            wal_files_since_snapshot: 0,
         }
     }
 }
@@ -733,9 +741,10 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
     let serialized_len = serialized.len();
     
     // Check if we need to create a new WAL file
-    if state.current_wal_file.is_none() || 
-       state.current_wal_size + serialized_len > state.config.wal_max_file_size {
-        
+    let should_create_new_file = state.current_wal_file.is_none() || 
+       state.current_wal_size + serialized_len > state.config.wal_max_file_size;
+    
+    if should_create_new_file {
         // Create WAL directory if it doesn't exist
         let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
         create_dir_all(&wal_dir).await?;
@@ -755,6 +764,36 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
         state.current_wal_file = Some(file);
         state.current_wal_size = 0;
         state.wal_file_counter += 1;
+        state.wal_files_since_snapshot += 1;
+        
+        // Check if we should take a snapshot based on WAL rollovers
+        let should_snapshot = state.wal_files_since_snapshot >= state.config.snapshot_wal_interval;
+        
+        if should_snapshot {
+            info!("Taking snapshot after {} WAL file rollovers", state.wal_files_since_snapshot);
+            
+            // Take a snapshot
+            let snapshot = {
+                let store = &state.store;
+                let store_guard = store.read().await;
+                store_guard.take_snapshot()
+            };
+            
+            drop(state); // Release the lock before calling save_snapshot
+            
+            // Save the snapshot to disk
+            if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
+                error!("Failed to save snapshot after WAL rollover: {}", e);
+            } else {
+                // Reset the WAL files counter
+                let mut state = app_state.write().await;
+                state.wal_files_since_snapshot = 0;
+                info!("Snapshot saved successfully after WAL rollover");
+            }
+            
+            // Re-acquire the state lock for the rest of the function
+            state = app_state.write().await;
+        }
         
         // Clean up old WAL files if we exceed the maximum
         let max_files = state.config.wal_max_files;
@@ -779,6 +818,327 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
     Ok(())
 }
 
+/// Save a snapshot to disk
+async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let mut state = app_state.write().await;
+    
+    // Create snapshots directory if it doesn't exist
+    let snapshot_dir = PathBuf::from(&state.config.data_dir).join("snapshots");
+    create_dir_all(&snapshot_dir).await?;
+    
+    // Create snapshot filename with counter
+    let snapshot_filename = format!("snapshot_{:010}.bin", state.snapshot_file_counter);
+    let snapshot_path = snapshot_dir.join(&snapshot_filename);
+    
+    info!("Saving snapshot to: {}", snapshot_path.display());
+    
+    // Serialize the snapshot using bincode for efficiency
+    let serialized = bincode::serialize(snapshot)?;
+    
+    // Write to file
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&snapshot_path)
+        .await?;
+    
+    file.write_all(&serialized).await?;
+    file.flush().await?;
+    
+    state.snapshot_file_counter += 1;
+    
+    info!("Snapshot saved successfully, {} bytes", serialized.len());
+    
+    // Clean up old snapshots (keep only the most recent 3)
+    if let Err(e) = cleanup_old_snapshots(&snapshot_dir, 3).await {
+        error!("Failed to clean up old snapshots: {}", e);
+    }
+    
+    Ok(())
+}
+
+/// Load the latest snapshot from disk and return it along with the snapshot counter
+async fn load_latest_snapshot(app_state: Arc<RwLock<AppState>>) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
+    let state = app_state.read().await;
+    let snapshot_dir = PathBuf::from(&state.config.data_dir).join("snapshots");
+    
+    if !snapshot_dir.exists() {
+        info!("No snapshots directory found, starting with empty store");
+        return Ok(None);
+    }
+    
+    // Find the latest snapshot file
+    let mut entries = read_dir(&snapshot_dir).await?;
+    let mut snapshot_files = Vec::new();
+    
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if let Some(filename) = path.file_name() {
+            if let Some(filename_str) = filename.to_str() {
+                if filename_str.starts_with("snapshot_") && filename_str.ends_with(".bin") {
+                    // Extract the counter from the filename
+                    if let Some(counter_str) = filename_str.strip_prefix("snapshot_").and_then(|s| s.strip_suffix(".bin")) {
+                        if let Ok(counter) = counter_str.parse::<u64>() {
+                            snapshot_files.push((path, counter));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if snapshot_files.is_empty() {
+        info!("No snapshot files found, starting with empty store");
+        return Ok(None);
+    }
+    
+    // Sort files by counter (which corresponds to creation order)
+    snapshot_files.sort_by_key(|(_, counter)| *counter);
+    
+    // Load the latest snapshot
+    let (latest_snapshot_path, latest_counter) = snapshot_files.last().unwrap();
+    info!("Loading snapshot from: {} (counter: {})", latest_snapshot_path.display(), latest_counter);
+    
+    drop(state); // Release the lock before async operations
+    
+    let mut file = File::open(latest_snapshot_path).await?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+    
+    match bincode::deserialize(&buffer) {
+        Ok(snapshot) => {
+            info!("Snapshot loaded successfully");
+            Ok(Some((snapshot, *latest_counter)))
+        }
+        Err(e) => {
+            error!("Failed to deserialize snapshot: {}", e);
+            Ok(None)
+        }
+    }
+}
+
+/// Clean up old snapshot files, keeping only the most recent max_files
+async fn cleanup_old_snapshots(snapshot_dir: &PathBuf, max_files: usize) -> Result<()> {
+    let mut entries = read_dir(snapshot_dir).await?;
+    let mut snapshot_files = Vec::new();
+    
+    // Collect all snapshot files
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if let Some(filename) = path.file_name() {
+            if let Some(filename_str) = filename.to_str() {
+                if filename_str.starts_with("snapshot_") && filename_str.ends_with(".bin") {
+                    snapshot_files.push(path);
+                }
+            }
+        }
+    }
+    
+    // Sort files by name (which corresponds to creation order due to counter)
+    snapshot_files.sort();
+    
+    // Remove old files if we have more than max_files
+    if snapshot_files.len() > max_files {
+        let files_to_remove = snapshot_files.len() - max_files;
+        for i in 0..files_to_remove {
+            info!("Removing old snapshot file: {}", snapshot_files[i].display());
+            if let Err(e) = remove_file(&snapshot_files[i]).await {
+                error!("Failed to remove old snapshot file {}: {}", snapshot_files[i].display(), e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Replay WAL files from a specific point to restore store state
+/// If start_from_wal_counter is provided, only replay WAL files with counter >= start_from_wal_counter
+async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_counter: Option<u64>) -> Result<()> {
+    let state = app_state.read().await;
+    let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
+    
+    if !wal_dir.exists() {
+        info!("No WAL directory found, no replay needed");
+        return Ok(());
+    }
+    
+    // Find all WAL files
+    let mut entries = read_dir(&wal_dir).await?;
+    let mut wal_files = Vec::new();
+    
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if let Some(filename) = path.file_name() {
+            if let Some(filename_str) = filename.to_str() {
+                if filename_str.starts_with("wal_") && filename_str.ends_with(".log") {
+                    // Extract the counter from the filename
+                    if let Some(counter_str) = filename_str.strip_prefix("wal_").and_then(|s| s.strip_suffix(".log")) {
+                        if let Ok(counter) = counter_str.parse::<u64>() {
+                            // Only include files that are >= start_from_wal_counter (if specified)
+                            if let Some(start_counter) = start_from_wal_counter {
+                                if counter >= start_counter {
+                                    wal_files.push((path, counter));
+                                }
+                            } else {
+                                wal_files.push((path, counter));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if wal_files.is_empty() {
+        if let Some(start_counter) = start_from_wal_counter {
+            info!("No WAL files found starting from counter {}, no replay needed", start_counter);
+        } else {
+            info!("No WAL files found, no replay needed");
+        }
+        return Ok(());
+    }
+    
+    // Sort files by counter (which corresponds to creation order)
+    wal_files.sort_by_key(|(_, counter)| *counter);
+    
+    drop(state); // Release the lock before processing
+    
+    if let Some(start_counter) = start_from_wal_counter {
+        info!("Replaying {} WAL files starting from counter {}", wal_files.len(), start_counter);
+    } else {
+        info!("Replaying {} WAL files", wal_files.len());
+    }
+    
+    for (wal_file, counter) in &wal_files {
+        info!("Replaying WAL file: {} (counter: {})", wal_file.display(), counter);
+        
+        if let Err(e) = replay_single_wal_file(wal_file, app_state.clone()).await {
+            error!("Failed to replay WAL file {}: {}", wal_file.display(), e);
+            // Continue with other files instead of failing completely
+        }
+    }
+    
+    info!("WAL replay completed");
+    Ok(())
+}
+
+/// Replay a single WAL file
+async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let mut file = File::open(wal_path).await?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+    
+    let mut offset = 0;
+    let mut requests_processed = 0;
+    
+    while offset < buffer.len() {
+        // Read length prefix (4 bytes)
+        if offset + 4 > buffer.len() {
+            break; // Not enough data for length prefix
+        }
+        
+        let len_bytes = [buffer[offset], buffer[offset+1], buffer[offset+2], buffer[offset+3]];
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        offset += 4;
+        
+        // Read the serialized request
+        if offset + len > buffer.len() {
+            error!("Incomplete request in WAL file at offset {}", offset);
+            break;
+        }
+        
+        let request_data = &buffer[offset..offset + len];
+        offset += len;
+        
+        // Deserialize and apply the request
+        match serde_json::from_slice::<qlib_rs::Request>(request_data) {
+            Ok(request) => {
+                // Apply the request to the store
+                let mut state = app_state.write().await;
+                let store = &mut state.store;
+                let mut store_guard = store.write().await;
+                
+                let mut requests = vec![request];
+                if let Err(e) = store_guard.perform(&mut requests).await {
+                    error!("Failed to apply request during WAL replay: {}", e);
+                } else {
+                    requests_processed += 1;
+                }
+                
+                drop(store_guard);
+                drop(state);
+            }
+            Err(e) => {
+                error!("Failed to deserialize request from WAL: {}", e);
+            }
+        }
+    }
+    
+    info!("Replayed {} requests from {}", requests_processed, wal_path.display());
+    Ok(())
+}
+
+/// Determine the next WAL file counter based on existing WAL files
+async fn get_next_wal_counter(app_state: Arc<RwLock<AppState>>) -> Result<u64> {
+    let state = app_state.read().await;
+    let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
+    
+    if !wal_dir.exists() {
+        return Ok(0);
+    }
+    
+    let mut entries = read_dir(&wal_dir).await?;
+    let mut max_counter = 0;
+    
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if let Some(filename) = path.file_name() {
+            if let Some(filename_str) = filename.to_str() {
+                if filename_str.starts_with("wal_") && filename_str.ends_with(".log") {
+                    if let Some(counter_str) = filename_str.strip_prefix("wal_").and_then(|s| s.strip_suffix(".log")) {
+                        if let Ok(counter) = counter_str.parse::<u64>() {
+                            max_counter = max_counter.max(counter);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(max_counter + 1)
+}
+
+/// Determine the next snapshot file counter based on existing snapshot files
+async fn get_next_snapshot_counter(app_state: Arc<RwLock<AppState>>) -> Result<u64> {
+    let state = app_state.read().await;
+    let snapshot_dir = PathBuf::from(&state.config.data_dir).join("snapshots");
+    
+    if !snapshot_dir.exists() {
+        return Ok(0);
+    }
+    
+    let mut entries = read_dir(&snapshot_dir).await?;
+    let mut max_counter = 0;
+    
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if let Some(filename) = path.file_name() {
+            if let Some(filename_str) = filename.to_str() {
+                if filename_str.starts_with("snapshot_") && filename_str.ends_with(".bin") {
+                    if let Some(counter_str) = filename_str.strip_prefix("snapshot_").and_then(|s| s.strip_suffix(".bin")) {
+                        if let Ok(counter) = counter_str.parse::<u64>() {
+                            max_counter = max_counter.max(counter);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(max_counter + 1)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
@@ -795,6 +1155,61 @@ async fn main() -> Result<()> {
 
     // Create shared application state
     let app_state = Arc::new(RwLock::new(AppState::new(config)));
+
+    // Initialize the WAL file counter based on existing files
+    {
+        let next_wal_counter = get_next_wal_counter(app_state.clone()).await?;
+        let mut state = app_state.write().await;
+        state.wal_file_counter = next_wal_counter;
+        info!("Initialized WAL file counter to {}", next_wal_counter);
+    }
+
+    // Load the latest snapshot if available
+    let snapshot_wal_counter = if let Some((snapshot, snapshot_counter)) = load_latest_snapshot(app_state.clone()).await? {
+        info!("Restoring store from snapshot (counter: {})", snapshot_counter);
+        
+        // Initialize the snapshot file counter to continue from the next number
+        let next_snapshot_counter = get_next_snapshot_counter(app_state.clone()).await?;
+        
+        let mut state = app_state.write().await;
+        let store = &mut state.store;
+        let mut store_guard = store.write().await;
+        store_guard.restore_snapshot(snapshot);
+        drop(store_guard);
+        
+        state.snapshot_file_counter = next_snapshot_counter;
+        drop(state);
+        
+        // Calculate which WAL files to replay
+        // We need to replay WAL files that were created after this snapshot
+        // Since snapshots are taken every N WAL rollovers, we need to calculate the WAL counter
+        // based on the snapshot counter
+        let config = {
+            let state = app_state.read().await;
+            state.config.clone()
+        };
+        
+        // The WAL counter that corresponds to this snapshot
+        // Since we take a snapshot every N WAL rollovers, the formula is:
+        // wal_counter = snapshot_counter * snapshot_wal_interval
+        Some(snapshot_counter * config.snapshot_wal_interval)
+    } else {
+        info!("No snapshot found, starting with empty store");
+        
+        // Initialize the snapshot file counter
+        let next_snapshot_counter = get_next_snapshot_counter(app_state.clone()).await?;
+        let mut state = app_state.write().await;
+        state.snapshot_file_counter = next_snapshot_counter;
+        
+        None
+    };
+
+    // Replay WAL files to bring the store up to date
+    info!("Replaying WAL files");
+    if let Err(e) = replay_wal_files(app_state.clone(), snapshot_wal_counter).await {
+        error!("Failed to replay WAL files: {}", e);
+        return Err(e);
+    }
 
     // Start the write channel consumer task
     let app_state_clone = Arc::clone(&app_state);
@@ -831,6 +1246,21 @@ async fn main() -> Result<()> {
     // Wait for shutdown signal
     signal::ctrl_c().await?;
     warn!("Received shutdown signal. Stopping Core service...");
+
+    // Take a final snapshot before shutting down
+    info!("Taking final snapshot before shutdown");
+    let snapshot = {
+        let state = app_state.read().await;
+        let store = &state.store;
+        let store_guard = store.read().await;
+        store_guard.take_snapshot()
+    };
+    
+    if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
+        error!("Failed to save final snapshot: {}", e);
+    } else {
+        info!("Final snapshot saved successfully");
+    }
 
     // Abort all tasks
     write_channel_task.abort();
