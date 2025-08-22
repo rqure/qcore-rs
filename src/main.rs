@@ -54,6 +54,10 @@ struct Config {
     /// Interval in seconds to retry connecting to peers
     #[arg(long, default_value_t = 30)]
     peer_reconnect_interval_secs: u64,
+
+    /// Enable background snapshots every hour as a safety measure
+    #[arg(long, default_value_t = false)]
+    enable_background_snapshots: bool,
 }
 
 /// Application state that is shared across all tasks
@@ -770,29 +774,18 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
         let should_snapshot = state.wal_files_since_snapshot >= state.config.snapshot_wal_interval;
         
         if should_snapshot {
-            info!("Taking snapshot after {} WAL file rollovers", state.wal_files_since_snapshot);
+            info!("Triggering async snapshot after {} WAL file rollovers", state.wal_files_since_snapshot);
             
-            // Take a snapshot
-            let snapshot = {
-                let store = &state.store;
-                let store_guard = store.read().await;
-                store_guard.take_snapshot()
-            };
+            // Reset the counter immediately to prevent multiple snapshots
+            state.wal_files_since_snapshot = 0;
             
-            drop(state); // Release the lock before calling save_snapshot
-            
-            // Save the snapshot to disk
-            if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
-                error!("Failed to save snapshot after WAL rollover: {}", e);
-            } else {
-                // Reset the WAL files counter
-                let mut state = app_state.write().await;
-                state.wal_files_since_snapshot = 0;
-                info!("Snapshot saved successfully after WAL rollover");
-            }
-            
-            // Re-acquire the state lock for the rest of the function
-            state = app_state.write().await;
+            // Trigger async snapshot without blocking
+            let app_state_clone = app_state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = create_async_snapshot(app_state_clone).await {
+                    error!("Failed to create async snapshot: {}", e);
+                }
+            });
         }
         
         // Clean up old WAL files if we exceed the maximum
@@ -815,6 +808,25 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
         debug!("Wrote {} bytes to WAL file", serialized_len + 4);
     }
     
+    Ok(())
+}
+
+/// Create a snapshot asynchronously without blocking the write channel
+async fn create_async_snapshot(app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    info!("Creating async snapshot");
+    
+    // Take the snapshot with minimal lock holding time
+    let snapshot = {
+        let state = app_state.read().await;
+        let store = &state.store;
+        let store_guard = store.read().await;
+        store_guard.take_snapshot()
+    };
+    
+    // Save the snapshot to disk (this can take time but doesn't block the store)
+    save_snapshot(&snapshot, app_state.clone()).await?;
+    
+    info!("Async snapshot completed successfully");
     Ok(())
 }
 
@@ -1243,23 +1255,38 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Optionally start the background snapshot task
+    let background_snapshot_task = if app_state.read().await.config.enable_background_snapshots {
+        info!("Starting background snapshot task");
+        let app_state_clone = Arc::clone(&app_state);
+        Some(tokio::spawn(async move {
+            if let Err(e) = background_snapshot_task(app_state_clone).await {
+                error!("Background snapshot task failed: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Wait for shutdown signal
     signal::ctrl_c().await?;
     warn!("Received shutdown signal. Stopping Core service...");
 
-    // Take a final snapshot before shutting down
+    // Take a final snapshot before shutting down (async to avoid blocking shutdown)
     info!("Taking final snapshot before shutdown");
-    let snapshot = {
-        let state = app_state.read().await;
-        let store = &state.store;
-        let store_guard = store.read().await;
-        store_guard.take_snapshot()
-    };
-    
-    if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
-        error!("Failed to save final snapshot: {}", e);
-    } else {
-        info!("Final snapshot saved successfully");
+    let app_state_clone = Arc::clone(&app_state);
+    let final_snapshot_task = tokio::spawn(async move {
+        if let Err(e) = create_async_snapshot(app_state_clone).await {
+            error!("Failed to save final snapshot: {}", e);
+        } else {
+            info!("Final snapshot saved successfully");
+        }
+    });
+
+    // Give the snapshot task a reasonable time to complete, but don't wait forever
+    let snapshot_timeout = Duration::from_secs(30);
+    if let Err(_) = tokio::time::timeout(snapshot_timeout, final_snapshot_task).await {
+        warn!("Final snapshot timed out after 30 seconds, proceeding with shutdown");
     }
 
     // Abort all tasks
@@ -1267,6 +1294,25 @@ async fn main() -> Result<()> {
     peer_server_task.abort();
     client_server_task.abort();
     outbound_peer_task.abort();
+    if let Some(task) = background_snapshot_task {
+        task.abort();
+    }
 
     Ok(())
+}
+
+/// Background task that takes snapshots at regular intervals
+/// This provides an additional safety net beyond WAL-triggered snapshots
+async fn background_snapshot_task(app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    // Take a snapshot every hour as a safety measure
+    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    
+    loop {
+        interval.tick().await;
+        
+        info!("Taking scheduled background snapshot");
+        if let Err(e) = create_async_snapshot(app_state.clone()).await {
+            error!("Background snapshot failed: {}", e);
+        }
+    }
 }
