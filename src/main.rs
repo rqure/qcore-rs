@@ -19,20 +19,18 @@ use serde::{Serialize, Deserialize};
 /// Messages exchanged between peers for leader election
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum PeerMessage {
-    /// Heartbeat message announcing startup time and machine ID
-    Heartbeat {
+    /// Startup message announcing startup time and machine ID
+    Startup {
         machine_id: String,
         startup_time: u64, // Timestamp in seconds since UNIX_EPOCH
     },
-    /// Request for peer information during leader election
-    LeaderElectionRequest {
+    /// Request for full synchronization from the leader
+    FullSyncRequest {
         machine_id: String,
-        startup_time: u64,
     },
-    /// Response to leader election request
-    LeaderElectionResponse {
-        machine_id: String,
-        startup_time: u64,
+    /// Response containing a complete snapshot for full synchronization
+    FullSyncResponse {
+        snapshot: qlib_rs::Snapshot,
     },
     /// Data synchronization request (existing functionality)
     SyncRequest {
@@ -81,7 +79,7 @@ struct Config {
     peer_reconnect_interval_secs: u64,
 
     /// Delay before starting leader election (useful for testing)
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 2)]
     leader_election_delay_secs: u64,
 }
 
@@ -96,6 +94,12 @@ struct AppState {
     
     /// Whether this instance has been elected as leader
     is_leader: bool,
+    
+    /// The machine ID of the current leader (if known)
+    current_leader: Option<String>,
+    
+    /// Whether this instance has completed full sync with the leader
+    is_fully_synced: bool,
     
     /// Information about known peers and their startup times
     peer_info: HashMap<String, PeerInfo>,
@@ -136,6 +140,7 @@ struct PeerInfo {
     last_seen: u64,
 }
 
+/// Check if this instance should be the leader based on startup times
 impl AppState {
     /// Create a new AppState with the given configuration
     fn new(config: Config) -> Self {
@@ -148,6 +153,8 @@ impl AppState {
             config,
             startup_time,
             is_leader: false, // Will be determined through leader election
+            current_leader: None,
+            is_fully_synced: false,
             peer_info: HashMap::new(),
             connected_outbound_peers: HashMap::new(),
             connected_inbound_peers: HashSet::new(),
@@ -180,14 +187,14 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
-    // Send initial heartbeat to announce ourselves
-    let heartbeat = PeerMessage::Heartbeat {
+    // Send initial startup message to announce ourselves
+    let startup = PeerMessage::Startup {
         machine_id: machine.clone(),
         startup_time,
     };
-    if let Ok(heartbeat_json) = serde_json::to_string(&heartbeat) {
-        if let Err(e) = ws_sender.send(Message::Text(heartbeat_json)).await {
-            error!("Failed to send initial heartbeat to peer {}: {}", peer_addr, e);
+    if let Ok(startup_json) = serde_json::to_string(&startup) {
+        if let Err(e) = ws_sender.send(Message::Text(startup_json)).await {
+            error!("Failed to send initial startup message to peer {}: {}", peer_addr, e);
         }
     }
     
@@ -304,7 +311,7 @@ async fn handle_peer_message(
         .as_secs();
 
     match peer_msg {
-        PeerMessage::Heartbeat { machine_id, startup_time } => {
+        PeerMessage::Startup { machine_id, startup_time } => {
             // Update peer information
             {
                 let mut state = app_state.write().await;
@@ -313,63 +320,133 @@ async fn handle_peer_message(
                     startup_time,
                     last_seen: current_time,
                 });
+                
+                // Determine leadership locally based on startup times
+                // If our startup time is the largest (earliest), we are the leader
+                let our_startup_time = state.startup_time;
+                let our_machine_id = state.config.machine.clone();
+                
+                // Find the earliest (largest) startup time among all known peers including ourselves
+                let earliest_startup = state.peer_info.values()
+                    .map(|p| p.startup_time)
+                    .min()
+                    .unwrap_or(our_startup_time)
+                    .min(our_startup_time);
+                
+                let should_be_leader = our_startup_time <= earliest_startup;
+                
+                // Handle startup time ties
+                if our_startup_time == earliest_startup {
+                    let peers_with_same_time: Vec<_> = state.peer_info.values()
+                        .filter(|p| p.startup_time == our_startup_time)
+                        .collect();
+                    
+                    if !peers_with_same_time.is_empty() {
+                        // We have a tie, use machine_id as tiebreaker
+                        info!("Startup time tie detected with {} peers. Using machine_id as tiebreaker.", peers_with_same_time.len());
+                        
+                        let mut all_machine_ids = peers_with_same_time.iter()
+                            .map(|p| p.machine_id.as_str())
+                            .collect::<Vec<_>>();
+                        all_machine_ids.push(our_machine_id.as_str());
+                        
+                        let min_machine_id = all_machine_ids.iter().min().unwrap();
+                        let should_be_leader_after_tiebreak = **min_machine_id == our_machine_id;
+                        
+                        // Update leadership status
+                        if should_be_leader_after_tiebreak {
+                            state.is_leader = true;
+                            state.current_leader = Some(our_machine_id.clone());
+                            state.is_fully_synced = true;
+                            info!("We are the leader after machine_id tiebreaker (startup_time: {}, machine_id: {})", our_startup_time, our_machine_id);
+                        } else {
+                            state.is_leader = false;
+                            // Find the actual leader
+                            let leader = state.peer_info.values()
+                                .filter(|p| p.startup_time <= earliest_startup)
+                                .min_by_key(|p| (&p.startup_time, &p.machine_id))
+                                .map(|p| p.machine_id.clone());
+                            state.current_leader = leader;
+                            info!("We are not the leader after machine_id tiebreaker (startup_time: {}, machine_id: {})", our_startup_time, our_machine_id);
+                        }
+                        return;
+                    }
+                }
+                
+                // Update leadership status
+                if should_be_leader {
+                    state.is_leader = true;
+                    state.current_leader = Some(our_machine_id.clone());
+                    state.is_fully_synced = true;
+                    info!("We are the leader based on startup time comparison (startup_time: {})", our_startup_time);
+                } else {
+                    state.is_leader = false;
+                    // Find the actual leader
+                    let leader = state.peer_info.values()
+                        .filter(|p| p.startup_time <= earliest_startup)
+                        .min_by_key(|p| (&p.startup_time, &p.machine_id))
+                        .map(|p| p.machine_id.clone());
+                    state.current_leader = leader;
+                    info!("Leader determined: {:?} (our startup_time: {})", state.current_leader, our_startup_time);
+                }
             }
             debug!("Updated peer info for {}: startup_time={}", machine_id, startup_time);
             
-            // Send our heartbeat in response
-            let our_machine_id = app_state.read().await.config.machine.clone();
-            let our_startup_time = app_state.read().await.startup_time;
+            // Send our startup info in response
+            let (our_machine_id, our_startup_time) = {
+                let state = app_state.read().await;
+                (state.config.machine.clone(), state.startup_time)
+            };
             
-            let response = PeerMessage::Heartbeat {
+            let response = PeerMessage::Startup {
                 machine_id: our_machine_id,
                 startup_time: our_startup_time,
             };
             
             if let Ok(response_json) = serde_json::to_string(&response) {
                 if let Err(e) = ws_sender.send(Message::Text(response_json)).await {
-                    error!("Failed to send heartbeat response to peer {}: {}", peer_addr, e);
+                    error!("Failed to send startup response to peer {}: {}", peer_addr, e);
                 }
             }
         }
         
-        PeerMessage::LeaderElectionRequest { machine_id, startup_time } => {
-            // Update peer information
-            {
-                let mut state = app_state.write().await;
-                state.peer_info.insert(machine_id.clone(), PeerInfo {
-                    machine_id: machine_id.clone(),
-                    startup_time,
-                    last_seen: current_time,
-                });
-            }
+        PeerMessage::FullSyncRequest { machine_id } => {
+            // Any peer can respond to sync requests
+            info!("Received full sync request from {}, sending snapshot", machine_id);
             
-            // Respond with our information
-            let our_machine_id = app_state.read().await.config.machine.clone();
-            let our_startup_time = app_state.read().await.startup_time;
-            
-            let response = PeerMessage::LeaderElectionResponse {
-                machine_id: our_machine_id,
-                startup_time: our_startup_time,
+            // Take a snapshot and send it
+            let snapshot = {
+                let state = app_state.read().await;
+                let store = &state.store;
+                let store_guard = store.read().await;
+                store_guard.take_snapshot()
             };
+            
+            let response = PeerMessage::FullSyncResponse { snapshot };
             
             if let Ok(response_json) = serde_json::to_string(&response) {
                 if let Err(e) = ws_sender.send(Message::Text(response_json)).await {
-                    error!("Failed to send leader election response to peer {}: {}", peer_addr, e);
+                    error!("Failed to send full sync response to peer {}: {}", peer_addr, e);
+                } else {
+                    info!("Sent full sync snapshot to {}", machine_id);
                 }
             }
         }
         
-        PeerMessage::LeaderElectionResponse { machine_id, startup_time } => {
-            // Update peer information
+        PeerMessage::FullSyncResponse { snapshot } => {
+            // Apply the snapshot from the leader
+            info!("Received full sync response, applying snapshot");
+            
             {
                 let mut state = app_state.write().await;
-                state.peer_info.insert(machine_id.clone(), PeerInfo {
-                    machine_id: machine_id.clone(),
-                    startup_time,
-                    last_seen: current_time,
-                });
+                let store = &mut state.store;
+                let mut store_guard = store.write().await;
+                store_guard.restore_snapshot(snapshot);
+                drop(store_guard);
+                state.is_fully_synced = true;
             }
-            debug!("Received leader election response from {}: startup_time={}", machine_id, startup_time);
+            
+            info!("Successfully applied full sync snapshot, instance is now fully synchronized");
         }
         
         PeerMessage::SyncRequest { request } => {
@@ -415,18 +492,31 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
         state.connected_outbound_peers.insert(peer_addr.to_string(), tx);
     }
     
-    // Send initial heartbeat to announce ourselves
+    // Send initial startup message to announce ourselves
     let machine = app_state.read().await.config.machine.clone();
     let startup_time = app_state.read().await.startup_time;
-    let heartbeat = PeerMessage::Heartbeat {
+    let startup = PeerMessage::Startup {
         machine_id: machine.clone(),
         startup_time,
     };
-    if let Ok(heartbeat_json) = serde_json::to_string(&heartbeat) {
-        if let Err(e) = ws_sender.send(Message::Text(heartbeat_json)).await {
-            error!("Failed to send initial heartbeat to peer {}: {}", peer_addr, e);
+    if let Ok(startup_json) = serde_json::to_string(&startup) {
+        if let Err(e) = ws_sender.send(Message::Text(startup_json)).await {
+            error!("Failed to send initial startup message to peer {}: {}", peer_addr, e);
         }
     }
+    
+    // Trigger leader election for this new connection
+    let app_state_clone = Arc::clone(&app_state);
+    let peer_addr_clone = peer_addr.to_string();
+    tokio::spawn(async move {
+        // Wait a short time for the connection to stabilize
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        
+        info!("Triggering leader election after successful outbound connection to {}", peer_addr_clone);
+        if let Err(e) = perform_leader_election(app_state_clone).await {
+            error!("Leader election failed after new outbound connection to {}: {}", peer_addr_clone, e);
+        }
+    });
     
     // Spawn a task to handle outgoing messages
     let peer_addr_clone = peer_addr.to_string();
@@ -439,54 +529,22 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
         }
     });
     
-    // Handle incoming messages from peer
+    // Handle incoming messages from peer (ignore all except connection control)
     while let Some(msg) = ws_receiver.next().await {
         match msg {
-            Ok(Message::Text(text)) => {
-                debug!("Received text from outbound peer {}: {}", peer_addr, text);
-                
-                // Try to parse as a PeerMessage first
-                match serde_json::from_str::<PeerMessage>(&text) {
-                    Ok(peer_msg) => {
-                        debug!("Received peer message from outbound peer {}: {:?}", peer_addr, peer_msg);
-                        handle_outbound_peer_message(peer_msg, peer_addr, app_state.clone()).await;
-                    }
-                    Err(_) => {
-                        // Try to parse as a Request for synchronization (legacy support)
-                        match serde_json::from_str::<qlib_rs::Request>(&text) {
-                            Ok(request) => {
-                                debug!("Received sync request from outbound peer {}: {:?}", peer_addr, request);
-                                
-                                // Apply the request to our store if it doesn't already have an originator
-                                // (to avoid infinite loops) and ensure the current timestamp is preserved
-                                if request.originator().is_some() {
-                                    let mut state = app_state.write().await;
-                                    let store = &mut state.store;
-                                    let mut store_guard = store.write().await;
-                                    
-                                    let mut requests = vec![request];
-                                    if let Err(e) = store_guard.perform(&mut requests).await {
-                                        error!("Failed to apply sync request from outbound peer {}: {}", peer_addr, e);
-                                    } else {
-                                        debug!("Successfully applied sync request from outbound peer {}", peer_addr);
-                                    }
-                                } else {
-                                    debug!("Ignoring request without originator from outbound peer {}", peer_addr);
-                                }
-                            }
-                            Err(_) => {
-                                // Not a sync request, treat as regular peer message
-                                debug!("Received non-sync message from outbound peer {}", peer_addr);
-                            }
-                        }
-                    }
-                }
+            Ok(Message::Text(_text)) => {
+                // Ignore all text messages - message handling is done in handle_inbound_peer_connection
+                debug!("Ignoring received text message from outbound peer {} (handled via inbound connection)", peer_addr);
             }
-            Ok(Message::Binary(data)) => {
-                debug!("Received binary data from outbound peer {}: {} bytes", peer_addr, data.len());
+            Ok(Message::Binary(_data)) => {
+                // Ignore binary data - message handling is done in handle_inbound_peer_connection
+                debug!("Ignoring received binary data from outbound peer {} (handled via inbound connection)", peer_addr);
             }
-            Ok(Message::Ping(_)) => {
+            Ok(Message::Ping(payload)) => {
+                // Respond to pings to keep connection alive
                 debug!("Received ping from outbound peer: {}", peer_addr);
+                // Note: We can't easily send pong here since ws_sender is in the outgoing task
+                // The ping/pong will be handled by the WebSocket implementation
             }
             Ok(Message::Pong(_)) => {
                 debug!("Received pong from outbound peer: {}", peer_addr);
@@ -522,98 +580,6 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
     
     info!("Outbound peer connection closed: {}", peer_addr);
     Ok(())
-}
-
-/// Handle a peer message from an outbound connection
-async fn handle_outbound_peer_message(
-    peer_msg: PeerMessage,
-    peer_addr: &str,
-    app_state: Arc<RwLock<AppState>>,
-) {
-    let current_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    match peer_msg {
-        PeerMessage::Heartbeat { machine_id, startup_time } => {
-            // Update peer information
-            {
-                let mut state = app_state.write().await;
-                state.peer_info.insert(machine_id.clone(), PeerInfo {
-                    machine_id: machine_id.clone(),
-                    startup_time,
-                    last_seen: current_time,
-                });
-            }
-            debug!("Updated peer info for {}: startup_time={}", machine_id, startup_time);
-        }
-        
-        PeerMessage::LeaderElectionRequest { machine_id, startup_time } => {
-            // Update peer information
-            {
-                let mut state = app_state.write().await;
-                state.peer_info.insert(machine_id.clone(), PeerInfo {
-                    machine_id: machine_id.clone(),
-                    startup_time,
-                    last_seen: current_time,
-                });
-            }
-            
-            // Send response back through the outbound peer connection
-            let our_machine_id = app_state.read().await.config.machine.clone();
-            let our_startup_time = app_state.read().await.startup_time;
-            
-            let response = PeerMessage::LeaderElectionResponse {
-                machine_id: our_machine_id,
-                startup_time: our_startup_time,
-            };
-            
-            if let Ok(response_json) = serde_json::to_string(&response) {
-                let state = app_state.read().await;
-                if let Some(sender) = state.connected_outbound_peers.get(peer_addr) {
-                    if let Err(e) = sender.send(Message::Text(response_json)) {
-                        error!("Failed to send leader election response to outbound peer {}: {}", peer_addr, e);
-                    }
-                }
-            }
-        }
-        
-        PeerMessage::LeaderElectionResponse { machine_id, startup_time } => {
-            // Update peer information
-            {
-                let mut state = app_state.write().await;
-                state.peer_info.insert(machine_id.clone(), PeerInfo {
-                    machine_id: machine_id.clone(),
-                    startup_time,
-                    last_seen: current_time,
-                });
-            }
-            debug!("Received leader election response from outbound peer {}: startup_time={}", machine_id, startup_time);
-        }
-        
-        PeerMessage::SyncRequest { request } => {
-            // Handle data synchronization (existing functionality)
-            let our_machine_id = app_state.read().await.config.machine.clone();
-            
-            if let Some(originator) = request.originator() {
-                if *originator != our_machine_id {
-                    let mut state = app_state.write().await;
-                    let store = &mut state.store;
-                    let mut store_guard = store.write().await;
-                    
-                    let mut requests = vec![request];
-                    if let Err(e) = store_guard.perform(&mut requests).await {
-                        error!("Failed to apply sync request from outbound peer {}: {}", peer_addr, e);
-                    } else {
-                        debug!("Successfully applied sync request from outbound peer {}", peer_addr);
-                    }
-                }
-            } else {
-                debug!("Ignoring sync request without originator from outbound peer {}", peer_addr);
-            }
-        }
-    }
 }
 
 /// Handle a single client WebSocket connection that uses StoreProxy protocol
@@ -797,6 +763,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
         }
         
         StoreMessage::Perform { id, mut requests } => {
+            // Allow write operations on any peer
             requests.iter_mut().for_each(|req| {
                 req.try_set_originator(machine.clone());
             });
@@ -853,6 +820,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
         }
         
         StoreMessage::TakeSnapshot { id } => {
+            // Allow snapshots to be taken on any peer
             let snapshot = store_guard.take_snapshot();
             StoreMessage::TakeSnapshotResponse {
                 id,
@@ -982,158 +950,81 @@ async fn start_inbound_peer_server(app_state: Arc<RwLock<AppState>>) -> Result<(
 async fn perform_leader_election(app_state: Arc<RwLock<AppState>>) -> Result<()> {
     info!("Starting leader election process");
     
-    // Wait a configurable amount of time for peer connections to establish
-    let delay_secs = app_state.read().await.config.leader_election_delay_secs;
-    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+    // Wait a short time for connections to stabilize
+    tokio::time::sleep(Duration::from_secs(1)).await;
     
-    // Request leader election information from all connected peers
     let our_machine_id = app_state.read().await.config.machine.clone();
     let our_startup_time = app_state.read().await.startup_time;
+    let current_is_leader = app_state.read().await.is_leader;
     
-    let election_request = PeerMessage::LeaderElectionRequest {
-        machine_id: our_machine_id.clone(),
-        startup_time: our_startup_time,
-    };
-    
-    if let Ok(request_json) = serde_json::to_string(&election_request) {
-        let peers_to_notify = {
-            let state = app_state.read().await;
-            state.connected_outbound_peers.clone()
-        };
-        
-        for (peer_addr, sender) in peers_to_notify {
-            if let Err(e) = sender.send(Message::Text(request_json.clone())) {
-                warn!("Failed to send leader election request to peer {}: {}", peer_addr, e);
-            }
-        }
-    }
-    
-    // Wait for responses
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    
-    // Determine if we should be the leader
     let should_be_leader = {
         let state = app_state.read().await;
-        let all_peers: Vec<_> = state.peer_info.values().cloned().collect();
         
-        info!("Known peers for leader election:");
-        for peer in &all_peers {
-            info!("  {} - startup_time: {}", peer.machine_id, peer.startup_time);
-        }
-        
-        // Find the peer with the earliest startup time
-        let earliest_startup = all_peers.iter()
+        // Find the earliest startup time among all known peers including ourselves
+        let earliest_startup = state.peer_info.values()
             .map(|p| p.startup_time)
             .min()
-            .unwrap_or(our_startup_time);
+            .unwrap_or(our_startup_time)
+            .min(our_startup_time);
         
-        // We should be leader if:
-        // 1. We have the earliest startup time, OR
-        // 2. We have the same startup time as the earliest but our machine_id is lexicographically smallest
+        // We should be leader if we have the earliest startup time
         if our_startup_time < earliest_startup {
             true
         } else if our_startup_time == earliest_startup {
-            // Check if there are other peers with the same startup time
-            let peers_with_same_time: Vec<_> = all_peers.iter()
+            // Check for ties - use machine_id as tiebreaker
+            let peers_with_same_time: Vec<_> = state.peer_info.values()
                 .filter(|p| p.startup_time == our_startup_time)
                 .collect();
             
-            if peers_with_same_time.is_empty() {
-                // Only we have this startup time
-                true
-            } else {
-                // Multiple peers with same startup time - use machine_id as tiebreaker
-                let all_machine_ids: Vec<_> = peers_with_same_time.iter()
+            if !peers_with_same_time.is_empty() {
+                // We have a tie - use machine ID as tiebreaker
+                info!("Startup time tie detected with {} peers, using machine_id as tiebreaker", peers_with_same_time.len());
+                
+                let mut all_machine_ids = peers_with_same_time.iter()
                     .map(|p| p.machine_id.as_str())
-                    .chain(std::iter::once(our_machine_id.as_str()))
-                    .collect();
+                    .collect::<Vec<_>>();
+                all_machine_ids.push(our_machine_id.as_str());
                 
                 let min_machine_id = all_machine_ids.iter().min().unwrap();
                 
-                if **min_machine_id == our_machine_id {
-                    true
-                } else {
-                    // We're not the leader - handle the rare case of identical startup times
-                    warn!("Multiple instances with identical startup times detected. This instance will exit after a random delay.");
-                    
-                    // Generate random delay outside of the async block to avoid Send issues
-                    let delay_secs = {
-                        use rand::Rng;
-                        let mut rng = rand::thread_rng();
-                        rng.gen_range(1..=10)
-                    };
-                    
-                    warn!("Waiting {} seconds before exiting to resolve startup time tie", delay_secs);
-                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                    
-                    false
-                }
+                **min_machine_id == our_machine_id
+            } else {
+                // Only we have this startup time
+                true
             }
         } else {
             false
         }
     };
     
-    if should_be_leader {
-        info!("🎉 This instance has been elected as the LEADER (startup_time: {})", our_startup_time);
-        let mut state = app_state.write().await;
-        state.is_leader = true;
-    } else {
-        warn!("This instance is NOT the leader. Shutting down gracefully...");
-        
-        // Take a final snapshot before shutting down
-        info!("Taking final snapshot before shutdown");
-        let snapshot = {
-            let state = app_state.read().await;
-            let store = &state.store;
-            let store_guard = store.read().await;
-            store_guard.take_snapshot()
-        };
-        
-        if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
-            error!("Failed to save final snapshot: {}", e);
+    // Update leadership status if it changed
+    if should_be_leader != current_is_leader {
+        if should_be_leader {
+            info!("🎉 This instance has been elected as the NEW LEADER (startup_time: {})", our_startup_time);
+            let mut state = app_state.write().await;
+            state.is_leader = true;
+            state.current_leader = Some(our_machine_id.clone());
+            state.is_fully_synced = true; // Leader is always fully synced
         } else {
-            info!("Final snapshot saved successfully");
+            info!("This instance is no longer the leader or failed to become leader");
+            let mut state = app_state.write().await;
+            state.is_leader = false;
+            
+            // Find the current leader
+            let leader = state.peer_info.values()
+                .min_by_key(|p| (&p.startup_time, &p.machine_id))
+                .map(|p| p.machine_id.clone());
+            state.current_leader = leader;
+            
+            info!("This instance will continue running as a non-leader node");
         }
-        
-        // Exit the process - the container orchestrator will restart us
-        info!("Exiting process. Container orchestrator should restart this instance.");
-        std::process::exit(0);
+    } else if should_be_leader {
+        debug!("Leadership confirmed - this instance remains the leader");
+    } else {
+        debug!("Non-leader status confirmed - this instance continues as a non-leader node");
     }
     
     Ok(())
-}
-
-/// Send periodic heartbeats to all connected peers
-async fn send_periodic_heartbeats(app_state: Arc<RwLock<AppState>>) -> Result<()> {
-    info!("Starting periodic heartbeat sender");
-    
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
-    
-    loop {
-        interval.tick().await;
-        
-        let our_machine_id = app_state.read().await.config.machine.clone();
-        let our_startup_time = app_state.read().await.startup_time;
-        
-        let heartbeat = PeerMessage::Heartbeat {
-            machine_id: our_machine_id,
-            startup_time: our_startup_time,
-        };
-        
-        if let Ok(heartbeat_json) = serde_json::to_string(&heartbeat) {
-            let peers_to_notify = {
-                let state = app_state.read().await;
-                state.connected_outbound_peers.clone()
-            };
-            
-            for (peer_addr, sender) in peers_to_notify {
-                if let Err(e) = sender.send(Message::Text(heartbeat_json.clone())) {
-                    debug!("Failed to send heartbeat to peer {}: {}", peer_addr, e);
-                }
-            }
-        }
-    }
 }
 
 /// Manage outbound peer connections - connects to configured peers and maintains connections
@@ -1812,19 +1703,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start the periodic heartbeat task
+    // Perform initial leader election after a short delay
     let app_state_clone = Arc::clone(&app_state);
-    let heartbeat_task = tokio::spawn(async move {
-        if let Err(e) = send_periodic_heartbeats(app_state_clone).await {
-            error!("Periodic heartbeat sender failed: {}", e);
-        }
-    });
-
-    // Start the leader election task
-    let app_state_clone = Arc::clone(&app_state);
-    let leader_election_task = tokio::spawn(async move {
+    let initial_leader_election_task = tokio::spawn(async move {
+        // Wait for services to start up
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        
+        info!("Performing initial leader election");
         if let Err(e) = perform_leader_election(app_state_clone).await {
-            error!("Leader election failed: {}", e);
+            error!("Initial leader election failed: {}", e);
         }
     });
 
@@ -1852,8 +1739,7 @@ async fn main() -> Result<()> {
     peer_server_task.abort();
     client_server_task.abort();
     outbound_peer_task.abort();
-    heartbeat_task.abort();
-    leader_election_task.abort();
+    initial_leader_election_task.abort();
 
     Ok(())
 }
