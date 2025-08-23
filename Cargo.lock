@@ -2211,6 +2211,7 @@ dependencies = [
  "clap",
  "futures-util",
  "qlib-rs",
+ "rand",
  "serde",
  "serde_json",
  "tokio",
