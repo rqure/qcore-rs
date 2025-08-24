@@ -187,17 +187,6 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
-    // Send initial startup message to announce ourselves
-    let startup = PeerMessage::Startup {
-        machine_id: machine.clone(),
-        startup_time,
-    };
-    if let Ok(startup_json) = serde_json::to_string(&startup) {
-        if let Err(e) = ws_sender.send(Message::Text(startup_json)).await {
-            error!("Failed to send initial startup message to peer {}: {}", peer_addr, e);
-        }
-    }
-    
     // Handle incoming messages from peer
     while let Some(msg) = ws_receiver.next().await {
         match msg {
@@ -504,19 +493,6 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
             error!("Failed to send initial startup message to peer {}: {}", peer_addr, e);
         }
     }
-    
-    // Trigger leader election for this new connection
-    let app_state_clone = Arc::clone(&app_state);
-    let peer_addr_clone = peer_addr.to_string();
-    tokio::spawn(async move {
-        // Wait a short time for the connection to stabilize
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        
-        info!("Triggering leader election after successful outbound connection to {}", peer_addr_clone);
-        if let Err(e) = perform_leader_election(app_state_clone).await {
-            error!("Leader election failed after new outbound connection to {}: {}", peer_addr_clone, e);
-        }
-    });
     
     // Spawn a task to handle outgoing messages
     let peer_addr_clone = peer_addr.to_string();
@@ -944,87 +920,6 @@ async fn start_inbound_peer_server(app_state: Arc<RwLock<AppState>>) -> Result<(
             }
         }
     }
-}
-
-/// Perform leader election to determine which instance should be the leader
-async fn perform_leader_election(app_state: Arc<RwLock<AppState>>) -> Result<()> {
-    info!("Starting leader election process");
-    
-    // Wait a short time for connections to stabilize
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    
-    let our_machine_id = app_state.read().await.config.machine.clone();
-    let our_startup_time = app_state.read().await.startup_time;
-    let current_is_leader = app_state.read().await.is_leader;
-    
-    let should_be_leader = {
-        let state = app_state.read().await;
-        
-        // Find the earliest startup time among all known peers including ourselves
-        let earliest_startup = state.peer_info.values()
-            .map(|p| p.startup_time)
-            .min()
-            .unwrap_or(our_startup_time)
-            .min(our_startup_time);
-        
-        // We should be leader if we have the earliest startup time
-        if our_startup_time < earliest_startup {
-            true
-        } else if our_startup_time == earliest_startup {
-            // Check for ties - use machine_id as tiebreaker
-            let peers_with_same_time: Vec<_> = state.peer_info.values()
-                .filter(|p| p.startup_time == our_startup_time)
-                .collect();
-            
-            if !peers_with_same_time.is_empty() {
-                // We have a tie - use machine ID as tiebreaker
-                info!("Startup time tie detected with {} peers, using machine_id as tiebreaker", peers_with_same_time.len());
-                
-                let mut all_machine_ids = peers_with_same_time.iter()
-                    .map(|p| p.machine_id.as_str())
-                    .collect::<Vec<_>>();
-                all_machine_ids.push(our_machine_id.as_str());
-                
-                let min_machine_id = all_machine_ids.iter().min().unwrap();
-                
-                **min_machine_id == our_machine_id
-            } else {
-                // Only we have this startup time
-                true
-            }
-        } else {
-            false
-        }
-    };
-    
-    // Update leadership status if it changed
-    if should_be_leader != current_is_leader {
-        if should_be_leader {
-            info!("🎉 This instance has been elected as the NEW LEADER (startup_time: {})", our_startup_time);
-            let mut state = app_state.write().await;
-            state.is_leader = true;
-            state.current_leader = Some(our_machine_id.clone());
-            state.is_fully_synced = true; // Leader is always fully synced
-        } else {
-            info!("This instance is no longer the leader or failed to become leader");
-            let mut state = app_state.write().await;
-            state.is_leader = false;
-            
-            // Find the current leader
-            let leader = state.peer_info.values()
-                .min_by_key(|p| (&p.startup_time, &p.machine_id))
-                .map(|p| p.machine_id.clone());
-            state.current_leader = leader;
-            
-            info!("This instance will continue running as a non-leader node");
-        }
-    } else if should_be_leader {
-        debug!("Leadership confirmed - this instance remains the leader");
-    } else {
-        debug!("Non-leader status confirmed - this instance continues as a non-leader node");
-    }
-    
-    Ok(())
 }
 
 /// Manage outbound peer connections - connects to configured peers and maintains connections
@@ -1703,18 +1598,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Perform initial leader election after a short delay
-    let app_state_clone = Arc::clone(&app_state);
-    let initial_leader_election_task = tokio::spawn(async move {
-        // Wait for services to start up
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        
-        info!("Performing initial leader election");
-        if let Err(e) = perform_leader_election(app_state_clone).await {
-            error!("Initial leader election failed: {}", e);
-        }
-    });
-
     // Wait for shutdown signal
     signal::ctrl_c().await?;
     warn!("Received shutdown signal. Stopping Core service...");
@@ -1739,7 +1622,6 @@ async fn main() -> Result<()> {
     peer_server_task.abort();
     client_server_task.abort();
     outbound_peer_task.abort();
-    initial_leader_election_task.abort();
 
     Ok(())
 }
