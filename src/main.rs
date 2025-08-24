@@ -172,7 +172,6 @@ impl AppState {
 /// Handle a single peer WebSocket connection
 async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAddr, app_state: Arc<RwLock<AppState>>) -> Result<()> {
     let machine = app_state.read().await.config.machine.clone();
-    let startup_time = app_state.read().await.startup_time;
 
     info!("New peer connection from: {}", peer_addr);
     
@@ -516,7 +515,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
                 // Ignore binary data - message handling is done in handle_inbound_peer_connection
                 debug!("Ignoring received binary data from outbound peer {} (handled via inbound connection)", peer_addr);
             }
-            Ok(Message::Ping(payload)) => {
+            Ok(Message::Ping(_payload)) => {
                 // Respond to pings to keep connection alive
                 debug!("Received ping from outbound peer: {}", peer_addr);
                 // Note: We can't easily send pong here since ws_sender is in the outgoing task
