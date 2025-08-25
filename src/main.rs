@@ -62,6 +62,10 @@ struct Config {
     #[arg(long, default_value_t = 3)]
     snapshot_wal_interval: u64,
 
+    /// Maximum number of snapshot files to keep
+    #[arg(long, default_value_t = 5)]
+    snapshot_max_files: usize,
+
     /// Port for peer-to-peer communication
     #[arg(long, default_value_t = 9000)]
     peer_port: u16,
@@ -1435,8 +1439,9 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<RwLock<AppSt
     
     info!("Snapshot saved successfully, {} bytes", serialized.len());
     
-    // Clean up old snapshots (keep only the most recent 3)
-    if let Err(e) = cleanup_old_snapshots(&snapshot_dir, 3).await {
+    // Clean up old snapshots using the configured limit
+    let max_files = state.config.snapshot_max_files;
+    if let Err(e) = cleanup_old_snapshots(&snapshot_dir, max_files).await {
         error!("Failed to clean up old snapshots: {}", e);
     }
     
