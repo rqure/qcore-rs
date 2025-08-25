@@ -402,7 +402,7 @@ async fn handle_peer_message(
                     .unwrap_or(our_startup_time)
                     .min(our_startup_time);
                 
-                let should_be_leader = our_startup_time <= earliest_startup;
+                let mut should_be_leader = our_startup_time <= earliest_startup;
                 
                 // Handle startup time ties
                 if our_startup_time == earliest_startup {
@@ -420,27 +420,7 @@ async fn handle_peer_message(
                         all_machine_ids.push(our_machine_id.as_str());
                         
                         let min_machine_id = all_machine_ids.iter().min().unwrap();
-                        let should_be_leader_after_tiebreak = **min_machine_id == our_machine_id;
-                        
-                        // Update leadership status
-                        if should_be_leader_after_tiebreak {
-                            state.is_leader = true;
-                            state.current_leader = Some(our_machine_id.clone());
-                            state.is_fully_synced = true;
-                            state.set_availability_state(AvailabilityState::Available);
-                            info!("We are the leader after machine_id tiebreaker (startup_time: {}, machine_id: {})", our_startup_time, our_machine_id);
-                        } else {
-                            state.is_leader = false;
-                            state.set_availability_state(AvailabilityState::Unavailable);
-                            state.force_disconnect_all_clients().await;
-                            let leader = state.peer_info.values()
-                                .filter(|p| p.startup_time <= earliest_startup)
-                                .min_by_key(|p| (&p.startup_time, &p.machine_id))
-                                .map(|p| p.machine_id.clone());
-                            state.current_leader = leader;
-                            info!("We are not the leader after machine_id tiebreaker (startup_time: {}, machine_id: {})", our_startup_time, our_machine_id);
-                        }
-                        return;
+                        should_be_leader = **min_machine_id == our_machine_id;
                     }
                 }
                 
