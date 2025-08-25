@@ -1499,9 +1499,55 @@ async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<RwLock<AppSta
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).await?;
     
-    let mut offset = 0;
     let mut requests_processed = 0;
+    let mut last_snapshot_offset = None;
+    let mut snapshot_found = false;
     
+    // First pass: find the most recent snapshot marker in this WAL file
+    let mut temp_offset = 0;
+    while temp_offset < buffer.len() {
+        // Read length prefix (4 bytes)
+        if temp_offset + 4 > buffer.len() {
+            break;
+        }
+        
+        let len_bytes = [buffer[temp_offset], buffer[temp_offset+1], buffer[temp_offset+2], buffer[temp_offset+3]];
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        temp_offset += 4;
+        
+        // Read the serialized request
+        if temp_offset + len > buffer.len() {
+            break;
+        }
+        
+        let request_data = &buffer[temp_offset..temp_offset + len];
+        
+        // Check if this is a snapshot marker
+        if let Ok(request) = serde_json::from_slice::<qlib_rs::Request>(request_data) {
+            if matches!(request, qlib_rs::Request::Snapshot { .. }) {
+                last_snapshot_offset = Some(temp_offset + len);
+                snapshot_found = true;
+                debug!("Found snapshot marker at offset {} in {}", temp_offset, wal_path.display());
+            }
+        }
+        
+        temp_offset += len;
+    }
+    
+    // Start replay from after the most recent snapshot marker (if any)
+    let mut offset = if let Some(start_offset) = last_snapshot_offset {
+        info!("Starting replay from offset {} (after snapshot marker) in {}", start_offset, wal_path.display());
+        start_offset
+    } else if snapshot_found {
+        // If we found a snapshot but couldn't determine offset, start from beginning
+        info!("Snapshot found but offset unclear, replaying entire file: {}", wal_path.display());
+        0
+    } else {
+        // No snapshot found, replay entire file
+        0
+    };
+    
+    // Second pass: replay requests from the determined starting point
     while offset < buffer.len() {
         // Read length prefix (4 bytes)
         if offset + 4 > buffer.len() {
@@ -1524,6 +1570,12 @@ async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<RwLock<AppSta
         // Deserialize and apply the request
         match serde_json::from_slice::<qlib_rs::Request>(request_data) {
             Ok(request) => {
+                // Skip snapshot markers during replay since they're just markers
+                if matches!(request, qlib_rs::Request::Snapshot { .. }) {
+                    debug!("Skipping snapshot marker during replay");
+                    continue;
+                }
+                
                 // Apply the request to the store
                 let mut state = app_state.write().await;
                 let store = &mut state.store;
@@ -1545,7 +1597,11 @@ async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<RwLock<AppSta
         }
     }
     
-    info!("Replayed {} requests from {}", requests_processed, wal_path.display());
+    if snapshot_found {
+        info!("Replayed {} requests from {} (started after snapshot marker)", requests_processed, wal_path.display());
+    } else {
+        info!("Replayed {} requests from {} (no snapshot marker found)", requests_processed, wal_path.display());
+    }
     Ok(())
 }
 
