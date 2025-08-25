@@ -1923,6 +1923,26 @@ async fn get_next_snapshot_counter(app_state: Arc<RwLock<AppState>>) -> Result<u
     Ok(max_counter + 1)
 }
 
+/// Handle miscellaneous periodic tasks that run every 10ms
+async fn handle_misc_tasks(_app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    info!("Starting miscellaneous tasks handler (10ms interval)");
+    
+    let mut interval = tokio::time::interval(Duration::from_millis(10));
+    
+    loop {
+        interval.tick().await;
+        
+        // Add any miscellaneous periodic logic here
+        // For now, this is a placeholder for future functionality
+        
+        // Example: You could add periodic health checks, metrics collection,
+        // cache cleanup, connection monitoring, etc.
+        
+        // Keep the task lightweight since it runs every 10ms
+        tokio::task::yield_now().await; // Yield to prevent blocking
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
@@ -2014,6 +2034,14 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start the misc tasks handler
+    let app_state_clone = Arc::clone(&app_state);
+    let misc_task = tokio::spawn(async move {
+        if let Err(e) = handle_misc_tasks(app_state_clone).await {
+            error!("Misc tasks handler failed: {}", e);
+        }
+    });
+
     // Wait for shutdown signal
     signal::ctrl_c().await?;
     warn!("Received shutdown signal. Stopping Core service...");
@@ -2038,6 +2066,7 @@ async fn main() -> Result<()> {
     peer_server_task.abort();
     client_server_task.abort();
     outbound_peer_task.abort();
+    misc_task.abort();
 
     Ok(())
 }

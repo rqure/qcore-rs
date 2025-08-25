@@ -11,10 +11,6 @@ path = "src/main.rs"
 name = "snapshot-tool"
 path = "src/bin/snapshot-tool.rs"
 
-[[bin]]
-name = "test-data-creator"
-path = "src/bin/test-data-creator.rs"
-
 [dependencies]
 anyhow = "1.0"
 bincode = "1.3"
