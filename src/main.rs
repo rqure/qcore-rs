@@ -94,6 +94,10 @@ struct Config {
     /// Delay before starting leader election (useful for testing)
     #[arg(long, default_value_t = 2)]
     leader_election_delay_secs: u64,
+
+    /// Grace period in seconds to wait after becoming unavailable before requesting full sync
+    #[arg(long, default_value_t = 5)]
+    full_sync_grace_period_secs: u64,
 }
 
 /// Application state that is shared across all tasks
@@ -154,6 +158,12 @@ struct AppState {
     
     /// Number of WAL files created since last snapshot
     wal_files_since_snapshot: u64,
+
+    /// Timestamp when we became unavailable (for grace period tracking)
+    became_unavailable_at: Option<u64>,
+
+    /// Whether a full sync request is pending (to avoid sending multiple)
+    full_sync_request_pending: bool,
 }
 
 /// Information about a peer instance
@@ -190,6 +200,8 @@ impl AppState {
             wal_file_counter: 0,
             snapshot_file_counter: 0,
             wal_files_since_snapshot: 0,
+            became_unavailable_at: None,
+            full_sync_request_pending: false,
         }
     }
 
@@ -212,6 +224,21 @@ impl AppState {
     fn set_availability_state(&mut self, new_state: AvailabilityState) {
         if self.availability_state != new_state {
             info!("Availability state transition: {:?} -> {:?}", self.availability_state, new_state);
+            
+            // Track when we become unavailable for grace period timing
+            if matches!(new_state, AvailabilityState::Unavailable) {
+                let current_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                self.became_unavailable_at = Some(current_time);
+                self.full_sync_request_pending = false; // Reset pending flag
+                info!("Became unavailable at timestamp: {}, starting grace period", current_time);
+            } else if matches!(new_state, AvailabilityState::Available) {
+                self.became_unavailable_at = None;
+                self.full_sync_request_pending = false;
+            }
+            
             self.availability_state = new_state;
         }
     }
@@ -483,6 +510,7 @@ async fn handle_peer_message(
                 store_guard.enable_notifications();
                 drop(store_guard);
                 state.is_fully_synced = true;
+                state.full_sync_request_pending = false; // Reset pending flag since we got a response
                 state.set_availability_state(AvailabilityState::Available);
             }
             
@@ -1926,7 +1954,7 @@ async fn get_next_snapshot_counter(app_state: Arc<RwLock<AppState>>) -> Result<u
 }
 
 /// Handle miscellaneous periodic tasks that run every 10ms
-async fn handle_misc_tasks(_app_state: Arc<RwLock<AppState>>) -> Result<()> {
+async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
     info!("Starting miscellaneous tasks handler (10ms interval)");
     
     let mut interval = tokio::time::interval(Duration::from_millis(10));
@@ -1934,11 +1962,90 @@ async fn handle_misc_tasks(_app_state: Arc<RwLock<AppState>>) -> Result<()> {
     loop {
         interval.tick().await;
         
-        // Add any miscellaneous periodic logic here
-        // For now, this is a placeholder for future functionality
+        // Check if we need to send a full sync request after grace period
+        let should_send_full_sync = {
+            let state = app_state.read().await;
+            
+            // Only check if we're unavailable, not the leader, not fully synced, and haven't sent a request yet
+            if matches!(state.availability_state, AvailabilityState::Unavailable) &&
+               !state.is_leader &&
+               !state.is_fully_synced &&
+               !state.full_sync_request_pending {
+                
+                if let Some(became_unavailable_at) = state.became_unavailable_at {
+                    let current_time = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    
+                    let grace_period_secs = state.config.full_sync_grace_period_secs;
+                    let elapsed = current_time.saturating_sub(became_unavailable_at);
+                    
+                    if elapsed >= grace_period_secs {
+                        // Grace period has expired, check if we have a known leader
+                        state.current_leader.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
         
-        // Example: You could add periodic health checks, metrics collection,
-        // cache cleanup, connection monitoring, etc.
+        if let Some(leader_machine_id) = should_send_full_sync {
+            info!("Grace period expired, sending FullSyncRequest to leader: {}", leader_machine_id);
+            
+            // Mark that we're sending a request to avoid duplicates
+            {
+                let mut state = app_state.write().await;
+                state.full_sync_request_pending = true;
+            }
+            
+            // Send FullSyncRequest to the leader through any connected outbound peer
+            let machine_id = {
+                let state = app_state.read().await;
+                state.config.machine.clone()
+            };
+            
+            let full_sync_request = PeerMessage::FullSyncRequest {
+                machine_id: machine_id.clone(),
+            };
+            
+            if let Ok(request_json) = serde_json::to_string(&full_sync_request) {
+                let message = Message::Text(request_json);
+                
+                // Try to send to any connected outbound peer
+                let sent = {
+                    let state = app_state.read().await;
+                    let mut sent = false;
+                    
+                    for (peer_addr, sender) in &state.connected_outbound_peers {
+                        if let Err(e) = sender.send(message.clone()) {
+                            warn!("Failed to send FullSyncRequest to peer {}: {}", peer_addr, e);
+                        } else {
+                            info!("Sent FullSyncRequest to peer: {}", peer_addr);
+                            sent = true;
+                            break; // Only need to send to one peer
+                        }
+                    }
+                    sent
+                };
+                
+                if !sent {
+                    warn!("No connected outbound peers available to send FullSyncRequest to leader {}", leader_machine_id);
+                    // Reset the pending flag so we can try again later
+                    let mut state = app_state.write().await;
+                    state.full_sync_request_pending = false;
+                }
+            } else {
+                error!("Failed to serialize FullSyncRequest");
+                let mut state = app_state.write().await;
+                state.full_sync_request_pending = false;
+            }
+        }
         
         // Keep the task lightweight since it runs every 10ms
         tokio::task::yield_now().await; // Yield to prevent blocking
