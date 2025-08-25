@@ -49,6 +49,13 @@
       ]
     },
     {
+      "_entityType": "Folder",
+      "inheritsFrom": [
+        "Object"
+      ],
+      "fields": []
+    },
+    {
       "_entityType": "Machine",
       "inheritsFrom": [
         "Object"
@@ -56,11 +63,66 @@
       "fields": []
     },
     {
+      "_entityType": "Subject",
+      "inheritsFrom": [
+        "Object"
+      ]
+    },
+    {
       "_entityType": "Service",
+      "inheritsFrom": [
+        "Subject"
+      ],
+      "fields": []
+    },
+    {
+      "_entityType": "User",
+      "inheritsFrom": [
+        "Subject"
+      ],
+      "fields": []
+    },
+    {
+      "_entityType": "Permission",
       "inheritsFrom": [
         "Object"
       ],
-      "fields": []
+      "fields": [
+        {
+          "name": "TestFn",
+          "dataType": "Script",
+          "default": ""
+        }
+      ]
+    },
+    {
+      "_entityType": "AuthorizationRule",
+      "inheritsFrom": [
+        "Object"
+      ],
+      "fields": [
+        {
+          "name": "Scope",
+          "dataType": "Choice",
+          "default": "Read Only",
+          "options": ["Read Only", "Read and Write"]
+        },
+        {
+          "name": "ResourceType",
+          "dataType": "String",
+          "default": ""
+        },
+        {
+          "name": "ResourceField",
+          "dataType": "String",
+          "default": ""
+        },
+        {
+          "name": "Permission",
+          "dataType": "EntityReference",
+          "default": null
+        }
+      ]
     }
   ],
   "entity": {
@@ -76,6 +138,24 @@
             "Name": "qcore"
           }
         ]
+      },
+      {
+        "_entityType": "User",
+        "Name": "admin",
+        "RoleList": ["Admin"]
+      },
+      {
+        "_entityType": "Permission",
+        "Name": "AdminPermission",
+        "TestFn": "function(subject, resource) { return subject.RoleList && subject.RoleList.includes('Admin'); }"
+      },
+      {
+        "_entityType": "AuthorizationRule",
+        "Name": "AdminAccessRule",
+        "Scope": "Read and Write",
+        "ResourceType": "Service",
+        "ResourceField": "Name",
+        "Permission": "AdminPermission"
       }
     ]
   }
