@@ -116,7 +116,7 @@
       ]
     }
   ],
-  "entity": {
+  "tree": {
     "_entityType": "Root",
     "Name": "QOS",
     "Children": [
