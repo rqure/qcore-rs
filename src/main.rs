@@ -425,13 +425,37 @@ async fn handle_peer_message(
             // Apply the snapshot from the leader
             info!("Received full sync response, applying snapshot");
             
+            // Apply the snapshot to the store
             {
                 let mut state = app_state.write().await;
                 let store = &mut state.store;
                 let mut store_guard = store.write().await;
-                store_guard.restore_snapshot(snapshot);
+                store_guard.restore_snapshot(snapshot.clone());
                 drop(store_guard);
                 state.is_fully_synced = true;
+            }
+            
+            // Save the snapshot to disk for persistence
+            if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
+                error!("Failed to save snapshot during full sync: {}", e);
+            } else {
+                info!("Snapshot saved to disk during full sync");
+                
+                // Write a snapshot marker to the WAL to indicate the sync point
+                // This helps during replay to know that the state was synced at this point
+                let snapshot_counter = {
+                    let state = app_state.read().await;
+                    state.snapshot_file_counter
+                };
+                
+                let snapshot_request = qlib_rs::Request::Snapshot {
+                    snapshot_counter,
+                    originator: Some(app_state.read().await.config.machine.clone()),
+                };
+                
+                if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
+                    error!("Failed to write snapshot marker to WAL: {}", e);
+                }
             }
             
             info!("Successfully applied full sync snapshot, instance is now fully synchronized");
@@ -1102,6 +1126,53 @@ async fn cleanup_old_wal_files(wal_dir: &PathBuf, max_files: usize) -> Result<()
     Ok(())
 }
 
+/// Write a request directly to the WAL file without snapshot logic (to avoid recursion)
+async fn write_request_to_wal_direct(request: &qlib_rs::Request, app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let mut state = app_state.write().await;
+    
+    // Serialize the request to JSON
+    let serialized = serde_json::to_vec(request)?;
+    let serialized_len = serialized.len();
+    
+    // Ensure we have a WAL file open
+    if state.current_wal_file.is_none() {
+        // Create WAL directory if it doesn't exist
+        let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
+        create_dir_all(&wal_dir).await?;
+        
+        // Create new WAL file in the wal directory
+        let wal_filename = format!("wal_{:010}.log", state.wal_file_counter);
+        let wal_path = wal_dir.join(&wal_filename);
+        
+        info!("Creating new WAL file for direct write: {}", wal_path.display());
+        
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)
+            .await?;
+            
+        state.current_wal_file = Some(file);
+        state.current_wal_size = 0;
+        state.wal_file_counter += 1;
+    }
+    
+    // Write to WAL file
+    if let Some(ref mut wal_file) = state.current_wal_file {
+        // Write length prefix (4 bytes) followed by the serialized data
+        let len_bytes = (serialized_len as u32).to_le_bytes();
+        wal_file.write_all(&len_bytes).await?;
+        wal_file.write_all(&serialized).await?;
+        wal_file.flush().await?;
+        
+        state.current_wal_size += 4 + serialized_len;
+        
+        debug!("Wrote {} bytes to WAL file (direct)", serialized_len + 4);
+    }
+    
+    Ok(())
+}
+
 /// Write a request to the WAL file
 async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<AppState>>) -> Result<()> {
     let mut state = app_state.write().await;
@@ -1159,6 +1230,20 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
                 let mut state = app_state.write().await;
                 state.wal_files_since_snapshot = 0;
                 info!("Snapshot saved successfully after WAL rollover");
+                
+                // Write a snapshot marker to the WAL to indicate the snapshot point
+                let snapshot_counter = state.snapshot_file_counter;
+                let machine_id = state.config.machine.clone();
+                drop(state); // Release the lock before writing to WAL
+                
+                let snapshot_request = qlib_rs::Request::Snapshot {
+                    snapshot_counter,
+                    originator: Some(machine_id),
+                };
+                
+                if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
+                    error!("Failed to write snapshot marker to WAL: {}", e);
+                }
             }
             
             // Re-acquire the state lock for the rest of the function
