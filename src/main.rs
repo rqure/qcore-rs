@@ -167,6 +167,21 @@ impl AppState {
             wal_files_since_snapshot: 0,
         }
     }
+
+    /// Get the machine-specific data directory
+    fn get_machine_data_dir(&self) -> PathBuf {
+        PathBuf::from(&self.config.data_dir).join(&self.config.machine)
+    }
+
+    /// Get the machine-specific WAL directory
+    fn get_wal_dir(&self) -> PathBuf {
+        self.get_machine_data_dir().join("wal")
+    }
+
+    /// Get the machine-specific snapshots directory
+    fn get_snapshots_dir(&self) -> PathBuf {
+        self.get_machine_data_dir().join("snapshots")
+    }
 }
 
 /// Handle a single peer WebSocket connection
@@ -1137,7 +1152,7 @@ async fn write_request_to_wal_direct(request: &qlib_rs::Request, app_state: Arc<
     // Ensure we have a WAL file open
     if state.current_wal_file.is_none() {
         // Create WAL directory if it doesn't exist
-        let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
+        let wal_dir = state.get_wal_dir();
         create_dir_all(&wal_dir).await?;
         
         // Create new WAL file in the wal directory
@@ -1187,7 +1202,7 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
     
     if should_create_new_file {
         // Create WAL directory if it doesn't exist
-        let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
+        let wal_dir = state.get_wal_dir();
         create_dir_all(&wal_dir).await?;
         
         // Create new WAL file in the wal directory
@@ -1278,7 +1293,7 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<RwLock<AppSt
     let mut state = app_state.write().await;
     
     // Create snapshots directory if it doesn't exist
-    let snapshot_dir = PathBuf::from(&state.config.data_dir).join("snapshots");
+    let snapshot_dir = state.get_snapshots_dir();
     create_dir_all(&snapshot_dir).await?;
     
     // Create snapshot filename with counter
@@ -1316,7 +1331,7 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<RwLock<AppSt
 /// Load the latest snapshot from disk and return it along with the snapshot counter
 async fn load_latest_snapshot(app_state: Arc<RwLock<AppState>>) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
     let state = app_state.read().await;
-    let snapshot_dir = PathBuf::from(&state.config.data_dir).join("snapshots");
+    let snapshot_dir = state.get_snapshots_dir();
     
     if !snapshot_dir.exists() {
         info!("No snapshots directory found, starting with empty store");
@@ -1411,7 +1426,7 @@ async fn cleanup_old_snapshots(snapshot_dir: &PathBuf, max_files: usize) -> Resu
 /// If start_from_wal_counter is provided, only replay WAL files with counter >= start_from_wal_counter
 async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_counter: Option<u64>) -> Result<()> {
     let state = app_state.read().await;
-    let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
+    let wal_dir = state.get_wal_dir();
     
     if !wal_dir.exists() {
         info!("No WAL directory found, no replay needed");
@@ -1537,7 +1552,7 @@ async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<RwLock<AppSta
 /// Determine the next WAL file counter based on existing WAL files
 async fn get_next_wal_counter(app_state: Arc<RwLock<AppState>>) -> Result<u64> {
     let state = app_state.read().await;
-    let wal_dir = PathBuf::from(&state.config.data_dir).join("wal");
+    let wal_dir = state.get_wal_dir();
     
     if !wal_dir.exists() {
         return Ok(0);
@@ -1567,7 +1582,7 @@ async fn get_next_wal_counter(app_state: Arc<RwLock<AppState>>) -> Result<u64> {
 /// Determine the next snapshot file counter based on existing snapshot files
 async fn get_next_snapshot_counter(app_state: Arc<RwLock<AppState>>) -> Result<u64> {
     let state = app_state.read().await;
-    let snapshot_dir = PathBuf::from(&state.config.data_dir).join("snapshots");
+    let snapshot_dir = state.get_snapshots_dir();
     
     if !snapshot_dir.exists() {
         return Ok(0);
