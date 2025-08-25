@@ -1542,9 +1542,10 @@ async fn cleanup_old_snapshots(snapshot_dir: &PathBuf, max_files: usize) -> Resu
     Ok(())
 }
 
-/// Replay WAL files from a specific point to restore store state
-/// If start_from_wal_counter is provided, only replay WAL files with counter >= start_from_wal_counter
-async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_counter: Option<u64>) -> Result<()> {
+/// Replay WAL files to restore store state
+/// This function scans all WAL files to find the most recent snapshot marker
+/// and starts replaying from that point
+async fn replay_wal_files(app_state: Arc<RwLock<AppState>>) -> Result<()> {
     let state = app_state.read().await;
     let wal_dir = state.get_wal_dir();
     
@@ -1565,14 +1566,7 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_count
                     // Extract the counter from the filename
                     if let Some(counter_str) = filename_str.strip_prefix("wal_").and_then(|s| s.strip_suffix(".log")) {
                         if let Ok(counter) = counter_str.parse::<u64>() {
-                            // Only include files that are >= start_from_wal_counter (if specified)
-                            if let Some(start_counter) = start_from_wal_counter {
-                                if counter >= start_counter {
-                                    wal_files.push((path, counter));
-                                }
-                            } else {
-                                wal_files.push((path, counter));
-                            }
+                            wal_files.push((path, counter));
                         }
                     }
                 }
@@ -1581,11 +1575,7 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_count
     }
     
     if wal_files.is_empty() {
-        if let Some(start_counter) = start_from_wal_counter {
-            info!("No WAL files found starting from counter {}, no replay needed", start_counter);
-        } else {
-            info!("No WAL files found, no replay needed");
-        }
+        info!("No WAL files found, no replay needed");
         return Ok(());
     }
     
@@ -1593,6 +1583,22 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_count
     wal_files.sort_by_key(|(_, counter)| *counter);
     
     drop(state); // Release the lock before processing
+    
+    // Find the most recent snapshot marker across all WAL files
+    let mut most_recent_snapshot: Option<(PathBuf, u64, usize)> = None; // (file_path, wal_counter, offset_after_snapshot)
+    
+    info!("Scanning {} WAL files to find the most recent snapshot marker", wal_files.len());
+    
+    for (wal_file, counter) in &wal_files {
+        if let Ok(snapshot_info) = find_most_recent_snapshot_in_wal(wal_file).await {
+            if let Some((offset_after_snapshot, _)) = snapshot_info {
+                // Update if this is the most recent snapshot found so far
+                if most_recent_snapshot.is_none() || counter > &most_recent_snapshot.as_ref().unwrap().1 {
+                    most_recent_snapshot = Some((wal_file.clone(), *counter, offset_after_snapshot));
+                }
+            }
+        }
+    }
     
     // Disable notifications during WAL replay
     {
@@ -1603,18 +1609,33 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_count
         info!("Notifications disabled for WAL replay");
     }
     
-    if let Some(start_counter) = start_from_wal_counter {
-        info!("Replaying {} WAL files starting from counter {}", wal_files.len(), start_counter);
-    } else {
-        info!("Replaying {} WAL files", wal_files.len());
-    }
-    
-    for (wal_file, counter) in &wal_files {
-        info!("Replaying WAL file: {} (counter: {})", wal_file.display(), counter);
+    if let Some((snapshot_wal_file, snapshot_counter, snapshot_offset)) = most_recent_snapshot {
+        info!("Starting replay from WAL file {} (counter: {}) at offset {}", 
+              snapshot_wal_file.display(), snapshot_counter, snapshot_offset);
         
-        if let Err(e) = replay_single_wal_file(wal_file, app_state.clone()).await {
-            error!("Failed to replay WAL file {}: {}", wal_file.display(), e);
-            // Continue with other files instead of failing completely
+        // First, replay the partial WAL file that contains the snapshot (from the offset)
+        if let Err(e) = replay_wal_file_from_offset(&snapshot_wal_file, snapshot_offset, app_state.clone()).await {
+            error!("Failed to replay WAL file {} from offset {}: {}", snapshot_wal_file.display(), snapshot_offset, e);
+        }
+        
+        // Then replay all subsequent WAL files completely
+        for (wal_file, counter) in &wal_files {
+            if counter > &snapshot_counter {
+                info!("Replaying complete WAL file: {} (counter: {})", wal_file.display(), counter);
+                if let Err(e) = replay_single_wal_file(wal_file, app_state.clone()).await {
+                    error!("Failed to replay WAL file {}: {}", wal_file.display(), e);
+                }
+            }
+        }
+    } else {
+        info!("No snapshot markers found in WAL files, replaying all {} files completely", wal_files.len());
+        
+        // No snapshot markers found, replay all WAL files completely
+        for (wal_file, counter) in &wal_files {
+            info!("Replaying WAL file: {} (counter: {})", wal_file.display(), counter);
+            if let Err(e) = replay_single_wal_file(wal_file, app_state.clone()).await {
+                error!("Failed to replay WAL file {}: {}", wal_file.display(), e);
+            }
         }
     }
     
@@ -1631,61 +1652,158 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_count
     Ok(())
 }
 
-/// Replay a single WAL file
+/// Apply a single WAL request from request data
+async fn apply_wal_request(request_data: &[u8], app_state: &Arc<RwLock<AppState>>, requests_processed: &mut usize) -> Result<()> {
+    match serde_json::from_slice::<qlib_rs::Request>(request_data) {
+        Ok(request) => {
+            // Skip snapshot requests during replay (they are just markers)
+            if matches!(request, qlib_rs::Request::Snapshot { .. }) {
+                debug!("Skipping snapshot marker during replay");
+                return Ok(());
+            }
+            
+            let mut state = app_state.write().await;
+            let store = &mut state.store;
+            let mut store_guard = store.write().await;
+            
+            let mut requests = vec![request];
+            if let Err(e) = store_guard.perform(&mut requests).await {
+                drop(store_guard);
+                drop(state);
+                return Err(anyhow::anyhow!("Failed to apply request during WAL replay: {}", e));
+            } else {
+                *requests_processed += 1;
+            }
+            
+            drop(store_guard);
+            drop(state);
+            Ok(())
+        }
+        Err(e) => {
+            Err(anyhow::anyhow!("Failed to deserialize request: {}", e))
+        }
+    }
+}
+
+/// Replay a single WAL file completely from beginning to end
+/// Skips snapshot markers but processes all other requests
 async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<RwLock<AppState>>) -> Result<()> {
     let mut file = File::open(wal_path).await?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).await?;
     
     let mut requests_processed = 0;
-    let mut last_snapshot_offset = None;
-    let mut snapshot_found = false;
+    let mut offset = 0;
     
-    // First pass: find the most recent snapshot marker in this WAL file
-    let mut temp_offset = 0;
-    while temp_offset < buffer.len() {
+    info!("Replaying complete WAL file: {}", wal_path.display());
+    
+    while offset < buffer.len() {
         // Read length prefix (4 bytes)
-        if temp_offset + 4 > buffer.len() {
-            break;
+        if offset + 4 > buffer.len() {
+            break; // Not enough data for length prefix
         }
         
-        let len_bytes = [buffer[temp_offset], buffer[temp_offset+1], buffer[temp_offset+2], buffer[temp_offset+3]];
+        let len_bytes = [buffer[offset], buffer[offset+1], buffer[offset+2], buffer[offset+3]];
         let len = u32::from_le_bytes(len_bytes) as usize;
-        temp_offset += 4;
+        offset += 4;
         
         // Read the serialized request
-        if temp_offset + len > buffer.len() {
+        if offset + len > buffer.len() {
+            error!("Incomplete request in WAL file at offset {}", offset);
             break;
         }
         
-        let request_data = &buffer[temp_offset..temp_offset + len];
+        let request_data = &buffer[offset..offset + len];
+        offset += len;
         
+        // Apply the request using the helper function
+        if let Err(e) = apply_wal_request(request_data, &app_state, &mut requests_processed).await {
+            error!("Failed to apply request at offset {}: {}", offset - len, e);
+        }
+    }
+    
+    info!("Replayed {} requests from {}", requests_processed, wal_path.display());
+    Ok(())
+}
+
+/// Parse WAL file entries and call a callback for each request
+/// The callback receives (offset, request_data_slice, is_last_entry)
+async fn parse_wal_file<F>(wal_path: &PathBuf, mut callback: F) -> Result<()>
+where
+    F: FnMut(usize, &[u8]) -> Result<bool>, // Returns Ok(true) to continue, Ok(false) to stop, Err to error
+{
+    let mut file = File::open(wal_path).await?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+    
+    let mut offset = 0;
+    while offset < buffer.len() {
+        // Read length prefix (4 bytes)
+        if offset + 4 > buffer.len() {
+            break; // Not enough data for length prefix
+        }
+        
+        let len_bytes = [buffer[offset], buffer[offset+1], buffer[offset+2], buffer[offset+3]];
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        offset += 4;
+        
+        // Read the serialized request
+        if offset + len > buffer.len() {
+            error!("Incomplete request in WAL file at offset {}", offset);
+            break;
+        }
+        
+        let request_data = &buffer[offset..offset + len];
+        
+        // Call the callback with the current data
+        match callback(offset, request_data) {
+            Ok(true) => {}, // Continue
+            Ok(false) => break, // Stop processing
+            Err(e) => return Err(e), // Propagate error
+        }
+        
+        offset += len;
+    }
+    
+    Ok(())
+}
+
+/// Find the most recent snapshot marker in a WAL file and return its offset
+/// Returns Ok(Some((offset_after_snapshot, snapshot_request))) if found, Ok(None) if not found
+async fn find_most_recent_snapshot_in_wal(wal_path: &PathBuf) -> Result<Option<(usize, qlib_rs::Request)>> {
+    let mut last_snapshot_offset = None;
+    let mut last_snapshot_request = None;
+    
+    parse_wal_file(wal_path, |offset, request_data| {
         // Check if this is a snapshot marker
         if let Ok(request) = serde_json::from_slice::<qlib_rs::Request>(request_data) {
             if matches!(request, qlib_rs::Request::Snapshot { .. }) {
-                last_snapshot_offset = Some(temp_offset + len);
-                snapshot_found = true;
-                debug!("Found snapshot marker at offset {} in {}", temp_offset, wal_path.display());
+                last_snapshot_offset = Some(offset + request_data.len());
+                last_snapshot_request = Some(request);
+                debug!("Found snapshot marker at offset {} in {}", offset, wal_path.display());
             }
         }
-        
-        temp_offset += len;
-    }
+        Ok(true) // Continue processing
+    }).await?;
     
-    // Start replay from after the most recent snapshot marker (if any)
-    let mut offset = if let Some(start_offset) = last_snapshot_offset {
-        info!("Starting replay from offset {} (after snapshot marker) in {}", start_offset, wal_path.display());
-        start_offset
-    } else if snapshot_found {
-        // If we found a snapshot but couldn't determine offset, start from beginning
-        info!("Snapshot found but offset unclear, replaying entire file: {}", wal_path.display());
-        0
+    if let (Some(offset), Some(request)) = (last_snapshot_offset, last_snapshot_request) {
+        Ok(Some((offset, request)))
     } else {
-        // No snapshot found, replay entire file
-        0
-    };
+        Ok(None)
+    }
+}
+
+/// Replay a WAL file starting from a specific byte offset
+async fn replay_wal_file_from_offset(wal_path: &PathBuf, start_offset: usize, app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let mut file = File::open(wal_path).await?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
     
-    // Second pass: replay requests from the determined starting point
+    let mut requests_processed = 0;
+    let mut offset = start_offset;
+    
+    info!("Replaying WAL file {} from offset {}", wal_path.display(), start_offset);
+    
     while offset < buffer.len() {
         // Read length prefix (4 bytes)
         if offset + 4 > buffer.len() {
@@ -1706,40 +1824,12 @@ async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<RwLock<AppSta
         offset += len;
         
         // Deserialize and apply the request
-        match serde_json::from_slice::<qlib_rs::Request>(request_data) {
-            Ok(request) => {
-                // Skip snapshot markers during replay since they're just markers
-                if matches!(request, qlib_rs::Request::Snapshot { .. }) {
-                    debug!("Skipping snapshot marker during replay");
-                    continue;
-                }
-                
-                // Apply the request to the store
-                let mut state = app_state.write().await;
-                let store = &mut state.store;
-                let mut store_guard = store.write().await;
-                
-                let mut requests = vec![request];
-                if let Err(e) = store_guard.perform(&mut requests).await {
-                    error!("Failed to apply request during WAL replay: {}", e);
-                } else {
-                    requests_processed += 1;
-                }
-                
-                drop(store_guard);
-                drop(state);
-            }
-            Err(e) => {
-                error!("Failed to deserialize request from WAL: {}", e);
-            }
+        if let Err(e) = apply_wal_request(request_data, &app_state, &mut requests_processed).await {
+            error!("Failed to apply request at offset {}: {}", offset - len, e);
         }
     }
     
-    if snapshot_found {
-        info!("Replayed {} requests from {} (started after snapshot marker)", requests_processed, wal_path.display());
-    } else {
-        info!("Replayed {} requests from {} (no snapshot marker found)", requests_processed, wal_path.display());
-    }
+    info!("Replayed {} requests from {} (starting from offset {})", requests_processed, wal_path.display(), start_offset);
     Ok(())
 }
 
@@ -1829,7 +1919,7 @@ async fn main() -> Result<()> {
     }
 
     // Load the latest snapshot if available
-    let snapshot_wal_counter = if let Some((snapshot, snapshot_counter)) = load_latest_snapshot(app_state.clone()).await? {
+    if let Some((snapshot, snapshot_counter)) = load_latest_snapshot(app_state.clone()).await? {
         info!("Restoring store from snapshot (counter: {})", snapshot_counter);
         
         // Initialize the snapshot file counter to continue from the next number
@@ -1844,21 +1934,6 @@ async fn main() -> Result<()> {
         drop(store_guard);
         
         state.snapshot_file_counter = next_snapshot_counter;
-        drop(state);
-        
-        // Calculate which WAL files to replay
-        // We need to replay WAL files that were created after this snapshot
-        // Since snapshots are taken every N WAL rollovers, we need to calculate the WAL counter
-        // based on the snapshot counter
-        let config = {
-            let state = app_state.read().await;
-            state.config.clone()
-        };
-        
-        // The WAL counter that corresponds to this snapshot
-        // Since we take a snapshot every N WAL rollovers, the formula is:
-        // wal_counter = snapshot_counter * snapshot_wal_interval
-        Some(snapshot_counter * config.snapshot_wal_interval)
     } else {
         info!("No snapshot found, starting with empty store");
         
@@ -1866,13 +1941,13 @@ async fn main() -> Result<()> {
         let next_snapshot_counter = get_next_snapshot_counter(app_state.clone()).await?;
         let mut state = app_state.write().await;
         state.snapshot_file_counter = next_snapshot_counter;
-        
-        None
-    };
+    }
 
     // Replay WAL files to bring the store up to date
+    // The replay function will automatically find the most recent snapshot marker
+    // in the WAL files and start replaying from that point
     info!("Replaying WAL files");
-    if let Err(e) = replay_wal_files(app_state.clone(), snapshot_wal_counter).await {
+    if let Err(e) = replay_wal_files(app_state.clone()).await {
         error!("Failed to replay WAL files: {}", e);
         return Err(e);
     }
