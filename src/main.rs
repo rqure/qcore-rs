@@ -455,7 +455,9 @@ async fn handle_peer_message(
                 let mut state = app_state.write().await;
                 let store = &mut state.store;
                 let mut store_guard = store.write().await;
+                store_guard.disable_notifications();
                 store_guard.restore_snapshot(snapshot.clone());
+                store_guard.enable_notifications();
                 drop(store_guard);
                 state.is_fully_synced = true;
             }
@@ -1587,6 +1589,15 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_count
     
     drop(state); // Release the lock before processing
     
+    // Disable notifications during WAL replay
+    {
+        let mut state = app_state.write().await;
+        let store = &mut state.store;
+        let mut store_guard = store.write().await;
+        store_guard.disable_notifications();
+        info!("Notifications disabled for WAL replay");
+    }
+    
     if let Some(start_counter) = start_from_wal_counter {
         info!("Replaying {} WAL files starting from counter {}", wal_files.len(), start_counter);
     } else {
@@ -1600,6 +1611,15 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>, start_from_wal_count
             error!("Failed to replay WAL file {}: {}", wal_file.display(), e);
             // Continue with other files instead of failing completely
         }
+    }
+    
+    // Re-enable notifications after WAL replay
+    {
+        let mut state = app_state.write().await;
+        let store = &mut state.store;
+        let mut store_guard = store.write().await;
+        store_guard.enable_notifications();
+        info!("Notifications re-enabled after WAL replay");
     }
     
     info!("WAL replay completed");
@@ -1813,7 +1833,9 @@ async fn main() -> Result<()> {
         let mut state = app_state.write().await;
         let store = &mut state.store;
         let mut store_guard = store.write().await;
+        store_guard.disable_notifications();
         store_guard.restore_snapshot(snapshot);
+        store_guard.enable_notifications();
         drop(store_guard);
         
         state.snapshot_file_counter = next_snapshot_counter;
