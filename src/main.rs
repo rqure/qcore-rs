@@ -840,23 +840,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
             }
         }
         
-        StoreMessage::TakeSnapshot { id } => {
-            // Allow snapshots to be taken on any peer
-            let snapshot = store_guard.take_snapshot();
-            StoreMessage::TakeSnapshotResponse {
-                id,
-                response: snapshot,
-            }
-        }
-        
-        StoreMessage::RestoreSnapshot { id, snapshot } => {
-            store_guard.restore_snapshot(snapshot);
-            StoreMessage::RestoreSnapshotResponse {
-                id,
-                response: Ok(()),
-            }
-        }
-        
         StoreMessage::RegisterNotification { id, config: _ } => {
             // For now, we'll implement a simple notification registration
             // In a full implementation, you'd want to handle the notification sender properly
@@ -884,8 +867,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
         StoreMessage::FindEntitiesResponse { id, .. } |
         StoreMessage::FindEntitiesExactResponse { id, .. } |
         StoreMessage::GetEntityTypesResponse { id, .. } |
-        StoreMessage::TakeSnapshotResponse { id, .. } |
-        StoreMessage::RestoreSnapshotResponse { id, .. } |
         StoreMessage::RegisterNotificationResponse { id, .. } |
         StoreMessage::UnregisterNotificationResponse { id, .. } => {
             StoreMessage::Error {
