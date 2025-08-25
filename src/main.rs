@@ -487,25 +487,23 @@ async fn handle_peer_message(
             }
             
             // Save the snapshot to disk for persistence
-            if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
-                error!("Failed to save snapshot during full sync: {}", e);
-            } else {
-                info!("Snapshot saved to disk during full sync");
-                
-                // Write a snapshot marker to the WAL to indicate the sync point
-                // This helps during replay to know that the state was synced at this point
-                let snapshot_counter = {
-                    let state = app_state.read().await;
-                    state.snapshot_file_counter
-                };
-                
-                let snapshot_request = qlib_rs::Request::Snapshot {
-                    snapshot_counter,
-                    originator: Some(app_state.read().await.config.machine.clone()),
-                };
-                
-                if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
-                    error!("Failed to write snapshot marker to WAL: {}", e);
+            match save_snapshot(&snapshot, app_state.clone()).await {
+                Ok(snapshot_counter) => {
+                    info!("Snapshot saved to disk during full sync");
+                    
+                    // Write a snapshot marker to the WAL to indicate the sync point
+                    // This helps during replay to know that the state was synced at this point
+                    let snapshot_request = qlib_rs::Request::Snapshot {
+                        snapshot_counter,
+                        originator: Some(app_state.read().await.config.machine.clone()),
+                    };
+                    
+                    if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
+                        error!("Failed to write snapshot marker to WAL: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to save snapshot during full sync: {}", e);
                 }
             }
             
@@ -1387,26 +1385,28 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
             drop(state); // Release the lock before calling save_snapshot
             
             // Save the snapshot to disk
-            if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
-                error!("Failed to save snapshot after WAL rollover: {}", e);
-            } else {
-                // Reset the WAL files counter
-                let mut state = app_state.write().await;
-                state.wal_files_since_snapshot = 0;
-                info!("Snapshot saved successfully after WAL rollover");
-                
-                // Write a snapshot marker to the WAL to indicate the snapshot point
-                let snapshot_counter = state.snapshot_file_counter;
-                let machine_id = state.config.machine.clone();
-                drop(state); // Release the lock before writing to WAL
-                
-                let snapshot_request = qlib_rs::Request::Snapshot {
-                    snapshot_counter,
-                    originator: Some(machine_id),
-                };
-                
-                if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
-                    error!("Failed to write snapshot marker to WAL: {}", e);
+            match save_snapshot(&snapshot, app_state.clone()).await {
+                Ok(snapshot_counter) => {
+                    // Reset the WAL files counter
+                    let mut state = app_state.write().await;
+                    state.wal_files_since_snapshot = 0;
+                    info!("Snapshot saved successfully after WAL rollover");
+                    
+                    // Write a snapshot marker to the WAL to indicate the snapshot point
+                    let machine_id = state.config.machine.clone();
+                    drop(state); // Release the lock before writing to WAL
+                    
+                    let snapshot_request = qlib_rs::Request::Snapshot {
+                        snapshot_counter,
+                        originator: Some(machine_id),
+                    };
+                    
+                    if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
+                        error!("Failed to write snapshot marker to WAL: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to save snapshot after WAL rollover: {}", e);
                 }
             }
             
@@ -1437,16 +1437,20 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
     Ok(())
 }
 
-/// Save a snapshot to disk
-async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<RwLock<AppState>>) -> Result<()> {
+/// Save a snapshot to disk and return the snapshot counter that was used
+async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<RwLock<AppState>>) -> Result<u64> {
     let mut state = app_state.write().await;
     
     // Create snapshots directory if it doesn't exist
     let snapshot_dir = state.get_snapshots_dir();
     create_dir_all(&snapshot_dir).await?;
     
-    // Create snapshot filename with counter
-    let snapshot_filename = format!("snapshot_{:010}.bin", state.snapshot_file_counter);
+    // Increment the counter before creating the filename
+    let current_snapshot_counter = state.snapshot_file_counter;
+    state.snapshot_file_counter += 1;
+    
+    // Create snapshot filename with the current counter
+    let snapshot_filename = format!("snapshot_{:010}.bin", current_snapshot_counter);
     let snapshot_path = snapshot_dir.join(&snapshot_filename);
     
     info!("Saving snapshot to: {}", snapshot_path.display());
@@ -1465,8 +1469,6 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<RwLock<AppSt
     file.write_all(&serialized).await?;
     file.flush().await?;
     
-    state.snapshot_file_counter += 1;
-    
     info!("Snapshot saved successfully, {} bytes", serialized.len());
     
     // Clean up old snapshots using the configured limit
@@ -1475,7 +1477,7 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<RwLock<AppSt
         error!("Failed to clean up old snapshots: {}", e);
     }
     
-    Ok(())
+    Ok(current_snapshot_counter)
 }
 
 /// Load the latest snapshot from disk and return it along with the snapshot counter
@@ -2055,10 +2057,26 @@ async fn main() -> Result<()> {
         store_guard.take_snapshot()
     };
     
-    if let Err(e) = save_snapshot(&snapshot, app_state.clone()).await {
-        error!("Failed to save final snapshot: {}", e);
-    } else {
-        info!("Final snapshot saved successfully");
+    match save_snapshot(&snapshot, app_state.clone()).await {
+        Ok(snapshot_counter) => {
+            info!("Final snapshot saved successfully");
+            
+            // Write a snapshot marker to the WAL to indicate the final snapshot point
+            // This helps during replay to know that the state was snapshotted at shutdown
+            let snapshot_request = qlib_rs::Request::Snapshot {
+                snapshot_counter,
+                originator: Some(app_state.read().await.config.machine.clone()),
+            };
+            
+            if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
+                error!("Failed to write final snapshot marker to WAL: {}", e);
+            } else {
+                info!("Final snapshot marker written to WAL");
+            }
+        }
+        Err(e) => {
+            error!("Failed to save final snapshot: {}", e);
+        }
     }
 
     // Abort all tasks
