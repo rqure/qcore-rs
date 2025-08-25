@@ -27,9 +27,7 @@
     },
     {
       "_entityType": "Root",
-      "inheritsFrom": [
-        "Object"
-      ],
+      "inheritsFrom": "Object",
       "fields": [
         {
           "name": "CreatedEntity",
@@ -50,43 +48,31 @@
     },
     {
       "_entityType": "Folder",
-      "inheritsFrom": [
-        "Object"
-      ],
+      "inheritsFrom": "Object",
       "fields": []
     },
     {
       "_entityType": "Machine",
-      "inheritsFrom": [
-        "Object"
-      ],
+      "inheritsFrom": "Object",
       "fields": []
     },
     {
       "_entityType": "Subject",
-      "inheritsFrom": [
-        "Object"
-      ]
+      "inheritsFrom": "Object"
     },
     {
       "_entityType": "Service",
-      "inheritsFrom": [
-        "Subject"
-      ],
+      "inheritsFrom": "Subject",
       "fields": []
     },
     {
       "_entityType": "User",
-      "inheritsFrom": [
-        "Subject"
-      ],
+      "inheritsFrom": "Subject",
       "fields": []
     },
     {
       "_entityType": "Permission",
-      "inheritsFrom": [
-        "Object"
-      ],
+      "inheritsFrom": "Object",
       "fields": [
         {
           "name": "TestFn",
@@ -97,9 +83,7 @@
     },
     {
       "_entityType": "AuthorizationRule",
-      "inheritsFrom": [
-        "Object"
-      ],
+      "inheritsFrom": "Object",
       "fields": [
         {
           "name": "Scope",
@@ -140,22 +124,14 @@
         ]
       },
       {
-        "_entityType": "User",
-        "Name": "admin",
-        "RoleList": ["Admin"]
-      },
-      {
-        "_entityType": "Permission",
-        "Name": "AdminPermission",
-        "TestFn": "function(subject, resource) { return subject.RoleList && subject.RoleList.includes('Admin'); }"
-      },
-      {
-        "_entityType": "AuthorizationRule",
-        "Name": "AdminAccessRule",
-        "Scope": "Read and Write",
-        "ResourceType": "Service",
-        "ResourceField": "Name",
-        "Permission": "AdminPermission"
+        "_entityType": "Folder",
+        "Name": "Security Models",
+        "Children": [
+          {
+            "_entityType": "User",
+            "Name": "qos"
+          }
+        ]
       }
     ]
   }
