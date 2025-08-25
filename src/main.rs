@@ -34,7 +34,7 @@ enum PeerMessage {
     },
     /// Data synchronization request (existing functionality)
     SyncRequest {
-        request: qlib_rs::Request,
+        requests: Vec<qlib_rs::Request>,
     },
 }
 
@@ -437,25 +437,32 @@ async fn handle_peer_message(
             info!("Successfully applied full sync snapshot, instance is now fully synchronized");
         }
         
-        PeerMessage::SyncRequest { request } => {
+        PeerMessage::SyncRequest { requests } => {
             // Handle data synchronization (existing functionality)
             let our_machine_id = app_state.read().await.config.machine.clone();
             
-            if let Some(originator) = request.originator() {
-                if *originator != our_machine_id {
-                    let mut state = app_state.write().await;
-                    let store = &mut state.store;
-                    let mut store_guard = store.write().await;
-                    
-                    let mut requests = vec![request];
-                    if let Err(e) = store_guard.perform(&mut requests).await {
-                        error!("Failed to apply sync request from peer {}: {}", peer_addr, e);
-                    } else {
-                        debug!("Successfully applied sync request from peer {}", peer_addr);
-                    }
+            // Check if any request in the batch originated from a different machine
+            let should_apply = requests.iter().any(|request| {
+                if let Some(originator) = request.originator() {
+                    *originator != our_machine_id
+                } else {
+                    false
+                }
+            });
+            
+            if should_apply {
+                let mut state = app_state.write().await;
+                let store = &mut state.store;
+                let mut store_guard = store.write().await;
+                
+                let mut requests_to_apply = requests;
+                if let Err(e) = store_guard.perform(&mut requests_to_apply).await {
+                    error!("Failed to apply sync requests from peer {}: {}", peer_addr, e);
+                } else {
+                    debug!("Successfully applied {} sync requests from peer {}", requests_to_apply.len(), peer_addr);
                 }
             } else {
-                debug!("Ignoring sync request without originator from peer {}", peer_addr);
+                debug!("Ignoring sync requests without originator from peer {}", peer_addr);
             }
         }
     }
@@ -985,63 +992,72 @@ async fn consume_write_channel(app_state: Arc<RwLock<AppState>>) -> Result<()> {
     };
     
     loop {
-        // Wait for a request from the write channel without holding any store locks
-        let request = {
+        // Wait for a batch of requests from the write channel without holding any store locks
+        let requests = {
             let mut receiver_guard = receiver.lock().await;
             receiver_guard.recv().await
         };
         
-        match request {
-            Some(request) => {
-                debug!("Writing request to WAL: {:?}", request);
+        match requests {
+            Some(requests) => {
+                debug!("Writing {} requests to WAL: {:?}", requests.len(), requests);
                 
-                // Write request to WAL file - the request has already been applied to the store
-                if let Err(e) = write_request_to_wal(&request, app_state.clone()).await {
-                    error!("Failed to write request to WAL: {}", e);
+                // Write all requests to WAL file - the requests have already been applied to the store
+                for request in &requests {
+                    if let Err(e) = write_request_to_wal(request, app_state.clone()).await {
+                        error!("Failed to write request to WAL: {}", e);
+                    }
                 }
                 
-                // Check if this request originated from the current machine
+                // Collect all requests that originated from this machine for batch synchronization
                 let current_machine = {
                     let state = app_state.read().await;
                     state.config.machine.clone()
                 };
                 
-                // If the request originated from this machine, send it to peers for synchronization
-                if let Some(originator) = request.originator() {
-                    if originator == &current_machine {
-                        debug!("Sending request to peers for synchronization: {:?}", request);
-                        
-                        // Send to all connected outbound peers using PeerMessage
-                        let peers_to_notify = {
-                            let state = app_state.read().await;
-                            state.connected_outbound_peers.clone()
-                        };
-                        
-                        // Create a sync message
-                        let sync_message = PeerMessage::SyncRequest {
-                            request: request.clone(),
-                        };
-                        
-                        // Serialize the sync message to JSON for transmission
-                        match serde_json::to_string(&sync_message) {
-                            Ok(message_json) => {
-                                let message = Message::Text(message_json);
-                                
-                                for (peer_addr, sender) in peers_to_notify {
-                                    if let Err(e) = sender.send(message.clone()) {
-                                        warn!("Failed to send sync request to peer {}: {}", peer_addr, e);
-                                    } else {
-                                        debug!("Sent sync request to peer: {}", peer_addr);
-                                    }
+                let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
+                    .filter(|request| {
+                        if let Some(originator) = request.originator() {
+                            originator == &current_machine
+                        } else {
+                            false
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                
+                // Send batch of requests to peers for synchronization if we have any
+                if !requests_to_sync.is_empty() {
+                    debug!("Sending {} requests to peers for synchronization", requests_to_sync.len());
+                    
+                    // Send to all connected outbound peers using PeerMessage
+                    let peers_to_notify = {
+                        let state = app_state.read().await;
+                        state.connected_outbound_peers.clone()
+                    };
+                    
+                    // Create a batch sync message
+                    let sync_message = PeerMessage::SyncRequest {
+                        requests: requests_to_sync.clone(),
+                    };
+                    
+                    // Serialize the sync message to JSON for transmission
+                    match serde_json::to_string(&sync_message) {
+                        Ok(message_json) => {
+                            let message = Message::Text(message_json);
+                            
+                            for (peer_addr, sender) in &peers_to_notify {
+                                if let Err(e) = sender.send(message.clone()) {
+                                    warn!("Failed to send sync requests to peer {}: {}", peer_addr, e);
+                                } else {
+                                    debug!("Sent {} sync requests to peer: {}", requests_to_sync.len(), peer_addr);
                                 }
                             }
-                            Err(e) => {
-                                error!("Failed to serialize sync message for peer synchronization: {}", e);
-                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize sync message for peer synchronization: {}", e);
                         }
                     }
-                } else {
-                    debug!("Request has no originator, not sending to peers");
                 }
             }
             None => {
