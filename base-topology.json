@@ -58,7 +58,14 @@
     },
     {
       "_entityType": "Subject",
-      "inheritsFrom": "Object"
+      "inheritsFrom": "Object",
+      "fields": [
+        {
+          "name": "Secret",
+          "dataType": "String",
+          "default": ""
+        }
+      ]
     },
     {
       "_entityType": "Service",
@@ -76,7 +83,7 @@
       "fields": [
         {
           "name": "TestFn",
-          "dataType": "Script",
+          "dataType": "String",
           "default": ""
         }
       ]
