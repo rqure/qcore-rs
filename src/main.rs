@@ -1,4 +1,4 @@
-use qlib_rs::{Snowflake, Store, StoreMessage};
+use qlib_rs::{Snowflake, Store, StoreMessage, NotifyConfig, NotificationSender, notification_channel};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
@@ -113,6 +113,14 @@ struct AppState {
     /// Connected clients with message senders
     connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
 
+    /// Client notification senders - maps client address to their notification sender
+    /// Used to send notifications to specific clients
+    client_notification_senders: HashMap<String, NotificationSender>,
+
+    /// Track notification configurations per client for cleanup on disconnect
+    /// Maps client address to a set of registered notification configurations
+    client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
+
     // Data store
     store: Arc<RwLock<Store>>,
     
@@ -159,6 +167,8 @@ impl AppState {
             connected_outbound_peers: HashMap::new(),
             connected_inbound_peers: HashSet::new(),
             connected_clients: HashMap::new(),
+            client_notification_senders: HashMap::new(),
+            client_notification_configs: HashMap::new(),
             store: Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new())))),
             current_wal_file: None,
             current_wal_size: 0,
@@ -615,11 +625,34 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     // Create a channel for sending messages to this client
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
     
-    // Store the sender in the connected_clients HashMap
+    // Create a notification channel for this client
+    let (notification_sender, mut notification_receiver) = notification_channel();
+    
+    // Store the sender and notification sender in the connected_clients HashMap
     {
         let mut state = app_state.write().await;
         state.connected_clients.insert(client_addr.to_string(), tx.clone());
+        state.client_notification_senders.insert(client_addr.to_string(), notification_sender);
     }
+    
+    // Spawn a task to handle notifications for this client
+    let client_addr_clone_notif = client_addr.to_string();
+    let tx_clone_notif = tx.clone();
+    let notification_task = tokio::spawn(async move {
+        while let Some(notification) = notification_receiver.recv().await {
+            // Convert notification to StoreMessage and send to client
+            let notification_msg = StoreMessage::Notification { notification };
+            if let Ok(notification_text) = serde_json::to_string(&notification_msg) {
+                if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)) {
+                    error!("Failed to send notification to client {}: {}", client_addr_clone_notif, e);
+                    break;
+                }
+            } else {
+                error!("Failed to serialize notification for client {}", client_addr_clone_notif);
+            }
+        }
+        debug!("Notification task ended for client {}", client_addr_clone_notif);
+    });
     
     // Spawn a task to handle outgoing messages to the client
     let client_addr_clone = client_addr.to_string();
@@ -650,7 +683,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                 match serde_json::from_str::<StoreMessage>(&text) {
                     Ok(store_msg) => {
                         // Process the message and generate response
-                        let response_msg = process_store_message(store_msg, &app_state).await;
+                        let response_msg = process_store_message(store_msg, &app_state, Some(client_addr.to_string())).await;
                         
                         // Send response back to client using the channel
                         let response_text = match serde_json::to_string(&response_msg) {
@@ -707,21 +740,59 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
         }
     }
     
-    // Remove client from connected_clients when connection ends
+    // Remove client from connected_clients and cleanup notifications when connection ends
     {
         let mut state = app_state.write().await;
-        state.connected_clients.remove(&client_addr.to_string());
+        let client_addr_string = client_addr.to_string();
+        state.connected_clients.remove(&client_addr_string);
+        
+        // Get the notification sender and configurations for this client
+        let notification_sender = state.client_notification_senders.remove(&client_addr_string);
+        let client_configs = state.client_notification_configs.remove(&client_addr_string);
+        
+        // Unregister all notifications for this client from the store
+        if let Some(configs) = client_configs {
+            if let Some(sender) = notification_sender {
+                let store = &mut state.store;
+                let mut store_guard = store.write().await;
+                
+                for config in configs {
+                    let removed = store_guard.unregister_notification(&config, &sender).await;
+                    if removed {
+                        debug!("Cleaned up notification config for disconnected client {}: {:?}", client_addr_string, config);
+                    } else {
+                        warn!("Failed to clean up notification config for disconnected client {}: {:?}", client_addr_string, config);
+                    }
+                }
+                
+                drop(store_guard);
+                // The notification sender being dropped will close the channel
+                drop(sender);
+            }
+        } else if let Some(sender) = notification_sender {
+            // Just drop the sender if no configs were tracked
+            drop(sender);
+        }
     }
     
-    // Abort the outgoing task
+    // Abort the outgoing task and notification task
     outgoing_task.abort();
+    notification_task.abort();
     
     info!("Client connection closed: {}", client_addr);
     Ok(())
 }
 
 /// Process a StoreMessage and generate the appropriate response
-async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<AppState>>) -> StoreMessage {
+async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<AppState>>, client_addr: Option<String>) -> StoreMessage {
+    // Extract client notification sender if needed (before accessing store)
+    let client_notification_sender = if let Some(ref addr) = client_addr {
+        let state = app_state.read().await;
+        state.client_notification_senders.get(addr).cloned()
+    } else {
+        None
+    };
+    
     let mut state = app_state.write().await;
     let machine = state.config.machine.clone();
     let store = &mut state.store;
@@ -840,20 +911,81 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
             }
         }
         
-        StoreMessage::RegisterNotification { id, config: _ } => {
-            // For now, we'll implement a simple notification registration
-            // In a full implementation, you'd want to handle the notification sender properly
-            StoreMessage::RegisterNotificationResponse {
-                id,
-                response: Ok(()),
+        StoreMessage::RegisterNotification { id, config } => {
+            // Register notification for this client
+            if let Some(client_addr) = &client_addr {
+                if let Some(ref notification_sender) = client_notification_sender {
+                    match store_guard.register_notification(config.clone(), notification_sender.clone()).await {
+                        Ok(()) => {
+                            // Track this notification config for this client
+                            // We need to drop the store_guard temporarily to access state mutably
+                            drop(store_guard);
+                            state.client_notification_configs
+                                .entry(client_addr.clone())
+                                .or_insert_with(HashSet::new)
+                                .insert(config);
+                            
+                            debug!("Registered notification for client {}", client_addr);
+                            StoreMessage::RegisterNotificationResponse {
+                                id,
+                                response: Ok(()),
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to register notification for client {}: {:?}", client_addr, e);
+                            StoreMessage::RegisterNotificationResponse {
+                                id,
+                                response: Err(format!("Failed to register notification: {:?}", e)),
+                            }
+                        }
+                    }
+                } else {
+                    error!("No notification sender found for client {}", client_addr);
+                    StoreMessage::RegisterNotificationResponse {
+                        id,
+                        response: Err("Client notification sender not found".to_string()),
+                    }
+                }
+            } else {
+                StoreMessage::RegisterNotificationResponse {
+                    id,
+                    response: Err("Client address not provided".to_string()),
+                }
             }
         }
         
-        StoreMessage::UnregisterNotification { id, config: _config } => {
-            // For now, we'll implement a simple notification unregistration
-            StoreMessage::UnregisterNotificationResponse {
-                id,
-                response: true,
+        StoreMessage::UnregisterNotification { id, config } => {
+            // Unregister notification for this client
+            if let Some(client_addr) = &client_addr {
+                if let Some(ref notification_sender) = client_notification_sender {
+                    let removed = store_guard.unregister_notification(&config, notification_sender).await;
+                    
+                    // Remove from client's tracked configs if successfully unregistered
+                    if removed {
+                        // We need to drop the store_guard temporarily to access state mutably
+                        drop(store_guard);
+                        if let Some(client_configs) = state.client_notification_configs.get_mut(client_addr) {
+                            client_configs.remove(&config);
+                        }
+                    }
+                    
+                    debug!("Unregistered notification for client {}: removed: {}", client_addr, removed);
+                    StoreMessage::UnregisterNotificationResponse {
+                        id,
+                        response: removed,
+                    }
+                } else {
+                    error!("No notification sender found for client {}", client_addr);
+                    StoreMessage::UnregisterNotificationResponse {
+                        id,
+                        response: false,
+                    }
+                }
+            } else {
+                StoreMessage::UnregisterNotificationResponse {
+                    id,
+                    response: false,
+                }
             }
         }
         
