@@ -16,6 +16,15 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
 
+/// Application availability state
+#[derive(Debug, Clone, PartialEq)]
+enum AvailabilityState {
+    /// Application is unavailable - attempting to sync with leader, clients are force disconnected
+    Unavailable,
+    /// Application is available - clients are allowed to connect and perform operations
+    Available,
+}
+
 /// Messages exchanged between peers for leader election
 #[derive(Serialize, Deserialize, Debug, Clone)]
 enum PeerMessage {
@@ -96,6 +105,9 @@ struct AppState {
     /// Startup time (timestamp in seconds since UNIX_EPOCH)
     startup_time: u64,
     
+    /// Current availability state of the application
+    availability_state: AvailabilityState,
+    
     /// Whether this instance has been elected as leader
     is_leader: bool,
     
@@ -152,9 +164,7 @@ struct PeerInfo {
     last_seen: u64,
 }
 
-/// Check if this instance should be the leader based on startup times
 impl AppState {
-    /// Create a new AppState with the given configuration
     fn new(config: Config) -> Self {
         let startup_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -164,7 +174,8 @@ impl AppState {
         Self {
             config,
             startup_time,
-            is_leader: false, // Will be determined through leader election
+            availability_state: AvailabilityState::Available,
+            is_leader: false,
             current_leader: None,
             is_fully_synced: false,
             peer_info: HashMap::new(),
@@ -195,6 +206,47 @@ impl AppState {
     /// Get the machine-specific snapshots directory
     fn get_snapshots_dir(&self) -> PathBuf {
         self.get_machine_data_dir().join("snapshots")
+    }
+
+    /// Set the availability state and handle state transitions
+    fn set_availability_state(&mut self, new_state: AvailabilityState) {
+        if self.availability_state != new_state {
+            info!("Availability state transition: {:?} -> {:?}", self.availability_state, new_state);
+            self.availability_state = new_state;
+        }
+    }
+
+    /// Check if the application is available for client connections
+    fn is_available(&self) -> bool {
+        matches!(self.availability_state, AvailabilityState::Available)
+    }
+
+    /// Force disconnect all connected clients (used when transitioning to unavailable)
+    async fn force_disconnect_all_clients(&mut self) {
+        if !self.connected_clients.is_empty() {
+            info!("Force disconnecting {} clients due to unavailable state", self.connected_clients.len());
+            
+            // Send close messages to all connected clients
+            let disconnect_message = Message::Close(None);
+            for (client_addr, sender) in &self.connected_clients {
+                if let Err(e) = sender.send(disconnect_message.clone()) {
+                    warn!("Failed to send close message to client {}: {}", client_addr, e);
+                }
+            }
+            
+            // Clear all client-related data structures
+            self.connected_clients.clear();
+            
+            // Clean up notification senders and configurations
+            for (_client_addr, sender) in self.client_notification_senders.drain() {
+                drop(sender); // This will close the notification channel
+            }
+            
+            for (client_addr, configs) in self.client_notification_configs.drain() {
+                // Note: Notifications will be cleaned up when the channels close
+                debug!("Cleared {} notification configs for disconnected client {}", configs.len(), client_addr);
+            }
+        }
     }
 }
 
@@ -375,10 +427,12 @@ async fn handle_peer_message(
                             state.is_leader = true;
                             state.current_leader = Some(our_machine_id.clone());
                             state.is_fully_synced = true;
+                            state.set_availability_state(AvailabilityState::Available);
                             info!("We are the leader after machine_id tiebreaker (startup_time: {}, machine_id: {})", our_startup_time, our_machine_id);
                         } else {
                             state.is_leader = false;
-                            // Find the actual leader
+                            state.set_availability_state(AvailabilityState::Unavailable);
+                            state.force_disconnect_all_clients().await;
                             let leader = state.peer_info.values()
                                 .filter(|p| p.startup_time <= earliest_startup)
                                 .min_by_key(|p| (&p.startup_time, &p.machine_id))
@@ -395,10 +449,12 @@ async fn handle_peer_message(
                     state.is_leader = true;
                     state.current_leader = Some(our_machine_id.clone());
                     state.is_fully_synced = true;
+                    state.set_availability_state(AvailabilityState::Available);
                     info!("We are the leader based on startup time comparison (startup_time: {})", our_startup_time);
                 } else {
                     state.is_leader = false;
-                    // Find the actual leader
+                    state.set_availability_state(AvailabilityState::Unavailable);
+                    state.force_disconnect_all_clients().await;
                     let leader = state.peer_info.values()
                         .filter(|p| p.startup_time <= earliest_startup)
                         .min_by_key(|p| (&p.startup_time, &p.machine_id))
@@ -408,23 +464,6 @@ async fn handle_peer_message(
                 }
             }
             debug!("Updated peer info for {}: startup_time={}", machine_id, startup_time);
-            
-            // Send our startup info in response
-            let (our_machine_id, our_startup_time) = {
-                let state = app_state.read().await;
-                (state.config.machine.clone(), state.startup_time)
-            };
-            
-            let response = PeerMessage::Startup {
-                machine_id: our_machine_id,
-                startup_time: our_startup_time,
-            };
-            
-            if let Ok(response_json) = serde_json::to_string(&response) {
-                if let Err(e) = ws_sender.send(Message::Text(response_json)).await {
-                    error!("Failed to send startup response to peer {}: {}", peer_addr, e);
-                }
-            }
         }
         
         PeerMessage::FullSyncRequest { machine_id } => {
@@ -464,6 +503,7 @@ async fn handle_peer_message(
                 store_guard.enable_notifications();
                 drop(store_guard);
                 state.is_fully_synced = true;
+                state.set_availability_state(AvailabilityState::Available);
             }
             
             // Save the snapshot to disk for persistence
@@ -622,6 +662,16 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
 /// Handle a single client WebSocket connection that uses StoreProxy protocol
 async fn handle_client_connection(stream: TcpStream, client_addr: std::net::SocketAddr, app_state: Arc<RwLock<AppState>>) -> Result<()> {
     info!("New client connection from: {}", client_addr);
+    
+    // Check if the application is available for client connections
+    {
+        let state = app_state.read().await;
+        if !state.is_available() {
+            info!("Rejecting client connection from {} - application is unavailable", client_addr);
+            // Don't accept the WebSocket connection, just return
+            return Ok(());
+        }
+    }
     
     let ws_stream = accept_async(stream).await?;
     debug!("WebSocket connection established with client: {}", client_addr);

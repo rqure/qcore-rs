@@ -1,0 +1,82 @@
+{
+  "schemas": [
+    {
+      "_entityType": "Object",
+      "fields": [
+        {
+          "name": "Name",
+          "dataType": "String",
+          "default": ""
+        },
+        {
+          "name": "Parent",
+          "dataType": "EntityReference",
+          "default": null
+        },
+        {
+          "name": "Description",
+          "dataType": "String",
+          "default": ""
+        },
+        {
+          "name": "Children",
+          "dataType": "EntityList",
+          "default": []
+        }
+      ]
+    },
+    {
+      "_entityType": "Root",
+      "inheritsFrom": [
+        "Object"
+      ],
+      "fields": [
+        {
+          "name": "CreatedEntity",
+          "dataType": "String",
+          "default": null
+        },
+        {
+          "name": "DeletedEntity",
+          "dataType": "String",
+          "default": null
+        },
+        {
+          "name": "SchemaChange",
+          "dataType": "String",
+          "default": null
+        }
+      ]
+    },
+    {
+      "_entityType": "Machine",
+      "inheritsFrom": [
+        "Object"
+      ],
+      "fields": []
+    },
+    {
+      "_entityType": "Service",
+      "inheritsFrom": [
+        "Object"
+      ],
+      "fields": []
+    }
+  ],
+  "entity": {
+    "_entityType": "Root",
+    "Name": "QOS",
+    "Children": [
+      {
+        "_entityType": "Machine",
+        "Name": "qos-a",
+        "Children": [
+          {
+            "_entityType": "Service",
+            "Name": "qcore"
+          }
+        ]
+      }
+    ]
+  }
+}
