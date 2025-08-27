@@ -1,13 +1,16 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use qlib_rs::{
-    StoreProxy, restore_json_snapshot_proxy, JsonSnapshot, JsonEntitySchema,
-    EntityType, EntityId, Error, Request,
-    build_json_entity_tree_proxy, restore_entity_recursive_proxy
+    StoreProxy, JsonSnapshot, JsonEntitySchema,
+    EntityType, EntityId, Error, Request, Snapshot,
+    build_json_entity_tree_proxy, FieldType, Field,
+    json_value_to_value
 };
 use serde_json;
 use std::path::PathBuf;
+use std::collections::HashMap;
 use tokio::fs::{read_to_string, write};
+use tokio::io::AsyncWriteExt;
 use tracing::{info, error, warn};
 
 /// Command-line tool for taking and restoring JSON snapshots from QCore service
@@ -44,6 +47,14 @@ enum Commands {
         /// Force restoration even if it might overwrite existing data
         #[arg(long)]
         force: bool,
+        
+        /// Target data directory where snapshot and WAL files will be created
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        
+        /// Target machine ID for the data directory structure (defaults to "restored")
+        #[arg(long, default_value = "restored")]
+        machine_id: String,
     },
     /// Validate a JSON snapshot file without restoring it
     Validate {
@@ -71,8 +82,8 @@ async fn main() -> Result<()> {
         Commands::Take { output, pretty } => {
             take_snapshot(&config.core_url, &output, pretty).await?;
         }
-        Commands::Restore { input, force } => {
-            restore_snapshot(&config.core_url, &input, force).await?;
+        Commands::Restore { input, force, data_dir, machine_id } => {
+            restore_snapshot(&input, force, data_dir, machine_id).await?;
         }
         Commands::Validate { input } => {
             validate_snapshot(&input).await?;
@@ -144,8 +155,13 @@ async fn take_json_snapshot_proxy(store: &mut StoreProxy) -> Result<JsonSnapshot
     })
 }
 
-/// Restore a snapshot from a file to the Core service
-async fn restore_snapshot(core_url: &str, input_path: &PathBuf, force: bool) -> Result<()> {
+/// Restore a snapshot from a file by generating snapshot and WAL files in the target data directory
+async fn restore_snapshot(
+    input_path: &PathBuf, 
+    force: bool, 
+    data_dir: Option<PathBuf>, 
+    machine_id: String
+) -> Result<()> {
     info!("Loading snapshot from: {}", input_path.display());
 
     // Read and parse the snapshot file
@@ -155,30 +171,84 @@ async fn restore_snapshot(core_url: &str, input_path: &PathBuf, force: bool) -> 
 
     info!("Snapshot loaded successfully. Contains {} schemas.", snapshot.schemas.len());
 
-    if !force {
-        warn!("WARNING: This operation will overwrite existing data in the Core service!");
-        warn!("The current store state will be replaced with the snapshot data.");
+    // Determine target data directory
+    let target_data_dir = data_dir.unwrap_or_else(|| PathBuf::from("./data"));
+    let machine_data_dir = target_data_dir.join(&machine_id);
+    let snapshots_dir = machine_data_dir.join("snapshots");
+    let wal_dir = machine_data_dir.join("wal");
+
+    // Check if directories already exist and warn user
+    if (snapshots_dir.exists() || wal_dir.exists()) && !force {
+        warn!("WARNING: Target directories already exist!");
+        warn!("Snapshots dir: {}", snapshots_dir.display());
+        warn!("WAL dir: {}", wal_dir.display());
+        warn!("This operation will create new files that might conflict with existing data.");
         warn!("Use --force flag to proceed without this warning.");
         
-        // In a real implementation, you might want to prompt for user confirmation here
-        // For now, we'll just return an error asking for --force
         return Err(anyhow::anyhow!("Restoration cancelled. Use --force flag to proceed."));
     }
 
-    info!("Connecting to Core service at: {}", core_url);
+    info!("Creating data structure for machine '{}' in: {}", machine_id, target_data_dir.display());
+
+    // Create directories
+    tokio::fs::create_dir_all(&snapshots_dir).await?;
+    tokio::fs::create_dir_all(&wal_dir).await?;
+
+    // Convert JsonSnapshot to internal Snapshot format
+    let internal_snapshot = convert_json_to_internal_snapshot(&snapshot).await?;
+
+    // Generate snapshot binary file
+    let snapshot_filename = "snapshot_0000000000.bin";
+    let snapshot_path = snapshots_dir.join(snapshot_filename);
     
-    // Connect to the Core service with authentication
-    // For the snapshot tool, we'll use default admin credentials
-    let mut store = StoreProxy::connect_and_authenticate(core_url, "admin", "admin123").await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to Core service: {}", e))?;
+    info!("Writing snapshot binary to: {}", snapshot_path.display());
+    
+    // Serialize the snapshot using bincode for consistency with QCore format
+    let serialized_snapshot = bincode::serialize(&internal_snapshot)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize snapshot: {}", e))?;
+    
+    tokio::fs::write(&snapshot_path, &serialized_snapshot).await?;
+    
+    info!("Snapshot binary written: {} bytes", serialized_snapshot.len());
 
-    info!("Connected successfully. Restoring snapshot...");
+    // Generate WAL file with snapshot marker
+    let wal_filename = "wal_0000000000.log";
+    let wal_path = wal_dir.join(wal_filename);
+    
+    info!("Writing WAL file to: {}", wal_path.display());
+    
+    // Create snapshot marker request
+    let snapshot_request = Request::Snapshot {
+        snapshot_counter: 0,
+        originator: Some("snapshot-tool".to_string()),
+    };
+    
+    // Serialize the request to JSON (matching QCore format)
+    let serialized_request = serde_json::to_vec(&snapshot_request)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize snapshot request: {}", e))?;
+    
+    // Write to WAL file with length prefix (matching QCore format)
+    let mut wal_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&wal_path)
+        .await?;
+    
+    // Write length prefix (4 bytes little-endian) followed by the serialized data
+    let len_bytes = (serialized_request.len() as u32).to_le_bytes();
+    wal_file.write_all(&len_bytes).await?;
+    wal_file.write_all(&serialized_request).await?;
+    wal_file.flush().await?;
+    
+    info!("WAL file written: {} bytes total", 4 + serialized_request.len());
 
-    // Restore the snapshot
-    restore_json_snapshot_proxy!(&mut store, snapshot).await
-        .map_err(|e| anyhow::anyhow!("Failed to restore snapshot: {}", e))?;
-
-    info!("Snapshot restored successfully!");
+    info!("Snapshot restoration completed successfully!");
+    info!("Files created:");
+    info!("  - Snapshot: {}", snapshot_path.display());
+    info!("  - WAL: {}", wal_path.display());
+    info!("Start QCore with --data-dir {} --machine {} to use these files", 
+          target_data_dir.display(), machine_id);
 
     Ok(())
 }
@@ -219,4 +289,91 @@ async fn validate_snapshot(input_path: &PathBuf) -> Result<()> {
     info!("All validations passed. The snapshot file is valid.");
 
     Ok(())
+}
+
+/// Convert JsonSnapshot to internal Snapshot format
+async fn convert_json_to_internal_snapshot(json_snapshot: &JsonSnapshot) -> Result<Snapshot> {
+    let mut snapshot = Snapshot::default();
+    
+    // Convert schemas
+    for json_schema in &json_snapshot.schemas {
+        let entity_type = EntityType::from(json_schema.entity_type.clone());
+        let schema = json_schema.to_entity_schema()
+            .map_err(|e| anyhow::anyhow!("Failed to convert schema: {}", e))?;
+        snapshot.schemas.insert(entity_type.clone(), schema);
+        if !snapshot.types.contains(&entity_type) {
+            snapshot.types.push(entity_type);
+        }
+    }
+    
+    // Convert the entity tree to individual entities and fields
+    let mut entity_counters: HashMap<String, u64> = HashMap::new();
+    convert_json_entity_recursive(&json_snapshot.tree, None, &mut snapshot, &mut entity_counters)?;
+    
+    Ok(snapshot)
+}
+
+/// Recursively convert JsonEntity to internal format and populate snapshot
+fn convert_json_entity_recursive(
+    json_entity: &qlib_rs::JsonEntity, 
+    _parent_id: Option<EntityId>,
+    snapshot: &mut Snapshot,
+    entity_counters: &mut HashMap<String, u64>
+) -> Result<EntityId> {
+    let entity_type = EntityType::from(json_entity.entity_type.clone());
+    
+    // Generate a unique entity ID using a counter per type
+    let counter = entity_counters.entry(entity_type.as_ref().to_string()).or_insert(0);
+    let entity_id = EntityId::new(entity_type.as_ref(), *counter);
+    *counter += 1;
+    
+    // Add entity to the snapshot
+    snapshot.entities.entry(entity_type.clone()).or_insert_with(Vec::new).push(entity_id.clone());
+    
+    // Get the schema for this entity type
+    let schema = snapshot.schemas.get(&entity_type)
+        .ok_or_else(|| anyhow::anyhow!("Schema not found for entity type: {}", entity_type.as_ref()))?;
+    
+    // Convert field values
+    let mut entity_fields = HashMap::new();
+    
+    for (field_name, json_value) in &json_entity.fields {
+        if field_name == "Children" {
+            // Handle children specially - we'll process them after this entity
+            continue;
+        }
+        
+        let field_type = FieldType::from(field_name.clone());
+        if let Some(field_schema) = schema.fields.get(&field_type) {
+            match json_value_to_value(json_value, field_schema) {
+                Ok(value) => {
+                    let field = Field {
+                        field_type: field_type.clone(),
+                        value,
+                        write_time: std::time::SystemTime::now(),
+                        writer_id: None,
+                    };
+                    entity_fields.insert(field_type, field);
+                }
+                Err(e) => {
+                    warn!("Failed to convert field '{}': {}", field_name, e);
+                }
+            }
+        }
+    }
+    
+    snapshot.fields.insert(entity_id.clone(), entity_fields);
+    
+    // Handle children recursively
+    if let Some(children_json) = json_entity.fields.get("Children") {
+        if let Some(children_array) = children_json.as_array() {
+            for child_json_value in children_array {
+                if let Ok(child_json_entity) = serde_json::from_value::<qlib_rs::JsonEntity>(child_json_value.clone()) {
+                    let _ = convert_json_entity_recursive(&child_json_entity, Some(entity_id.clone()), snapshot, entity_counters)?;
+                }
+            }
+        }
+    }
+    
+    Ok(entity_id)
 }
