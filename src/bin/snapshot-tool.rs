@@ -86,8 +86,9 @@ async fn main() -> Result<()> {
 async fn take_snapshot(core_url: &str, output_path: &PathBuf, pretty: bool) -> Result<()> {
     info!("Connecting to Core service at: {}", core_url);
     
-    // Connect to the Core service
-    let mut store = StoreProxy::connect(core_url).await
+    // Connect to the Core service with authentication
+    // For the snapshot tool, we'll use default admin credentials
+    let mut store = StoreProxy::connect_and_authenticate(core_url, "admin", "admin123").await
         .map_err(|e| anyhow::anyhow!("Failed to connect to Core service: {}", e))?;
 
     info!("Connected successfully. Taking snapshot...");
@@ -166,8 +167,9 @@ async fn restore_snapshot(core_url: &str, input_path: &PathBuf, force: bool) -> 
 
     info!("Connecting to Core service at: {}", core_url);
     
-    // Connect to the Core service
-    let mut store = StoreProxy::connect(core_url).await
+    // Connect to the Core service with authentication
+    // For the snapshot tool, we'll use default admin credentials
+    let mut store = StoreProxy::connect_and_authenticate(core_url, "admin", "admin123").await
         .map_err(|e| anyhow::anyhow!("Failed to connect to Core service: {}", e))?;
 
     info!("Connected successfully. Restoring snapshot...");

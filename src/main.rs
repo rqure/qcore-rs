@@ -1,4 +1,5 @@
-use qlib_rs::{Snowflake, Store, StoreMessage, NotifyConfig, NotificationSender, notification_channel};
+use qlib_rs::{Snowflake, Store, StoreMessage, NotifyConfig, NotificationSender, notification_channel, AuthenticationResult, AuthConfig};
+use qlib_rs::auth::authenticate_subject;
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
@@ -141,6 +142,9 @@ struct AppState {
     /// Maps client address to a set of registered notification configurations
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
 
+    /// Track authenticated clients - maps client address to authenticated subject ID
+    authenticated_clients: HashMap<String, qlib_rs::EntityId>,
+
     // Data store
     store: Arc<RwLock<Store>>,
     
@@ -194,6 +198,7 @@ impl AppState {
             connected_clients: HashMap::new(),
             client_notification_senders: HashMap::new(),
             client_notification_configs: HashMap::new(),
+            authenticated_clients: HashMap::new(),
             store: Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new())))),
             current_wal_file: None,
             current_wal_size: 0,
@@ -682,8 +687,82 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     let ws_stream = accept_async(stream).await?;
     debug!("WebSocket connection established with client: {}", client_addr);
     
-    let (ws_sender, mut ws_receiver) = ws_stream.split();
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
+    // Wait for authentication message as the first message
+    let auth_timeout = tokio::time::timeout(Duration::from_secs(10), ws_receiver.next()).await;
+    
+    let first_message = match auth_timeout {
+        Ok(Some(Ok(Message::Text(text)))) => text,
+        Ok(Some(Ok(Message::Close(_)))) => {
+            info!("Client {} closed connection before authentication", client_addr);
+            return Ok(());
+        }
+        Ok(Some(Err(e))) => {
+            error!("WebSocket error from client {} during authentication: {}", client_addr, e);
+            return Ok(());
+        }
+        Ok(None) => {
+            info!("Client {} closed connection before authentication", client_addr);
+            return Ok(());
+        }
+        Ok(Some(Ok(_))) => {
+            error!("Client {} sent non-text message during authentication", client_addr);
+            let _ = ws_sender.close().await;
+            return Ok(());
+        }
+        Err(_) => {
+            info!("Client {} authentication timeout", client_addr);
+            let _ = ws_sender.close().await;
+            return Ok(());
+        }
+    };
+    
+    // Parse and validate authentication message
+    let auth_message = match serde_json::from_str::<StoreMessage>(&first_message) {
+        Ok(StoreMessage::Authenticate { .. }) => {
+            serde_json::from_str::<StoreMessage>(&first_message).unwrap()
+        }
+        _ => {
+            error!("Client {} first message was not authentication", client_addr);
+            let _ = ws_sender.close().await;
+            return Ok(());
+        }
+    };
+    
+    // Process authentication
+    let auth_response = process_store_message(auth_message, &app_state, Some(client_addr.to_string())).await;
+    
+    // Send authentication response
+    let auth_response_text = match serde_json::to_string(&auth_response) {
+        Ok(text) => text,
+        Err(e) => {
+            error!("Failed to serialize authentication response: {}", e);
+            let _ = ws_sender.close().await;
+            return Ok(());
+        }
+    };
+    
+    if let Err(e) = ws_sender.send(Message::Text(auth_response_text)).await {
+        error!("Failed to send authentication response to client {}: {}", client_addr, e);
+        return Ok(());
+    }
+    
+    // Check if authentication was successful
+    let is_authenticated = {
+        let state = app_state.read().await;
+        state.authenticated_clients.contains_key(&client_addr.to_string())
+    };
+    
+    if !is_authenticated {
+        info!("Client {} authentication failed, closing connection", client_addr);
+        let _ = ws_sender.close().await;
+        return Ok(());
+    }
+    
+    info!("Client {} authenticated successfully", client_addr);
+    
+    // Now proceed with normal client handling
     // Create a channel for sending messages to this client
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
     
@@ -733,9 +812,11 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
         // Remove client from connected_clients when outgoing task ends
         let mut state = app_state_clone.write().await;
         state.connected_clients.remove(&client_addr_clone);
+        state.authenticated_clients.remove(&client_addr_clone);
+        state.client_notification_senders.remove(&client_addr_clone);
     });
     
-    // Handle incoming messages from client
+    // Handle incoming messages from client (after successful authentication)
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
@@ -812,6 +893,9 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
         let notification_sender = state.client_notification_senders.remove(&client_addr_string);
         let client_configs = state.client_notification_configs.remove(&client_addr_string);
         
+        // Remove authentication state for this client
+        state.authenticated_clients.remove(&client_addr_string);
+        
         // Unregister all notifications for this client from the store
         if let Some(configs) = client_configs {
             if let Some(sender) = notification_sender {
@@ -858,9 +942,89 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
     let mut state = app_state.write().await;
     let machine = state.config.machine.clone();
     let store = &mut state.store;
-    let mut store_guard = store.write().await;
+    let store_guard = store.write().await;
 
     match message {
+        StoreMessage::Authenticate { id, subject_name, credential } => {
+            // Drop the store guard temporarily to avoid holding it during authentication
+            drop(store_guard);
+            drop(state);
+            
+            // Perform authentication
+            let auth_config = AuthConfig::default();
+            let store_for_auth = app_state.write().await.store.clone();
+            let mut store_guard_for_auth = store_for_auth.write().await;
+            
+            match authenticate_subject(&mut store_guard_for_auth, &subject_name, &credential, &auth_config).await {
+                Ok(subject_id) => {
+                    // Store authentication state
+                    if let Some(ref addr) = client_addr {
+                        let mut state = app_state.write().await;
+                        state.authenticated_clients.insert(addr.clone(), subject_id.clone());
+                    }
+                    
+                    // Create authentication result
+                    let auth_result = AuthenticationResult {
+                        subject_id: subject_id.clone(),
+                        subject_type: if subject_id.to_string().starts_with("user:") { 
+                            "User".to_string() 
+                        } else { 
+                            "Service".to_string() 
+                        },
+                    };
+                    
+                    StoreMessage::AuthenticateResponse {
+                        id,
+                        response: Ok(auth_result),
+                    }
+                }
+                Err(e) => StoreMessage::AuthenticateResponse {
+                    id,
+                    response: Err(format!("{:?}", e)),
+                },
+            }
+        }
+        
+        StoreMessage::AuthenticateResponse { .. } => {
+            // This should not be sent by clients, only by server
+            StoreMessage::Error {
+                id: "unknown".to_string(),
+                error: "Invalid message type".to_string(),
+            }
+        }
+        
+        // All other messages require authentication
+        _ => {
+            // Check if client is authenticated
+            let is_authenticated = if let Some(ref addr) = client_addr {
+                let state = app_state.read().await;
+                state.authenticated_clients.contains_key(addr)
+            } else {
+                false // No client address means not authenticated
+            };
+            
+            if !is_authenticated {
+                return StoreMessage::Error {
+                    id: "unknown".to_string(),
+                    error: "Authentication required".to_string(),
+                };
+            }
+            
+            // Reacquire locks for authenticated operations
+            let mut state = app_state.write().await;
+            let store = &mut state.store;
+            let mut store_guard = store.write().await;
+            
+            match message {
+        StoreMessage::Authenticate { .. } |
+        StoreMessage::AuthenticateResponse { .. } => {
+            // These are handled in the outer match, should not reach here
+            StoreMessage::Error {
+                id: "unknown".to_string(),
+                error: "Authentication messages should not reach this point".to_string(),
+            }
+        }
+        
         StoreMessage::GetEntitySchema { id, entity_type } => {
             match store_guard.get_entity_schema(&entity_type).await {
                 Ok(schema) => StoreMessage::GetEntitySchemaResponse {
@@ -1081,6 +1245,8 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
             StoreMessage::Error {
                 id: uuid::Uuid::new_v4().to_string(),
                 error: "Server received error message from client".to_string(),
+            }
+        }
             }
         }
     }

@@ -75,7 +75,14 @@
     {
       "_entityType": "User",
       "inheritsFrom": "Subject",
-      "fields": []
+      "fields": [
+        {
+          "name": "AuthMethod",
+          "dataType": "Choice",
+          "default": "Native",
+          "options": ["Native", "LDAP", "OpenID Connect"]
+        }
+      ]
     },
     {
       "_entityType": "Permission",
