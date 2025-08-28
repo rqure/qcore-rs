@@ -214,9 +214,9 @@ impl AppState {
             full_sync_request_pending: false,
             auth_cache: Cache::new(
                 store.clone(),
-                et::authorization_rule(),
+                et::permission(),
                 vec![ft::resource_type(), ft::resource_field()],
-                vec![ft::scope(), ft::test_fn()]
+                vec![ft::scope(), ft::program()]
             ).await?
         })
     }
