@@ -170,7 +170,7 @@ struct AppState {
     full_sync_request_pending: bool,
 
     /// Auth Cache
-    auth_cache: Cache,
+    auth_cache: Cache<Store>,
 }
 
 /// Information about a peer instance
