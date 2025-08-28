@@ -1,5 +1,5 @@
-use qlib_rs::{Snowflake, Store, StoreMessage, NotifyConfig, NotificationSender, notification_channel, AuthenticationResult, AuthConfig};
-use qlib_rs::auth::authenticate_subject;
+use qlib_rs::{et, ft, notification_channel, AuthConfig, AuthenticationResult, Cache, NotificationSender, NotifyConfig, Snowflake, Store, StoreMessage};
+use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn, error, debug};
 use clap::Parser;
 use anyhow::Result;
-use std::sync::Arc;
 use std::collections::{HashSet, HashMap};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
@@ -168,6 +168,9 @@ struct AppState {
 
     /// Whether a full sync request is pending (to avoid sending multiple)
     full_sync_request_pending: bool,
+
+    /// Auth Cache
+    auth_cache: Cache,
 }
 
 /// Information about a peer instance
@@ -179,13 +182,15 @@ struct PeerInfo {
 }
 
 impl AppState {
-    fn new(config: Config) -> Self {
+    async fn new(config: Config) -> Result<Self> {
         let startup_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        let store = Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new()))));
         
-        Self {
+        Ok(Self {
             config,
             startup_time,
             availability_state: AvailabilityState::Available,
@@ -199,7 +204,7 @@ impl AppState {
             client_notification_senders: HashMap::new(),
             client_notification_configs: HashMap::new(),
             authenticated_clients: HashMap::new(),
-            store: Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new())))),
+            store: store.clone(),
             current_wal_file: None,
             current_wal_size: 0,
             wal_file_counter: 0,
@@ -207,9 +212,15 @@ impl AppState {
             wal_files_since_snapshot: 0,
             became_unavailable_at: None,
             full_sync_request_pending: false,
-        }
+            auth_cache: Cache::new(
+                store.clone(),
+                et::authorization_rule(),
+                vec![ft::resource_type(), ft::resource_field()],
+                vec![ft::scope(), ft::test_fn()]
+            ).await?
+        })
     }
-
+    
     /// Get the machine-specific data directory
     fn get_machine_data_dir(&self) -> PathBuf {
         PathBuf::from(&self.config.data_dir).join(&self.config.machine)
@@ -938,24 +949,15 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
     } else {
         None
     };
-    
-    let mut state = app_state.write().await;
-    let machine = state.config.machine.clone();
-    let store = &mut state.store;
-    let store_guard = store.write().await;
 
     match message {
         StoreMessage::Authenticate { id, subject_name, credential } => {
-            // Drop the store guard temporarily to avoid holding it during authentication
-            drop(store_guard);
-            drop(state);
-            
             // Perform authentication
             let auth_config = AuthConfig::default();
-            let store_for_auth = app_state.write().await.store.clone();
-            let mut store_guard_for_auth = store_for_auth.write().await;
+            let store = app_state.write().await.store.clone();
+            let mut store_guard = store.write().await;
             
-            match authenticate_subject(&mut store_guard_for_auth, &subject_name, &credential, &auth_config).await {
+            match authenticate_subject(&mut store_guard, &subject_name, &credential, &auth_config).await {
                 Ok(subject_id) => {
                     // Store authentication state
                     if let Some(ref addr) = client_addr {
@@ -1010,243 +1012,357 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
                 };
             }
             
-            // Reacquire locks for authenticated operations
-            let mut state = app_state.write().await;
-            let store = &mut state.store;
-            let mut store_guard = store.write().await;
-            
             match message {
-        StoreMessage::Authenticate { .. } |
-        StoreMessage::AuthenticateResponse { .. } => {
-            // These are handled in the outer match, should not reach here
-            StoreMessage::Error {
-                id: "unknown".to_string(),
-                error: "Authentication messages should not reach this point".to_string(),
-            }
-        }
+                StoreMessage::Authenticate { .. } |
+                StoreMessage::AuthenticateResponse { .. } => {
+                    // These are handled in the outer match, should not reach here
+                    StoreMessage::Error {
+                        id: "unknown".to_string(),
+                        error: "Authentication messages should not reach this point".to_string(),
+                    }
+                }
         
-        StoreMessage::GetEntitySchema { id, entity_type } => {
-            match store_guard.get_entity_schema(&entity_type).await {
-                Ok(schema) => StoreMessage::GetEntitySchemaResponse {
-                    id,
-                    response: Ok(Some(schema)),
-                },
-                Err(e) => StoreMessage::GetEntitySchemaResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
-            match store_guard.get_complete_entity_schema(&entity_type).await {
-                Ok(schema) => StoreMessage::GetCompleteEntitySchemaResponse {
-                    id,
-                    response: Ok(schema),
-                },
-                Err(e) => StoreMessage::GetCompleteEntitySchemaResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
-            match store_guard.get_field_schema(&entity_type, &field_type).await {
-                Ok(schema) => StoreMessage::GetFieldSchemaResponse {
-                    id,
-                    response: Ok(Some(schema)),
-                },
-                Err(e) => StoreMessage::GetFieldSchemaResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::EntityExists { id, entity_id } => {
-            let exists = store_guard.entity_exists(&entity_id).await;
-            StoreMessage::EntityExistsResponse {
-                id,
-                response: exists,
-            }
-        }
-        
-        StoreMessage::FieldExists { id, entity_type, field_type } => {
-            let exists = store_guard.field_exists(&entity_type, &field_type).await;
-            StoreMessage::FieldExistsResponse {
-                id,
-                response: exists,
-            }
-        }
-        
-        StoreMessage::Perform { id, mut requests } => {
-            // Allow write operations on any peer
-            requests.iter_mut().for_each(|req| {
-                req.try_set_originator(machine.clone());
-            });
+                StoreMessage::GetEntitySchema { id, entity_type } => {
+                    match app_state
+                        .read().await
+                        .store
+                        .read().await
+                        .get_entity_schema(&entity_type).await {
+                        Ok(schema) => StoreMessage::GetEntitySchemaResponse {
+                            id,
+                            response: Ok(Some(schema)),
+                        },
+                        Err(e) => StoreMessage::GetEntitySchemaResponse {
+                            id,
+                            response: Err(format!("{:?}", e)),
+                        },
+                    }
+                }
+                
+                StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
+                    match app_state
+                        .read().await
+                        .store
+                        .read().await
+                        .get_complete_entity_schema(&entity_type).await {
+                        Ok(schema) => StoreMessage::GetCompleteEntitySchemaResponse {
+                            id,
+                            response: Ok(schema),
+                        },
+                        Err(e) => StoreMessage::GetCompleteEntitySchemaResponse {
+                            id,
+                            response: Err(format!("{:?}", e)),
+                        },
+                    }
+                }
+                
+                StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
+                    match app_state
+                        .read().await
+                        .store
+                        .read().await
+                        .get_field_schema(&entity_type, &field_type).await {
+                        Ok(schema) => StoreMessage::GetFieldSchemaResponse {
+                            id,
+                            response: Ok(Some(schema)),
+                        },
+                        Err(e) => StoreMessage::GetFieldSchemaResponse {
+                            id,
+                            response: Err(format!("{:?}", e)),
+                        },
+                    }
+                }
+                
+                StoreMessage::EntityExists { id, entity_id } => {
+                    let exists = app_state
+                        .read().await
+                        .store
+                        .read().await
+                        .entity_exists(&entity_id)
+                        .await;
+                    StoreMessage::EntityExistsResponse {
+                        id,
+                        response: exists,
+                    }
+                }
+                
+                StoreMessage::FieldExists { id, entity_type, field_type } => {
+                    let exists = app_state
+                        .read().await
+                        .store
+                        .read().await
+                        .field_exists(&entity_type, &field_type)
+                        .await;
+                    StoreMessage::FieldExistsResponse {
+                        id,
+                        response: exists,
+                    }
+                }
+                
+                StoreMessage::Perform { id, mut requests } => {
+                    // Check if the client is authorized to perform these requests
+                    if let Some(client_addr) = &client_addr {
+                        // Get the authenticated subject ID for this client
+                        let subject_id = {
+                            let state = app_state.read().await;
+                            state.authenticated_clients.get(client_addr).cloned()
+                        };
 
-            match store_guard.perform(&mut requests).await {
-                Ok(()) => StoreMessage::PerformResponse {
-                    id,
-                    response: Ok(requests),
-                },
-                Err(e) => StoreMessage::PerformResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::FindEntities { id, entity_type, page_opts } => {
-            match store_guard.find_entities_paginated(&entity_type, page_opts).await {
-                Ok(result) => StoreMessage::FindEntitiesResponse {
-                    id,
-                    response: Ok(result),
-                },
-                Err(e) => StoreMessage::FindEntitiesResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::FindEntitiesExact { id, entity_type, page_opts } => {
-            match store_guard.find_entities_exact(&entity_type, page_opts).await {
-                Ok(result) => StoreMessage::FindEntitiesExactResponse {
-                    id,
-                    response: Ok(result),
-                },
-                Err(e) => StoreMessage::FindEntitiesExactResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::GetEntityTypes { id, page_opts } => {
-            match store_guard.get_entity_types_paginated(page_opts).await {
-                Ok(result) => StoreMessage::GetEntityTypesResponse {
-                    id,
-                    response: Ok(result),
-                },
-                Err(e) => StoreMessage::GetEntityTypesResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
-            }
-        }
-        
-        StoreMessage::RegisterNotification { id, config } => {
-            // Register notification for this client
-            if let Some(client_addr) = &client_addr {
-                if let Some(ref notification_sender) = client_notification_sender {
-                    match store_guard.register_notification(config.clone(), notification_sender.clone()).await {
-                        Ok(()) => {
-                            // Track this notification config for this client
-                            // We need to drop the store_guard temporarily to access state mutably
-                            drop(store_guard);
-                            state.client_notification_configs
-                                .entry(client_addr.clone())
-                                .or_insert_with(HashSet::new)
-                                .insert(config);
+                        if let Some(subject_id) = subject_id {
+                            let auth_cache = &app_state.read().await.auth_cache;
+
+                            for request in &requests {
+                                    if let Some(entity_id) = request.entity_id() {
+                                        if let Some(field_type) = request.field_type() {
+                                            match get_scope(
+                                                app_state.read().await.store.clone(),
+                                                auth_cache,
+                                                &subject_id,
+                                                entity_id,
+                                                field_type,
+                                            ).await {
+                                                Ok(scope) => {
+                                                    if scope == AuthorizationScope::None {
+                                                        return StoreMessage::PerformResponse {
+                                                            id,
+                                                            response: Err(format!(
+                                                                "Access denied: Subject {} is not authorized to access {} on entity {}",
+                                                            subject_id,
+                                                            field_type,
+                                                            entity_id
+                                                        )),
+                                                    };
+                                                }
+                                                // For write operations, check if we have write access
+                                                if matches!(request, qlib_rs::Request::Write { .. } | qlib_rs::Request::Create { .. } | qlib_rs::Request::Delete { .. } | qlib_rs::Request::SchemaUpdate { .. }) {
+                                                    if scope == AuthorizationScope::ReadOnly {
+                                                        return StoreMessage::PerformResponse {
+                                                            id,
+                                                            response: Err(format!(
+                                                                "Access denied: Subject {} only has read access to {} on entity {}",
+                                                                subject_id,
+                                                                field_type,
+                                                                entity_id
+                                                            )),
+                                                        };
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                return StoreMessage::PerformResponse {
+                                                    id,
+                                                    response: Err(format!("Authorization check failed: {:?}", e)),
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            return StoreMessage::PerformResponse {
+                                id,
+                                response: Err("Client is not authenticated".to_string()),
+                            };
+                        }
+                    } else {
+                        return StoreMessage::PerformResponse {
+                            id,
+                            response: Err("Authorization cache not available".to_string()),
+                        };
+                    }
+
+                    let machine = app_state.read().await.config.machine.clone();
+
+                    // Allow write operations on any peer
+                    requests.iter_mut().for_each(|req| {
+                        req.try_set_originator(machine.clone());
+                    });
+
+                    match app_state
+                        .write().await
+                        .store
+                        .write().await
+                        .perform(&mut requests).await {
+                        Ok(()) => StoreMessage::PerformResponse {
+                            id,
+                            response: Ok(requests),
+                        },
+                        Err(e) => StoreMessage::PerformResponse {
+                            id,
+                            response: Err(format!("{:?}", e)),
+                        },
+                    }
+                }
+                
+                StoreMessage::FindEntities { id, entity_type, page_opts } => {
+                    match app_state
+                        .read().await
+                        .store
+                        .read().await
+                        .find_entities_paginated(&entity_type, page_opts).await {
+                        Ok(result) => StoreMessage::FindEntitiesResponse {
+                            id,
+                            response: Ok(result),
+                        },
+                        Err(e) => StoreMessage::FindEntitiesResponse {
+                            id,
+                            response: Err(format!("{:?}", e)),
+                        },
+                    }
+                }
+                
+                StoreMessage::FindEntitiesExact { id, entity_type, page_opts } => {
+                    match app_state
+                        .read().await
+                        .store
+                        .read().await
+                        .find_entities_exact(&entity_type, page_opts).await {
+                        Ok(result) => StoreMessage::FindEntitiesExactResponse {
+                            id,
+                            response: Ok(result),
+                        },
+                        Err(e) => StoreMessage::FindEntitiesExactResponse {
+                            id,
+                            response: Err(format!("{:?}", e)),
+                        },
+                    }
+                }
+                
+                StoreMessage::GetEntityTypes { id, page_opts } => {
+                    match app_state
+                        .read().await
+                        .store
+                        .read().await
+                        .get_entity_types_paginated(page_opts).await {
+                        Ok(result) => StoreMessage::GetEntityTypesResponse {
+                            id,
+                            response: Ok(result),
+                        },
+                        Err(e) => StoreMessage::GetEntityTypesResponse {
+                            id,
+                            response: Err(format!("{:?}", e)),
+                        },
+                    }
+                }
+                
+                StoreMessage::RegisterNotification { id, config } => {
+                    // Register notification for this client
+                    if let Some(client_addr) = &client_addr {
+                        if let Some(ref notification_sender) = client_notification_sender {
+                            match app_state
+                                .write().await
+                                .store
+                                .write().await
+                                .register_notification(config.clone(), notification_sender.clone()).await {
+                                Ok(()) => {
+                                    app_state
+                                        .write().await
+                                        .client_notification_configs
+                                        .entry(client_addr.clone())
+                                        .or_insert_with(HashSet::new)
+                                        .insert(config);
+                                    
+                                    debug!("Registered notification for client {}", client_addr);
+                                    StoreMessage::RegisterNotificationResponse {
+                                        id,
+                                        response: Ok(()),
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to register notification for client {}: {:?}", client_addr, e);
+                                    StoreMessage::RegisterNotificationResponse {
+                                        id,
+                                        response: Err(format!("Failed to register notification: {:?}", e)),
+                                    }
+                                }
+                            }
+                        } else {
+                            error!("No notification sender found for client {}", client_addr);
+                            StoreMessage::RegisterNotificationResponse {
+                                id,
+                                response: Err("Client notification sender not found".to_string()),
+                            }
+                        }
+                    } else {
+                        StoreMessage::RegisterNotificationResponse {
+                            id,
+                            response: Err("Client address not provided".to_string()),
+                        }
+                    }
+                }
+                
+                StoreMessage::UnregisterNotification { id, config } => {
+                    // Unregister notification for this client
+                    if let Some(client_addr) = &client_addr {
+                        if let Some(ref notification_sender) = client_notification_sender {
+                            let removed = app_state
+                                .write().await
+                                .store
+                                .write().await
+                                .unregister_notification(&config, notification_sender).await;
                             
-                            debug!("Registered notification for client {}", client_addr);
-                            StoreMessage::RegisterNotificationResponse {
+                            // Remove from client's tracked configs if successfully unregistered
+                            if removed {
+                                if let Some(client_configs) = app_state
+                                    .write().await
+                                    .client_notification_configs
+                                    .get_mut(client_addr) {
+                                    client_configs.remove(&config);
+                                }
+                            }
+                            
+                            debug!("Unregistered notification for client {}: removed: {}", client_addr, removed);
+                            StoreMessage::UnregisterNotificationResponse {
                                 id,
-                                response: Ok(()),
+                                response: removed,
+                            }
+                        } else {
+                            error!("No notification sender found for client {}", client_addr);
+                            StoreMessage::UnregisterNotificationResponse {
+                                id,
+                                response: false,
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to register notification for client {}: {:?}", client_addr, e);
-                            StoreMessage::RegisterNotificationResponse {
-                                id,
-                                response: Err(format!("Failed to register notification: {:?}", e)),
-                            }
+                    } else {
+                        StoreMessage::UnregisterNotificationResponse {
+                            id,
+                            response: false,
                         }
                     }
-                } else {
-                    error!("No notification sender found for client {}", client_addr);
-                    StoreMessage::RegisterNotificationResponse {
+                }
+                
+                // These message types should not be received by the server
+                StoreMessage::GetEntitySchemaResponse { id, .. } |
+                StoreMessage::GetCompleteEntitySchemaResponse { id, .. } |
+                StoreMessage::GetFieldSchemaResponse { id, .. } |
+                StoreMessage::EntityExistsResponse { id, .. } |
+                StoreMessage::FieldExistsResponse { id, .. } |
+                StoreMessage::PerformResponse { id, .. } |
+                StoreMessage::FindEntitiesResponse { id, .. } |
+                StoreMessage::FindEntitiesExactResponse { id, .. } |
+                StoreMessage::GetEntityTypesResponse { id, .. } |
+                StoreMessage::RegisterNotificationResponse { id, .. } |
+                StoreMessage::UnregisterNotificationResponse { id, .. } => {
+                    StoreMessage::Error {
                         id,
-                        response: Err("Client notification sender not found".to_string()),
+                        error: "Received response message on server - this should not happen".to_string(),
                     }
                 }
-            } else {
-                StoreMessage::RegisterNotificationResponse {
-                    id,
-                    response: Err("Client address not provided".to_string()),
-                }
-            }
-        }
-        
-        StoreMessage::UnregisterNotification { id, config } => {
-            // Unregister notification for this client
-            if let Some(client_addr) = &client_addr {
-                if let Some(ref notification_sender) = client_notification_sender {
-                    let removed = store_guard.unregister_notification(&config, notification_sender).await;
-                    
-                    // Remove from client's tracked configs if successfully unregistered
-                    if removed {
-                        // We need to drop the store_guard temporarily to access state mutably
-                        drop(store_guard);
-                        if let Some(client_configs) = state.client_notification_configs.get_mut(client_addr) {
-                            client_configs.remove(&config);
-                        }
-                    }
-                    
-                    debug!("Unregistered notification for client {}: removed: {}", client_addr, removed);
-                    StoreMessage::UnregisterNotificationResponse {
-                        id,
-                        response: removed,
-                    }
-                } else {
-                    error!("No notification sender found for client {}", client_addr);
-                    StoreMessage::UnregisterNotificationResponse {
-                        id,
-                        response: false,
+                
+                StoreMessage::Notification { .. } => {
+                    StoreMessage::Error {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        error: "Received notification message on server - this should not happen".to_string(),
                     }
                 }
-            } else {
-                StoreMessage::UnregisterNotificationResponse {
-                    id,
-                    response: false,
+                
+                StoreMessage::Error { id, error } => {
+                    warn!("Received error message from client: {} - {}", id, error);
+                    StoreMessage::Error {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        error: "Server received error message from client".to_string(),
+                    }
                 }
-            }
-        }
-        
-        // These message types should not be received by the server
-        StoreMessage::GetEntitySchemaResponse { id, .. } |
-        StoreMessage::GetCompleteEntitySchemaResponse { id, .. } |
-        StoreMessage::GetFieldSchemaResponse { id, .. } |
-        StoreMessage::EntityExistsResponse { id, .. } |
-        StoreMessage::FieldExistsResponse { id, .. } |
-        StoreMessage::PerformResponse { id, .. } |
-        StoreMessage::FindEntitiesResponse { id, .. } |
-        StoreMessage::FindEntitiesExactResponse { id, .. } |
-        StoreMessage::GetEntityTypesResponse { id, .. } |
-        StoreMessage::RegisterNotificationResponse { id, .. } |
-        StoreMessage::UnregisterNotificationResponse { id, .. } => {
-            StoreMessage::Error {
-                id,
-                error: "Received response message on server - this should not happen".to_string(),
-            }
-        }
-        
-        StoreMessage::Notification { .. } => {
-            StoreMessage::Error {
-                id: uuid::Uuid::new_v4().to_string(),
-                error: "Received notification message on server - this should not happen".to_string(),
-            }
-        }
-        
-        StoreMessage::Error { id, error } => {
-            warn!("Received error message from client: {} - {}", id, error);
-            StoreMessage::Error {
-                id: uuid::Uuid::new_v4().to_string(),
-                error: "Server received error message from client".to_string(),
-            }
-        }
             }
         }
     }
@@ -2233,7 +2349,7 @@ async fn main() -> Result<()> {
     info!(?config, "Starting Core service with configuration");
 
     // Create shared application state
-    let app_state = Arc::new(RwLock::new(AppState::new(config)));
+    let app_state = Arc::new(RwLock::new(AppState::new(config).await?));
 
     // Initialize the WAL file counter based on existing files
     {
