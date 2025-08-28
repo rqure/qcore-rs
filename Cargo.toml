@@ -26,7 +26,3 @@ tokio-tungstenite = "0.21"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.0", features = ["v4"] }
-
-# https://github.com/rscarson/rustyscript/issues/332
-[patch.crates-io]
-deno_media_type = { git = 'https://github.com/denoland/deno_media_type', tag = "0.2.6" }
