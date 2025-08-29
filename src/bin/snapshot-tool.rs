@@ -80,29 +80,33 @@ impl Progress {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-                .template("{spinner:.blue} {msg}")
+                .tick_strings(&["|", "/", "-", "\\"])
+                .template("{spinner} {msg}")
                 .unwrap(),
         );
         pb.set_message(msg.to_string());
-        pb.enable_steady_tick(Duration::from_millis(80));
+        pb.enable_steady_tick(Duration::from_millis(120));
         pb
     }
 
     fn success(msg: &str) {
-        println!("✅ {}", msg);
+        println!("[SUCCESS] {}", msg);
     }
 
     fn info(msg: &str) {
-        println!("ℹ️  {}", msg);
+        println!("[INFO] {}", msg);
     }
 
     fn warning(msg: &str) {
-        println!("⚠️  {}", msg);
+        println!("[WARNING] {}", msg);
     }
 
     fn error(msg: &str) {
-        eprintln!("❌ {}", msg);
+        eprintln!("[ERROR] {}", msg);
+    }
+
+    fn step(step: usize, total: usize, msg: &str) {
+        println!("[{}/{}] {}", step, total, msg);
     }
 }
 
@@ -144,27 +148,31 @@ async fn take_snapshot(
     output_path: &PathBuf, 
     pretty: bool
 ) -> Result<()> {
-    let spinner = Progress::new_spinner("Connecting to QCore service");
+    Progress::step(1, 4, "Connecting to QCore service");
+    let spinner = Progress::new_spinner("Establishing connection...");
     
     // Connect to the Core service with authentication
     let mut store = StoreProxy::connect_and_authenticate(core_url, username, password).await
         .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
 
-    spinner.finish_with_message("✅ Connected to QCore service");
+    spinner.finish_with_message("Connected successfully");
 
-    let spinner = Progress::new_spinner("Taking snapshot");
+    Progress::step(2, 4, "Taking snapshot from QCore service");
+    let spinner = Progress::new_spinner("Retrieving schemas and entities...");
 
     // Take the JSON snapshot using the library function
     let snapshot = take_json_snapshot(&mut store).await
         .context("Failed to take snapshot")?;
 
+    let entity_count = count_entities_in_tree(&snapshot.tree);
     spinner.finish_with_message(format!(
-        "✅ Snapshot taken ({} schemas, {} root fields)", 
+        "Snapshot captured: {} schemas, {} entities in tree", 
         snapshot.schemas.len(),
-        snapshot.tree.fields.len()
+        entity_count
     ));
 
-    let spinner = Progress::new_spinner("Serializing snapshot");
+    Progress::step(3, 4, "Serializing snapshot data");
+    let spinner = Progress::new_spinner("Converting to JSON format...");
 
     // Serialize the snapshot to JSON
     let json_content = if pretty {
@@ -175,20 +183,55 @@ async fn take_snapshot(
             .context("Failed to serialize snapshot to JSON")?
     };
 
-    spinner.finish_with_message("✅ Snapshot serialized");
+    spinner.finish_with_message(format!("Serialized {} bytes", json_content.len()));
     
-    let spinner = Progress::new_spinner("Writing to file");
+    Progress::step(4, 4, "Writing snapshot to file");
+    let spinner = Progress::new_spinner("Saving to disk...");
 
     // Write to file
     write(output_path, json_content.as_bytes()).await
         .with_context(|| format!("Failed to write snapshot to {}", output_path.display()))?;
 
-    spinner.finish_with_message("✅ File written");
+    spinner.finish_with_message("File saved successfully");
 
     Progress::success(&format!("Snapshot saved to {}", output_path.display()));
     Progress::info(&format!("File size: {} bytes", json_content.len()));
 
     Ok(())
+}
+
+/// Count total entities in the JSON entity tree
+fn count_entities_in_tree(entity: &qlib_rs::JsonEntity) -> usize {
+    let mut count = 1; // Count this entity
+    
+    if let Some(children) = entity.fields.get("Children") {
+        if let Some(children_array) = children.as_array() {
+            for child_value in children_array {
+                if let Ok(child_entity) = serde_json::from_value::<qlib_rs::JsonEntity>(child_value.clone()) {
+                    count += count_entities_in_tree(&child_entity);
+                }
+            }
+        }
+    }
+    
+    count
+}
+
+/// Count entities by type in the JSON entity tree
+fn count_entities_by_type(entity: &qlib_rs::JsonEntity, counts: &mut HashMap<String, usize>) {
+    // Count this entity
+    *counts.entry(entity.entity_type.clone()).or_insert(0) += 1;
+    
+    // Recursively count children
+    if let Some(children) = entity.fields.get("Children") {
+        if let Some(children_array) = children.as_array() {
+            for child_value in children_array {
+                if let Ok(child_entity) = serde_json::from_value::<qlib_rs::JsonEntity>(child_value.clone()) {
+                    count_entities_by_type(&child_entity, counts);
+                }
+            }
+        }
+    }
 }
 
 /// Restore a snapshot from a file by generating snapshot and WAL files in the target data directory
@@ -198,38 +241,45 @@ async fn restore_snapshot(
     data_dir: Option<PathBuf>, 
     machine_id: String
 ) -> Result<()> {
-    let spinner = Progress::new_spinner("Loading snapshot file");
+    Progress::step(1, 6, "Loading snapshot file");
+    let spinner = Progress::new_spinner("Reading and parsing JSON...");
 
     // Read and parse the snapshot file
     let snapshot = load_json_snapshot(input_path).await?;
+    let entity_count = count_entities_in_tree(&snapshot.tree);
     
-    spinner.finish_with_message(format!("✅ Snapshot loaded ({} schemas)", snapshot.schemas.len()));
+    spinner.finish_with_message(format!("Loaded {} schemas, {} entities", snapshot.schemas.len(), entity_count));
 
+    Progress::step(2, 6, "Preparing target directories");
     // Determine target directories
     let target_data_dir = data_dir.unwrap_or_else(|| PathBuf::from("./data"));
     let directories = create_target_directories(&target_data_dir, &machine_id, force).await?;
 
-    let spinner = Progress::new_spinner("Converting snapshot format");
+    Progress::step(3, 6, "Converting snapshot format");
+    let spinner = Progress::new_spinner("Converting JSON to internal format...");
 
     // Convert JsonSnapshot to internal Snapshot format
     let internal_snapshot = convert_json_to_internal_snapshot(&snapshot).await?;
 
-    spinner.finish_with_message("✅ Snapshot converted");
+    spinner.finish_with_message(format!("Converted {} entity types", internal_snapshot.types.len()));
 
-    let spinner = Progress::new_spinner("Writing snapshot binary");
+    Progress::step(4, 6, "Writing snapshot binary");
+    let spinner = Progress::new_spinner("Serializing to binary format...");
 
     // Write snapshot binary file
     write_snapshot_file(&directories.snapshots, &internal_snapshot).await?;
 
-    spinner.finish_with_message("✅ Snapshot binary written");
+    spinner.finish_with_message("Binary snapshot created");
 
-    let spinner = Progress::new_spinner("Writing WAL file");
+    Progress::step(5, 6, "Writing WAL file");
+    let spinner = Progress::new_spinner("Creating write-ahead log...");
 
     // Write WAL file with snapshot marker
     write_wal_file(&directories.wal).await?;
 
-    spinner.finish_with_message("✅ WAL file written");
+    spinner.finish_with_message("WAL file created");
 
+    Progress::step(6, 6, "Restoration complete");
     Progress::success("Snapshot restoration completed successfully!");
     Progress::info(&format!("Files created in: {}", target_data_dir.display()));
     Progress::info(&format!("Start QCore with: --data-dir {} --machine {}", target_data_dir.display(), machine_id));
@@ -339,21 +389,24 @@ async fn write_wal_file(wal_dir: &PathBuf) -> Result<()> {
 
 /// Validate a snapshot file without restoring it
 async fn validate_snapshot(input_path: &PathBuf) -> Result<()> {
-    let spinner = Progress::new_spinner("Validating snapshot file");
+    Progress::step(1, 3, "Loading snapshot file");
+    let spinner = Progress::new_spinner("Reading and parsing JSON...");
 
     // Read and parse the snapshot file
     let snapshot = load_json_snapshot(input_path).await?;
 
-    spinner.finish_with_message("✅ JSON structure is valid");
+    spinner.finish_with_message("JSON structure is valid");
 
+    Progress::step(2, 3, "Analyzing snapshot contents");
     print_snapshot_summary(&snapshot);
 
-    let spinner = Progress::new_spinner("Validating schemas");
+    Progress::step(3, 3, "Validating schemas");
+    let spinner = Progress::new_spinner("Checking schema definitions...");
 
     // Validate that all schemas can be converted to internal format
     validate_schemas(&snapshot.schemas)?;
 
-    spinner.finish_with_message("✅ All schemas are valid");
+    spinner.finish_with_message("All schemas are valid");
 
     Progress::success("Snapshot file is valid and ready for use!");
     Ok(())
@@ -361,6 +414,8 @@ async fn validate_snapshot(input_path: &PathBuf) -> Result<()> {
 
 /// Print a summary of the snapshot contents
 fn print_snapshot_summary(snapshot: &JsonSnapshot) {
+    let total_entity_count = count_entities_in_tree(&snapshot.tree);
+    
     Progress::info(&format!("Snapshot contains {} schemas:", snapshot.schemas.len()));
     
     for schema in &snapshot.schemas {
@@ -369,11 +424,17 @@ fn print_snapshot_summary(snapshot: &JsonSnapshot) {
         } else {
             String::new()
         };
-        Progress::info(&format!("  • {} ({} fields){}", schema.entity_type, schema.fields.len(), inheritance));
+        Progress::info(&format!("  - {} ({} fields){}", schema.entity_type, schema.fields.len(), inheritance));
     }
-
-    Progress::info(&format!("Root entity type: {}", snapshot.tree.entity_type));
-    Progress::info(&format!("Root entity has {} fields", snapshot.tree.fields.len()));
+    
+    // Count entities by type
+    let mut entity_counts: HashMap<String, usize> = HashMap::new();
+    count_entities_by_type(&snapshot.tree, &mut entity_counts);
+    
+    Progress::info(&format!("Entity breakdown ({} total):", total_entity_count));
+    for (entity_type, count) in entity_counts.iter() {
+        Progress::info(&format!("  - {}: {}", entity_type, count));
+    }
 }
 
 /// Validate that all schemas can be converted to internal format
@@ -394,7 +455,9 @@ async fn convert_json_to_internal_snapshot(json_snapshot: &JsonSnapshot) -> Resu
     
     // Convert the entity tree to individual entities and fields
     let mut entity_counters: HashMap<String, u64> = HashMap::new();
-    convert_json_entity_recursive(&json_snapshot.tree, None, &mut snapshot, &mut entity_counters)?;
+    let mut total_entities = 0;
+    
+    convert_json_entity_recursive(&json_snapshot.tree, None, &mut snapshot, &mut entity_counters, &mut total_entities)?;
     
     Ok(snapshot)
 }
@@ -419,7 +482,8 @@ fn convert_json_entity_recursive(
     json_entity: &qlib_rs::JsonEntity, 
     _parent_id: Option<EntityId>,
     snapshot: &mut Snapshot,
-    entity_counters: &mut HashMap<String, u64>
+    entity_counters: &mut HashMap<String, u64>,
+    total_entities: &mut usize,
 ) -> Result<EntityId> {
     let entity_type = EntityType::from(json_entity.entity_type.clone());
     
@@ -427,6 +491,7 @@ fn convert_json_entity_recursive(
     let counter = entity_counters.entry(entity_type.as_ref().to_string()).or_insert(0);
     let entity_id = EntityId::new(entity_type.as_ref(), *counter);
     *counter += 1;
+    *total_entities += 1;
     
     // Add entity to the snapshot
     snapshot.entities.entry(entity_type.clone()).or_insert_with(Vec::new).push(entity_id.clone());
@@ -440,7 +505,7 @@ fn convert_json_entity_recursive(
     snapshot.fields.insert(entity_id.clone(), entity_fields);
     
     // Handle children recursively
-    handle_entity_children(json_entity, &entity_id, snapshot, entity_counters)?;
+    handle_entity_children(json_entity, &entity_id, snapshot, entity_counters, total_entities)?;
     
     Ok(entity_id)
 }
@@ -475,18 +540,19 @@ fn convert_entity_fields(
     Ok(entity_fields)
 }
 
-/// Handle children entities recursively
+/// Handle the children of an entity during recursive conversion
 fn handle_entity_children(
     json_entity: &qlib_rs::JsonEntity,
     entity_id: &EntityId,
     snapshot: &mut Snapshot,
-    entity_counters: &mut HashMap<String, u64>
+    entity_counters: &mut HashMap<String, u64>,
+    total_entities: &mut usize,
 ) -> Result<()> {
     if let Some(children_json) = json_entity.fields.get("Children") {
         if let Some(children_array) = children_json.as_array() {
             for child_json_value in children_array {
                 if let Ok(child_json_entity) = serde_json::from_value::<qlib_rs::JsonEntity>(child_json_value.clone()) {
-                    let _ = convert_json_entity_recursive(&child_json_entity, Some(entity_id.clone()), snapshot, entity_counters)?;
+                    let _ = convert_json_entity_recursive(&child_json_entity, Some(entity_id.clone()), snapshot, entity_counters, total_entities)?;
                 }
             }
         }
