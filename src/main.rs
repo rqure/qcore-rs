@@ -1,10 +1,10 @@
-use qlib_rs::{et, ft, notification_channel, AuthConfig, AuthenticationResult, Cache, NotificationSender, NotifyConfig, Snowflake, Store, StoreMessage};
+use qlib_rs::{et, ft, notification_channel, AuthConfig, AuthenticationResult, Cache, NotificationSender, NotifyConfig, Snowflake, AsyncStore, StoreTrait, StoreMessage, CelExecutor};
 use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc};
 use tracing::{info, warn, error, debug};
 use clap::Parser;
 use anyhow::Result;
@@ -146,7 +146,7 @@ struct AppState {
     authenticated_clients: HashMap<String, qlib_rs::EntityId>,
 
     // Data store
-    store: Arc<RwLock<Store>>,
+    store: Arc<RwLock<AsyncStore>>,
     
     /// Current WAL file handle
     current_wal_file: Option<File>,
@@ -169,8 +169,11 @@ struct AppState {
     /// Whether a full sync request is pending (to avoid sending multiple)
     full_sync_request_pending: bool,
 
-    /// Auth Cache
-    auth_cache: Cache<Store>,
+    /// Permission Cache
+    permission_cache: Cache<AsyncStore>,
+
+    /// CEL Executor for evaluating authorization conditions
+    cel_executor: CelExecutor,
 }
 
 /// Information about a peer instance
@@ -188,7 +191,7 @@ impl AppState {
             .unwrap_or_default()
             .as_secs();
 
-        let store = Arc::new(RwLock::new(Store::new(Arc::new(Snowflake::new()))));
+        let store = Arc::new(RwLock::new(AsyncStore::new(Arc::new(Snowflake::new()))));
         
         Ok(Self {
             config,
@@ -212,12 +215,13 @@ impl AppState {
             wal_files_since_snapshot: 0,
             became_unavailable_at: None,
             full_sync_request_pending: false,
-            auth_cache: Cache::new(
+            permission_cache: Cache::new(
                 store.clone(),
                 et::permission(),
                 vec![ft::resource_type(), ft::resource_field()],
-                vec![ft::scope(), ft::program()]
-            ).await?
+                vec![ft::scope(), ft::condition()]
+            ).await?,
+            cel_executor: CelExecutor::new(),
         })
     }
     
@@ -498,7 +502,7 @@ async fn handle_peer_message(
                 let state = app_state.read().await;
                 let store = &state.store;
                 let store_guard = store.read().await;
-                store_guard.take_snapshot()
+                store_guard.inner().take_snapshot()
             };
             
             let response = PeerMessage::FullSyncResponse { snapshot };
@@ -521,9 +525,9 @@ async fn handle_peer_message(
                 let mut state = app_state.write().await;
                 let store = &mut state.store;
                 let mut store_guard = store.write().await;
-                store_guard.disable_notifications();
-                store_guard.restore_snapshot(snapshot.clone());
-                store_guard.enable_notifications();
+                store_guard.inner_mut().disable_notifications();
+                store_guard.inner_mut().restore_snapshot(snapshot.clone());
+                store_guard.inner_mut().enable_notifications();
                 drop(store_guard);
                 state.is_fully_synced = true;
                 state.full_sync_request_pending = false; // Reset pending flag since we got a response
@@ -1109,14 +1113,15 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
                         };
 
                         if let Some(subject_id) = subject_id {
-                            let auth_cache = &app_state.read().await.auth_cache;
+                            let permission_cache = &app_state.read().await.permission_cache;
 
                             for request in &requests {
                                     if let Some(entity_id) = request.entity_id() {
                                         if let Some(field_type) = request.field_type() {
                                             match get_scope(
                                                 app_state.read().await.store.clone(),
-                                                auth_cache,
+                                                &mut app_state.write().await.cel_executor,
+                                                permission_cache,
                                                 &subject_id,
                                                 entity_id,
                                                 field_type,
@@ -1484,7 +1489,7 @@ async fn consume_write_channel(app_state: Arc<RwLock<AppState>>) -> Result<()> {
         let state = app_state.read().await;
         let store = &state.store;
         let store_guard = store.read().await;
-        store_guard.get_write_channel_receiver()
+        store_guard.inner().get_write_channel_receiver()
     };
     
     loop {
@@ -1689,7 +1694,7 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<RwLock<
             let snapshot = {
                 let store = &state.store;
                 let store_guard = store.read().await;
-                store_guard.take_snapshot()
+                store_guard.inner().take_snapshot()
             };
             
             drop(state); // Release the lock before calling save_snapshot
@@ -1947,7 +1952,7 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>) -> Result<()> {
         let mut state = app_state.write().await;
         let store = &mut state.store;
         let mut store_guard = store.write().await;
-        store_guard.disable_notifications();
+        store_guard.inner_mut().disable_notifications();
         info!("Notifications disabled for WAL replay");
     }
     
@@ -1986,7 +1991,7 @@ async fn replay_wal_files(app_state: Arc<RwLock<AppState>>) -> Result<()> {
         let mut state = app_state.write().await;
         let store = &mut state.store;
         let mut store_guard = store.write().await;
-        store_guard.enable_notifications();
+        store_guard.inner_mut().enable_notifications();
         info!("Notifications re-enabled after WAL replay");
     }
     
@@ -2369,9 +2374,9 @@ async fn main() -> Result<()> {
         let mut state = app_state.write().await;
         let store = &mut state.store;
         let mut store_guard = store.write().await;
-        store_guard.disable_notifications();
-        store_guard.restore_snapshot(snapshot);
-        store_guard.enable_notifications();
+        store_guard.inner_mut().disable_notifications();
+        store_guard.inner_mut().restore_snapshot(snapshot);
+        store_guard.inner_mut().enable_notifications();
         drop(store_guard);
         
         state.snapshot_file_counter = next_snapshot_counter;
@@ -2443,7 +2448,7 @@ async fn main() -> Result<()> {
         let state = app_state.read().await;
         let store = &state.store;
         let store_guard = store.read().await;
-        store_guard.take_snapshot()
+        store_guard.inner().take_snapshot()
     };
     
     match save_snapshot(&snapshot, app_state.clone()).await {
