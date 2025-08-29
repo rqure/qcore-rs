@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use qlib_rs::{
-    StoreProxy, JsonSnapshot, JsonEntitySchema,
+    StoreProxy, JsonSnapshot, JsonEntitySchema, JsonEntity,
     take_json_snapshot, factory_restore_json_snapshot, restore_json_snapshot_via_proxy
 };
 use serde_json;
@@ -68,12 +68,34 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
     },
+    /// Report: Connect to QCore service and show a diff of what would be changed by restore
+    Report {
+        /// Input file path containing the JSON snapshot
+        #[arg(short, long)]
+        input: PathBuf,
+        
+        /// Output the report to a file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        
+        /// Output format for the report
+        #[arg(long, default_value = "text")]
+        format: ReportFormat,
+    },
     /// Validate a JSON snapshot file without restoring it
     Validate {
         /// Input file path containing the JSON snapshot to validate
         #[arg(short, long)]
         input: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum ReportFormat {
+    /// Human-readable text format
+    Text,
+    /// JSON format for programmatic use
+    Json,
 }
 
 /// Progress bar helpers for better UX
@@ -131,6 +153,9 @@ async fn main() -> Result<()> {
         }
         Commands::Restore { input } => {
             normal_restore_snapshot(&config.core_url, &username, &password, &input).await
+        }
+        Commands::Report { input, output, format } => {
+            report_snapshot_diff(&config.core_url, &username, &password, &input, output, format).await
         }
         Commands::Validate { input } => {
             validate_snapshot(&input).await
@@ -336,6 +361,69 @@ async fn normal_restore_snapshot(
     Ok(())
 }
 
+/// Generate a report showing what would be changed by a restore operation
+async fn report_snapshot_diff(
+    core_url: &str,
+    username: &str,
+    password: &str,
+    input_path: &PathBuf,
+    output_path: Option<PathBuf>,
+    format: ReportFormat,
+) -> Result<()> {
+    Progress::step(1, 4, "Loading snapshot file");
+    let spinner = Progress::new_spinner("Reading and parsing JSON...");
+
+    // Read and parse the snapshot file
+    let target_snapshot = load_json_snapshot(input_path).await?;
+    let entity_count = count_entities_in_tree(&target_snapshot.tree);
+    
+    spinner.finish_with_message(format!("Loaded {} schemas, {} entities", target_snapshot.schemas.len(), entity_count));
+
+    Progress::step(2, 4, "Connecting to QCore service");
+    let spinner = Progress::new_spinner("Establishing connection...");
+    
+    // Connect to the Core service with authentication
+    let mut store = StoreProxy::connect_and_authenticate(core_url, username, password).await
+        .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
+
+    spinner.finish_with_message("Connected successfully");
+
+    Progress::step(3, 4, "Taking current snapshot");
+    let spinner = Progress::new_spinner("Retrieving current state...");
+
+    // Take current snapshot to compute diff
+    let current_snapshot = take_json_snapshot(&mut store).await
+        .context("Failed to take current snapshot")?;
+
+    spinner.finish_with_message("Current state captured");
+
+    Progress::step(4, 4, "Computing differences");
+    let spinner = Progress::new_spinner("Analyzing changes...");
+
+    // Compute differences
+    let diff_report = compute_snapshot_diff(&current_snapshot, &target_snapshot)?;
+
+    spinner.finish_with_message("Differences computed");
+
+    // Format and output the report
+    let report_content = match format {
+        ReportFormat::Text => format_diff_report_text(&diff_report),
+        ReportFormat::Json => format_diff_report_json(&diff_report)?,
+    };
+
+    if let Some(output) = output_path {
+        tokio::fs::write(&output, report_content.as_bytes()).await
+            .with_context(|| format!("Failed to write report to {}", output.display()))?;
+        Progress::success(&format!("Report written to {}", output.display()));
+    } else {
+        println!("{}", report_content);
+    }
+
+    Progress::success("Report generation completed successfully!");
+
+    Ok(())
+}
+
 /// Load and parse a JSON snapshot file
 async fn load_json_snapshot(input_path: &PathBuf) -> Result<JsonSnapshot> {
     let json_content = read_to_string(input_path).await
@@ -402,4 +490,305 @@ fn validate_schemas(schemas: &[JsonEntitySchema]) -> Result<()> {
             .with_context(|| format!("Schema validation failed for '{}'", schema.entity_type))?;
     }
     Ok(())
+}
+
+/// Represents the differences between two snapshots
+#[derive(Debug, Clone, serde::Serialize)]
+struct SnapshotDiff {
+    schema_changes: Vec<SchemaChange>,
+    entity_changes: Vec<EntityChange>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+enum SchemaChange {
+    Added(JsonEntitySchema),
+    Modified { 
+        entity_type: String, 
+        current: JsonEntitySchema, 
+        target: JsonEntitySchema 
+    },
+    Removed(JsonEntitySchema),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+enum EntityChange {
+    Added(JsonEntity),
+    Modified { 
+        path: String,
+        current: JsonEntity, 
+        target: JsonEntity,
+        field_changes: Vec<FieldChange>,
+    },
+    Removed(JsonEntity),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct FieldChange {
+    field_name: String,
+    current_value: Option<serde_json::Value>,
+    target_value: Option<serde_json::Value>,
+}
+
+/// Compute the differences between current and target snapshots
+fn compute_snapshot_diff(current: &JsonSnapshot, target: &JsonSnapshot) -> Result<SnapshotDiff> {
+    let mut schema_changes = Vec::new();
+    let mut entity_changes = Vec::new();
+
+    // Compare schemas
+    let current_schemas: std::collections::HashMap<String, &JsonEntitySchema> = current.schemas
+        .iter()
+        .map(|s| (s.entity_type.clone(), s))
+        .collect();
+    
+    let target_schemas: std::collections::HashMap<String, &JsonEntitySchema> = target.schemas
+        .iter()
+        .map(|s| (s.entity_type.clone(), s))
+        .collect();
+
+    // Find added and modified schemas
+    for (entity_type, target_schema) in &target_schemas {
+        match current_schemas.get(entity_type) {
+            Some(current_schema) => {
+                // Check if schema changed
+                if !schemas_equal(current_schema, target_schema) {
+                    schema_changes.push(SchemaChange::Modified {
+                        entity_type: entity_type.clone(),
+                        current: (*current_schema).clone(),
+                        target: (*target_schema).clone(),
+                    });
+                }
+            }
+            None => {
+                schema_changes.push(SchemaChange::Added((*target_schema).clone()));
+            }
+        }
+    }
+
+    // Find removed schemas
+    for (entity_type, current_schema) in &current_schemas {
+        if !target_schemas.contains_key(entity_type) {
+            schema_changes.push(SchemaChange::Removed((*current_schema).clone()));
+        }
+    }
+
+    // Compare entity trees
+    compare_entities_recursive(&current.tree, &target.tree, "Root".to_string(), &mut entity_changes)?;
+
+    Ok(SnapshotDiff {
+        schema_changes,
+        entity_changes,
+    })
+}
+
+/// Compare two schemas for equality (simplified)
+fn schemas_equal(a: &JsonEntitySchema, b: &JsonEntitySchema) -> bool {
+    serde_json::to_string(a).unwrap_or_default() == serde_json::to_string(b).unwrap_or_default()
+}
+
+/// Recursively compare entities in the tree
+fn compare_entities_recursive(
+    current_entity: &JsonEntity,
+    target_entity: &JsonEntity,
+    path: String,
+    changes: &mut Vec<EntityChange>,
+) -> Result<()> {
+    // Check if entity types match
+    if current_entity.entity_type != target_entity.entity_type {
+        // This is essentially a remove + add
+        changes.push(EntityChange::Removed(current_entity.clone()));
+        changes.push(EntityChange::Added(target_entity.clone()));
+        return Ok(());
+    }
+
+    // Compare field values
+    let mut field_changes = Vec::new();
+    let mut all_field_names = std::collections::HashSet::new();
+    
+    for field_name in current_entity.fields.keys() {
+        all_field_names.insert(field_name.clone());
+    }
+    for field_name in target_entity.fields.keys() {
+        all_field_names.insert(field_name.clone());
+    }
+
+    for field_name in &all_field_names {
+        if field_name == "Children" {
+            continue; // Handle children separately
+        }
+
+        let current_value = current_entity.fields.get(field_name);
+        let target_value = target_entity.fields.get(field_name);
+
+        if current_value != target_value {
+            field_changes.push(FieldChange {
+                field_name: field_name.clone(),
+                current_value: current_value.cloned(),
+                target_value: target_value.cloned(),
+            });
+        }
+    }
+
+    if !field_changes.is_empty() {
+        changes.push(EntityChange::Modified {
+            path: path.clone(),
+            current: current_entity.clone(),
+            target: target_entity.clone(),
+            field_changes,
+        });
+    }
+
+    // Compare children
+    let current_children = current_entity.fields.get("Children")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    
+    let target_children = target_entity.fields.get("Children")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    // Simple comparison: match by name and entity type
+    let current_children_map: std::collections::HashMap<String, &serde_json::Value> = current_children
+        .iter()
+        .filter_map(|child| {
+            let entity_type = child.get("entityType")?.as_str()?;
+            let name = child.get("Name")?.as_str()?;
+            Some((format!("{}:{}", entity_type, name), *child))
+        })
+        .collect();
+
+    let target_children_map: std::collections::HashMap<String, &serde_json::Value> = target_children
+        .iter()
+        .filter_map(|child| {
+            let entity_type = child.get("entityType")?.as_str()?;
+            let name = child.get("Name")?.as_str()?;
+            Some((format!("{}:{}", entity_type, name), *child))
+        })
+        .collect();
+
+    // Find added, modified, and removed children
+    for (key, target_child) in &target_children_map {
+        let child_path = format!("{}/{}", path, key.split(':').nth(1).unwrap_or("Unknown"));
+        
+        match current_children_map.get(key) {
+            Some(current_child) => {
+                // Compare this child
+                let current_entity = serde_json::from_value::<JsonEntity>((*current_child).clone())
+                    .context("Failed to parse current child entity")?;
+                let target_entity = serde_json::from_value::<JsonEntity>((*target_child).clone())
+                    .context("Failed to parse target child entity")?;
+                
+                compare_entities_recursive(&current_entity, &target_entity, child_path, changes)?;
+            }
+            None => {
+                // Child added
+                let target_entity = serde_json::from_value::<JsonEntity>((*target_child).clone())
+                    .context("Failed to parse target child entity")?;
+                changes.push(EntityChange::Added(target_entity));
+            }
+        }
+    }
+
+    // Find removed children
+    for (key, current_child) in &current_children_map {
+        if !target_children_map.contains_key(key) {
+            let current_entity = serde_json::from_value::<JsonEntity>((*current_child).clone())
+                .context("Failed to parse current child entity")?;
+            changes.push(EntityChange::Removed(current_entity));
+        }
+    }
+
+    Ok(())
+}
+
+/// Format the diff report as human-readable text
+fn format_diff_report_text(diff: &SnapshotDiff) -> String {
+    let mut report = String::new();
+    
+    report.push_str("=== SNAPSHOT DIFFERENCE REPORT ===\n\n");
+
+    // Schema changes
+    if !diff.schema_changes.is_empty() {
+        report.push_str("SCHEMA CHANGES:\n");
+        report.push_str("===============\n");
+        
+        for change in &diff.schema_changes {
+            match change {
+                SchemaChange::Added(schema) => {
+                    report.push_str(&format!("+ ADDED SCHEMA: {}\n", schema.entity_type));
+                    if let Some(ref inherits) = schema.inherits_from {
+                        report.push_str(&format!("  Inherits from: {}\n", inherits));
+                    }
+                    report.push_str(&format!("  Fields: {}\n", schema.fields.len()));
+                }
+                SchemaChange::Modified { entity_type, .. } => {
+                    report.push_str(&format!("~ MODIFIED SCHEMA: {}\n", entity_type));
+                }
+                SchemaChange::Removed(schema) => {
+                    report.push_str(&format!("- REMOVED SCHEMA: {}\n", schema.entity_type));
+                }
+            }
+        }
+        report.push_str("\n");
+    }
+
+    // Entity changes
+    if !diff.entity_changes.is_empty() {
+        report.push_str("ENTITY CHANGES:\n");
+        report.push_str("===============\n");
+        
+        for change in &diff.entity_changes {
+            match change {
+                EntityChange::Added(entity) => {
+                    let name = entity.fields.get("Name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown");
+                    report.push_str(&format!("+ ADDED ENTITY: {} ({})\n", name, entity.entity_type));
+                }
+                EntityChange::Modified { path, field_changes, .. } => {
+                    report.push_str(&format!("~ MODIFIED ENTITY: {}\n", path));
+                    for field_change in field_changes {
+                        report.push_str(&format!("  Field '{}': ", field_change.field_name));
+                        match (&field_change.current_value, &field_change.target_value) {
+                            (Some(current), Some(target)) => {
+                                report.push_str(&format!("{:?} -> {:?}\n", current, target));
+                            }
+                            (None, Some(target)) => {
+                                report.push_str(&format!("(none) -> {:?}\n", target));
+                            }
+                            (Some(current), None) => {
+                                report.push_str(&format!("{:?} -> (removed)\n", current));
+                            }
+                            (None, None) => {
+                                report.push_str("(no change)\n");
+                            }
+                        }
+                    }
+                }
+                EntityChange::Removed(entity) => {
+                    let name = entity.fields.get("Name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown");
+                    report.push_str(&format!("- REMOVED ENTITY: {} ({})\n", name, entity.entity_type));
+                }
+            }
+        }
+        report.push_str("\n");
+    }
+
+    if diff.schema_changes.is_empty() && diff.entity_changes.is_empty() {
+        report.push_str("No differences found. The snapshots are identical.\n");
+    } else {
+        report.push_str(&format!("SUMMARY: {} schema changes, {} entity changes\n", 
+            diff.schema_changes.len(), diff.entity_changes.len()));
+    }
+
+    report
+}
+
+/// Format the diff report as JSON
+fn format_diff_report_json(diff: &SnapshotDiff) -> Result<String> {
+    serde_json::to_string_pretty(diff)
+        .context("Failed to serialize diff report to JSON")
 }
