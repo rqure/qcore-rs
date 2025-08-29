@@ -1,4 +1,4 @@
-use qlib_rs::{et, ft, notification_channel, AuthConfig, AuthenticationResult, Cache, NotificationSender, NotifyConfig, Snowflake, AsyncStore, StoreTrait, StoreMessage, CelExecutor};
+use qlib_rs::{et, ft, notification_channel, now, sadd, schoice, sreflist, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, Snowflake, StoreMessage, StoreTrait, Timestamp};
 use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
@@ -143,7 +143,7 @@ struct AppState {
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
 
     /// Track authenticated clients - maps client address to authenticated subject ID
-    authenticated_clients: HashMap<String, qlib_rs::EntityId>,
+    authenticated_clients: HashMap<String, EntityId>,
 
     // Data store
     store: Arc<RwLock<AsyncStore>>,
@@ -170,7 +170,13 @@ struct AppState {
     full_sync_request_pending: bool,
 
     /// Permission Cache
-    permission_cache: Cache<AsyncStore>,
+    permission_cache: Option<Cache<AsyncStore>>,
+
+    /// Fault Tolerance Cache
+    fault_tolerance_cache: Option<Cache<AsyncStore>>,
+
+    /// Mapping of last known heartbeat timestamps for each candidate
+    candidate_heartbeat_map: HashMap<EntityId, Timestamp>,
 
     /// CEL Executor for evaluating authorization conditions
     cel_executor: CelExecutor,
@@ -215,12 +221,9 @@ impl AppState {
             wal_files_since_snapshot: 0,
             became_unavailable_at: None,
             full_sync_request_pending: false,
-            permission_cache: Cache::new(
-                store.clone(),
-                et::permission(),
-                vec![ft::resource_type(), ft::resource_field()],
-                vec![ft::scope(), ft::condition()]
-            ).await?,
+            permission_cache: None,
+            fault_tolerance_cache: None,
+            candidate_heartbeat_map: HashMap::new(),
             cel_executor: CelExecutor::new(),
         })
     }
@@ -548,6 +551,15 @@ async fn handle_peer_message(
                     
                     if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
                         error!("Failed to write snapshot marker to WAL: {}", e);
+                    }
+
+                    match reinit_caches(app_state.clone()).await {
+                        Ok(()) => {
+                            info!("Caches reinitialized successfully");
+                        }
+                        Err(e) => {
+                            error!("Failed to reinitialize caches: {}", e);
+                        }
                     }
                 }
                 Err(e) => {
@@ -972,11 +984,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
                     // Create authentication result
                     let auth_result = AuthenticationResult {
                         subject_id: subject_id.clone(),
-                        subject_type: if subject_id.to_string().starts_with("user:") { 
-                            "User".to_string() 
-                        } else { 
-                            "Service".to_string() 
-                        },
+                        subject_type: subject_id.get_type().to_string(),
                     };
                     
                     StoreMessage::AuthenticateResponse {
@@ -1115,53 +1123,61 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
                         if let Some(subject_id) = subject_id {
                             let permission_cache = &app_state.read().await.permission_cache;
 
-                            for request in &requests {
-                                    if let Some(entity_id) = request.entity_id() {
-                                        if let Some(field_type) = request.field_type() {
-                                            match get_scope(
-                                                app_state.read().await.store.clone(),
-                                                &mut app_state.write().await.cel_executor,
-                                                permission_cache,
-                                                &subject_id,
-                                                entity_id,
-                                                field_type,
-                                            ).await {
-                                                Ok(scope) => {
-                                                    if scope == AuthorizationScope::None {
-                                                        return StoreMessage::PerformResponse {
-                                                            id,
-                                                            response: Err(format!(
-                                                                "Access denied: Subject {} is not authorized to access {} on entity {}",
-                                                            subject_id,
-                                                            field_type,
-                                                            entity_id
-                                                        )),
-                                                    };
-                                                }
-                                                // For write operations, check if we have write access
-                                                if matches!(request, qlib_rs::Request::Write { .. } | qlib_rs::Request::Create { .. } | qlib_rs::Request::Delete { .. } | qlib_rs::Request::SchemaUpdate { .. }) {
-                                                    if scope == AuthorizationScope::ReadOnly {
-                                                        return StoreMessage::PerformResponse {
-                                                            id,
-                                                            response: Err(format!(
-                                                                "Access denied: Subject {} only has read access to {} on entity {}",
+                            if let Some(permission_cache) = permission_cache {
+                                // Check authorization for each request
+                                for request in &requests {
+                                        if let Some(entity_id) = request.entity_id() {
+                                            if let Some(field_type) = request.field_type() {
+                                                match get_scope(
+                                                    app_state.read().await.store.clone(),
+                                                    &mut app_state.write().await.cel_executor,
+                                                    permission_cache,
+                                                    &subject_id,
+                                                    entity_id,
+                                                    field_type,
+                                                ).await {
+                                                    Ok(scope) => {
+                                                        if scope == AuthorizationScope::None {
+                                                            return StoreMessage::PerformResponse {
+                                                                id,
+                                                                response: Err(format!(
+                                                                    "Access denied: Subject {} is not authorized to access {} on entity {}",
                                                                 subject_id,
                                                                 field_type,
                                                                 entity_id
                                                             )),
                                                         };
                                                     }
+                                                    // For write operations, check if we have write access
+                                                    if matches!(request, qlib_rs::Request::Write { .. } | qlib_rs::Request::Create { .. } | qlib_rs::Request::Delete { .. } | qlib_rs::Request::SchemaUpdate { .. }) {
+                                                        if scope == AuthorizationScope::ReadOnly {
+                                                            return StoreMessage::PerformResponse {
+                                                                id,
+                                                                response: Err(format!(
+                                                                    "Access denied: Subject {} only has read access to {} on entity {}",
+                                                                    subject_id,
+                                                                    field_type,
+                                                                    entity_id
+                                                                )),
+                                                            };
+                                                        }
+                                                    }
                                                 }
-                                            }
-                                            Err(e) => {
-                                                return StoreMessage::PerformResponse {
-                                                    id,
-                                                    response: Err(format!("Authorization check failed: {:?}", e)),
-                                                };
+                                                Err(e) => {
+                                                    return StoreMessage::PerformResponse {
+                                                        id,
+                                                        response: Err(format!("Authorization check failed: {:?}", e)),
+                                                    };
+                                                }
                                             }
                                         }
                                     }
                                 }
+                            } else {
+                                return StoreMessage::PerformResponse {
+                                    id,
+                                    response: Err("Authorization cache not available".to_string()),
+                                };
                             }
                         } else {
                             return StoreMessage::PerformResponse {
@@ -2250,7 +2266,7 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
         interval.tick().await;
         
         // Check if we need to send a full sync request after grace period
-        let should_send_full_sync = {
+        let (should_send_full_sync, is_leader) = {
             let state = app_state.read().await;
             
             // Only check if we're unavailable, not the leader, not fully synced, and haven't sent a request yet
@@ -2270,15 +2286,15 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
                     
                     if elapsed >= grace_period_secs {
                         // Grace period has expired, check if we have a known leader
-                        state.current_leader.clone()
+                        (state.current_leader.clone(), state.is_leader)
                     } else {
-                        None
+                        (None, state.is_leader)
                     }
                 } else {
-                    None
+                    (None, state.is_leader)
                 }
             } else {
-                None
+                (None, state.is_leader)
             }
         };
         
@@ -2333,10 +2349,149 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
                 state.full_sync_request_pending = false;
             }
         }
-        
-        // Keep the task lightweight since it runs every 10ms
-        tokio::task::yield_now().await; // Yield to prevent blocking
+
+        // Process cache notifications
+        {
+            let mut state = app_state.write().await;
+            if let Some(permission_cache) = &mut state.permission_cache {
+                permission_cache.process_notifications();
+            }
+            if let Some(fault_tolerance_cache) = &mut state.fault_tolerance_cache {
+                fault_tolerance_cache.process_notifications();
+            }
+        }
+
+        if is_leader {
+            let fault_tolerances = &app_state.read().await.fault_tolerance_cache;
+        }
+
+        tokio::task::yield_now().await;
     }
+}
+
+/// Handle heartbeat writing
+async fn handle_heartbeat_writing(app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    info!("Starting heartbeat writer");
+    
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    
+    loop {
+        interval.tick().await;
+        
+        {
+            let state = app_state.write().await;
+            let mut store = state.store.write().await;
+            let machine = state.config.machine.clone();
+
+            let candidates = store.find_entities(
+                &et::candidate(), 
+                Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))).await?;
+
+            if let Some(candidate) = candidates.first() {
+                store.perform_mut(&mut vec![
+                    swrite!(candidate.clone(), ft::heartbeat(), schoice!(0))
+                ]).await?;
+            }
+        }
+
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Handle candidate notification processing
+async fn handle_candidate_notifications(app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    info!("Starting candidate notification processor");
+    
+    let (sender, mut receiver) = notification_channel();
+
+    {
+        let state = app_state.write().await;
+        let mut store = state.store.write().await;
+        store.register_notification(
+            NotifyConfig::EntityType {
+                entity_type: et::candidate(),
+                field_type: ft::heartbeat(),
+                trigger_on_change: false,
+                context: Vec::new()
+            },
+            sender.clone()
+        ).await?;
+
+        store.register_notification(
+            NotifyConfig::EntityType {
+                entity_type: et::candidate(),
+                field_type: ft::make_me_available(),
+                trigger_on_change: false,
+                context: Vec::new()
+            },
+            sender.clone()
+        ).await?;
+
+        store.register_notification(
+            NotifyConfig::EntityType {
+                entity_type: et::candidate(),
+                field_type: ft::make_me_unavailable(),
+                trigger_on_change: true,
+                context: Vec::new()
+            },
+            sender.clone()
+        ).await?;
+    }
+
+    while let Some(notification) = receiver.recv().await {
+        let field_type = notification.current.field_type().unwrap();
+        let entity_id = notification.current.entity_id().unwrap();
+
+        if *field_type == ft::heartbeat() {
+            let mut state = app_state.write().await;
+            
+            state.candidate_heartbeat_map.insert(entity_id.clone(), now());
+        } else if *field_type == ft::make_me_available() {
+            let state = app_state.write().await;
+            let mut store = state.store.write().await;
+
+            let fault_tolerances = store.find_entities(
+                &et::fault_tolerance(),
+                Some(format!("CandidateList.contains('{}')", entity_id.to_string()))
+            ).await?;
+            
+            for ft_entity_id in fault_tolerances {
+                store.perform_mut(&mut vec![
+                    sadd!(ft_entity_id.clone(), ft::available_list(), sreflist!(entity_id.clone()))
+                ]).await?;
+            }
+        } else if *field_type == ft::make_me_unavailable() {
+            let state = app_state.write().await;
+            let mut store = state.store.write().await;
+
+            let fault_tolerances = store.find_entities(
+                &et::fault_tolerance(),
+                Some(format!("CandidateList.contains('{}')", entity_id.to_string()))
+            ).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn reinit_caches(app_state: Arc<RwLock<AppState>>) -> Result<()> {
+    let mut state = app_state.write().await;
+
+    state.permission_cache = Some(Cache::new(
+        state.store.clone(),
+        et::permission(),
+        vec![ft::resource_type(), ft::resource_field()],
+        vec![ft::scope(), ft::condition()]
+    ).await?);
+
+    state.fault_tolerance_cache = Some(Cache::new(
+        state.store.clone(),
+        et::fault_tolerance(),
+        vec![ft::name()],
+        vec![ft::candidate_list(), ft::available_list(), ft::current_leader()]
+    ).await?);
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -2398,6 +2553,9 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
+    // Reinitialize caches after WAL replay
+    reinit_caches(app_state.clone()).await?;
+
     // Start the write channel consumer task
     let app_state_clone = Arc::clone(&app_state);
     let write_channel_task = tokio::spawn(async move {
@@ -2435,6 +2593,22 @@ async fn main() -> Result<()> {
     let misc_task = tokio::spawn(async move {
         if let Err(e) = handle_misc_tasks(app_state_clone).await {
             error!("Misc tasks handler failed: {}", e);
+        }
+    });
+
+    // Start the heartbeat writer
+    let app_state_clone = Arc::clone(&app_state);
+    let heartbeat_task = tokio::spawn(async move {
+        if let Err(e) = handle_heartbeat_writing(app_state_clone).await {
+            error!("Heartbeat writer failed: {}", e);
+        }
+    });
+
+    // Start the candidate notification processor
+    let app_state_clone = Arc::clone(&app_state);
+    let candidate_notification_task = tokio::spawn(async move {
+        if let Err(e) = handle_candidate_notifications(app_state_clone).await {
+            error!("Candidate notification processor failed: {}", e);
         }
     });
 
@@ -2479,6 +2653,8 @@ async fn main() -> Result<()> {
     client_server_task.abort();
     outbound_peer_task.abort();
     misc_task.abort();
+    heartbeat_task.abort();
+    candidate_notification_task.abort();
 
     Ok(())
 }

@@ -72,8 +72,44 @@
       ]
     },
     {
-      "entityType": "Service",
+      "entityType": "Candidate",
       "inheritsFrom": "Subject",
+      "fields": [
+        {
+          "name": "Heartbeat",
+          "dataType": "Choice",
+          "default": "Trigger",
+          "options": ["Trigger"]
+        },
+        {
+          "name": "MakeMeAvailable",
+          "dataType": "Choice",
+          "default": "Trigger",
+          "options": ["Trigger"]
+        },
+        {
+          "name": "MakeMeUnavailable",
+          "dataType": "Choice",
+          "default": "Trigger",
+          "options": ["Trigger"]
+        },
+        {
+          "name": "DeathDetectionTimeout",
+          "dataType": "Integer",
+          "default": 5000,
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "Status",
+          "dataType": "Choice",
+          "default": "Offline",
+          "options": ["Offline", "Online"]
+        }
+      ]
+    },
+    {
+      "entityType": "Service",
+      "inheritsFrom": "Candidate",
       "fields": []
     },
     {
@@ -121,6 +157,28 @@
           "dataType": "String",
           "default": "",
           "storageScope": "Configuration"
+        }
+      ]
+    },
+    {
+      "entityType": "FaultTolerance",
+      "inheritsFrom": "Object",
+      "fields": [
+        {
+          "name": "CandidateList",
+          "dataType": "EntityList",
+          "default": [],
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "AvailableList",
+          "dataType": "EntityList",
+          "default": []
+        },
+        {
+          "name": "CurrentLeader",
+          "dataType": "EntityReference",
+          "default": null
         }
       ]
     }
