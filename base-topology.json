@@ -6,22 +6,26 @@
         {
           "name": "Name",
           "dataType": "String",
-          "default": ""
+          "default": "",
+          "storageScope": "Configuration"
         },
         {
           "name": "Parent",
           "dataType": "EntityReference",
-          "default": null
+          "default": null,
+          "storageScope": "Configuration"
         },
         {
           "name": "Description",
           "dataType": "String",
-          "default": ""
+          "default": "",
+          "storageScope": "Configuration"
         },
         {
           "name": "Children",
           "dataType": "EntityList",
-          "default": []
+          "default": [],
+          "storageScope": "Configuration"
         }
       ]
     },
@@ -73,6 +77,11 @@
       "fields": []
     },
     {
+      "entityType": "Tool",
+      "inheritsFrom": "Subject",
+      "fields": []
+    },
+    {
       "entityType": "User",
       "inheritsFrom": "Subject",
       "fields": [
@@ -89,36 +98,29 @@
       "inheritsFrom": "Object",
       "fields": [
         {
-          "name": "TestFn",
-          "dataType": "String",
-          "default": ""
-        }
-      ]
-    },
-    {
-      "entityType": "AuthorizationRule",
-      "inheritsFrom": "Object",
-      "fields": [
-        {
           "name": "Scope",
           "dataType": "Choice",
           "default": "Read Only",
-          "options": ["Read Only", "Read and Write"]
+          "options": ["Read Only", "Read and Write"],
+          "storageScope": "Configuration"
         },
         {
           "name": "ResourceType",
           "dataType": "String",
-          "default": ""
+          "default": "",
+          "storageScope": "Configuration"
         },
         {
           "name": "ResourceField",
           "dataType": "String",
-          "default": ""
+          "default": "",
+          "storageScope": "Configuration"
         },
         {
-          "name": "Permission",
-          "dataType": "EntityReference",
-          "default": null
+          "name": "Condition",
+          "dataType": "String",
+          "default": "",
+          "storageScope": "Configuration"
         }
       ]
     }
