@@ -1,7 +1,7 @@
 {
   "schemas": [
     {
-      "_entityType": "Object",
+      "entityType": "Object",
       "fields": [
         {
           "name": "Name",
@@ -26,7 +26,7 @@
       ]
     },
     {
-      "_entityType": "Root",
+      "entityType": "Root",
       "inheritsFrom": "Object",
       "fields": [
         {
@@ -47,17 +47,17 @@
       ]
     },
     {
-      "_entityType": "Folder",
+      "entityType": "Folder",
       "inheritsFrom": "Object",
       "fields": []
     },
     {
-      "_entityType": "Machine",
+      "entityType": "Machine",
       "inheritsFrom": "Object",
       "fields": []
     },
     {
-      "_entityType": "Subject",
+      "entityType": "Subject",
       "inheritsFrom": "Object",
       "fields": [
         {
@@ -68,12 +68,12 @@
       ]
     },
     {
-      "_entityType": "Service",
+      "entityType": "Service",
       "inheritsFrom": "Subject",
       "fields": []
     },
     {
-      "_entityType": "User",
+      "entityType": "User",
       "inheritsFrom": "Subject",
       "fields": [
         {
@@ -85,7 +85,7 @@
       ]
     },
     {
-      "_entityType": "Permission",
+      "entityType": "Permission",
       "inheritsFrom": "Object",
       "fields": [
         {
@@ -96,7 +96,7 @@
       ]
     },
     {
-      "_entityType": "AuthorizationRule",
+      "entityType": "AuthorizationRule",
       "inheritsFrom": "Object",
       "fields": [
         {
@@ -124,25 +124,25 @@
     }
   ],
   "tree": {
-    "_entityType": "Root",
+    "entityType": "Root",
     "Name": "QOS",
     "Children": [
       {
-        "_entityType": "Machine",
+        "entityType": "Machine",
         "Name": "qos-a",
         "Children": [
           {
-            "_entityType": "Service",
+            "entityType": "Service",
             "Name": "qcore"
           }
         ]
       },
       {
-        "_entityType": "Folder",
+        "entityType": "Folder",
         "Name": "Security Models",
         "Children": [
           {
-            "_entityType": "User",
+            "entityType": "User",
             "Name": "qos"
           }
         ]
