@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use qlib_rs::{
     StoreProxy, JsonSnapshot, JsonEntitySchema,
     EntityType, EntityId, Error, Request, Snapshot,
-    build_json_entity_tree_proxy, FieldType, Field,
+    build_json_entity_tree, FieldType, Field,
     json_value_to_value
 };
 use serde_json;
@@ -142,12 +142,12 @@ async fn take_json_snapshot_proxy(store: &mut StoreProxy) -> Result<JsonSnapshot
     json_schemas.sort_by(|a, b| a.entity_type.cmp(&b.entity_type));
 
     // Find the Root entity
-    let root_entities = store.find_entities(&EntityType::from("Root")).await?;
+    let root_entities = store.find_entities(&EntityType::from("Root"), None).await?;
     let root_entity_id = root_entities.first()
         .ok_or_else(|| Error::EntityNotFound(EntityId::new("Root", 0)))?;
 
-    // Build the entity tree starting from root using the proxy helper function
-    let root_entity = build_json_entity_tree_proxy(store, root_entity_id).await?;
+    // Build the entity tree starting from root using the helper function
+    let root_entity = build_json_entity_tree(store, root_entity_id).await?;
 
     Ok(JsonSnapshot {
         schemas: json_schemas,

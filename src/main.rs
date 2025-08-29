@@ -341,7 +341,7 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
                                         let mut store_guard = store.write().await;
                                         
                                         let mut requests = vec![request];
-                                        if let Err(e) = store_guard.perform(&mut requests).await {
+                                        if let Err(e) = store_guard.perform_mut(&mut requests).await {
                                             error!("Failed to apply sync request from peer {}: {}", peer_addr, e);
                                         } else {
                                             debug!("Successfully applied sync request from peer {}", peer_addr);
@@ -577,7 +577,7 @@ async fn handle_peer_message(
                 let mut store_guard = store.write().await;
                 
                 let mut requests_to_apply = requests;
-                if let Err(e) = store_guard.perform(&mut requests_to_apply).await {
+                if let Err(e) = store_guard.perform_mut(&mut requests_to_apply).await {
                     error!("Failed to apply sync requests from peer {}: {}", peer_addr, e);
                 } else {
                     debug!("Successfully applied {} sync requests from peer {}", requests_to_apply.len(), peer_addr);
@@ -1187,7 +1187,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
                         .write().await
                         .store
                         .write().await
-                        .perform(&mut requests).await {
+                        .perform_mut(&mut requests).await {
                         Ok(()) => StoreMessage::PerformResponse {
                             id,
                             response: Ok(requests),
@@ -1199,12 +1199,12 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
                     }
                 }
                 
-                StoreMessage::FindEntities { id, entity_type, page_opts } => {
+                StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
                     match app_state
                         .read().await
                         .store
                         .read().await
-                        .find_entities_paginated(&entity_type, page_opts).await {
+                        .find_entities_paginated(&entity_type, page_opts, filter).await {
                         Ok(result) => StoreMessage::FindEntitiesResponse {
                             id,
                             response: Ok(result),
@@ -1216,12 +1216,12 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
                     }
                 }
                 
-                StoreMessage::FindEntitiesExact { id, entity_type, page_opts } => {
+                StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
                     match app_state
                         .read().await
                         .store
                         .read().await
-                        .find_entities_exact(&entity_type, page_opts).await {
+                        .find_entities_exact(&entity_type, page_opts, filter).await {
                         Ok(result) => StoreMessage::FindEntitiesExactResponse {
                             id,
                             response: Ok(result),
@@ -2014,7 +2014,7 @@ async fn apply_wal_request(request_data: &[u8], app_state: &Arc<RwLock<AppState>
             let mut store_guard = store.write().await;
             
             let mut requests = vec![request];
-            if let Err(e) = store_guard.perform(&mut requests).await {
+            if let Err(e) = store_guard.perform_mut(&mut requests).await {
                 drop(store_guard);
                 drop(state);
                 return Err(anyhow::anyhow!("Failed to apply request during WAL replay: {}", e));
