@@ -3,15 +3,13 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use qlib_rs::{
     StoreProxy, JsonSnapshot, JsonEntitySchema,
-    EntityType, EntityId, Request, Snapshot,
-    FieldType, Field, json_value_to_value, take_json_snapshot
+    take_json_snapshot, factory_restore_json_snapshot, restore_json_snapshot_via_proxy
 };
 use serde_json;
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::fs::{read_to_string, write};
-use tokio::io::AsyncWriteExt;
 
 /// Command-line tool for taking and restoring JSON snapshots from QCore service
 #[derive(Parser)]
@@ -46,8 +44,8 @@ enum Commands {
         #[arg(long)]
         pretty: bool,
     },
-    /// Restore store state from a JSON snapshot file
-    Restore {
+    /// Factory restore: Create snapshot and WAL files in target data directory from JSON
+    FactoryRestore {
         /// Input file path containing the JSON snapshot
         #[arg(short, long)]
         input: PathBuf,
@@ -63,6 +61,12 @@ enum Commands {
         /// Target machine ID for the data directory structure (defaults to "restored")
         #[arg(long, default_value = "restored")]
         machine_id: String,
+    },
+    /// Normal restore: Connect to QCore service and apply differences from JSON snapshot
+    Restore {
+        /// Input file path containing the JSON snapshot
+        #[arg(short, long)]
+        input: PathBuf,
     },
     /// Validate a JSON snapshot file without restoring it
     Validate {
@@ -122,8 +126,11 @@ async fn main() -> Result<()> {
         Commands::Take { output, pretty } => {
             take_snapshot(&config.core_url, &username, &password, &output, pretty).await
         }
-        Commands::Restore { input, force, data_dir, machine_id } => {
-            restore_snapshot(&input, force, data_dir, machine_id).await
+        Commands::FactoryRestore { input, force, data_dir, machine_id } => {
+            factory_restore_snapshot(&input, force, data_dir, machine_id).await
+        }
+        Commands::Restore { input } => {
+            normal_restore_snapshot(&config.core_url, &username, &password, &input).await
         }
         Commands::Validate { input } => {
             validate_snapshot(&input).await
@@ -234,14 +241,14 @@ fn count_entities_by_type(entity: &qlib_rs::JsonEntity, counts: &mut HashMap<Str
     }
 }
 
-/// Restore a snapshot from a file by generating snapshot and WAL files in the target data directory
-async fn restore_snapshot(
+/// Factory restore a snapshot from a file by generating snapshot and WAL files in the target data directory
+async fn factory_restore_snapshot(
     input_path: &PathBuf, 
     force: bool, 
     data_dir: Option<PathBuf>, 
     machine_id: String
 ) -> Result<()> {
-    Progress::step(1, 6, "Loading snapshot file");
+    Progress::step(1, 4, "Loading snapshot file");
     let spinner = Progress::new_spinner("Reading and parsing JSON...");
 
     // Read and parse the snapshot file
@@ -250,69 +257,15 @@ async fn restore_snapshot(
     
     spinner.finish_with_message(format!("Loaded {} schemas, {} entities", snapshot.schemas.len(), entity_count));
 
-    Progress::step(2, 6, "Preparing target directories");
+    Progress::step(2, 4, "Preparing target directories");
     // Determine target directories
     let target_data_dir = data_dir.unwrap_or_else(|| PathBuf::from("./data"));
-    let directories = create_target_directories(&target_data_dir, &machine_id, force).await?;
-
-    Progress::step(3, 6, "Converting snapshot format");
-    let spinner = Progress::new_spinner("Converting JSON to internal format...");
-
-    // Convert JsonSnapshot to internal Snapshot format
-    let internal_snapshot = convert_json_to_internal_snapshot(&snapshot).await?;
-
-    spinner.finish_with_message(format!("Converted {} entity types", internal_snapshot.types.len()));
-
-    Progress::step(4, 6, "Writing snapshot binary");
-    let spinner = Progress::new_spinner("Serializing to binary format...");
-
-    // Write snapshot binary file
-    write_snapshot_file(&directories.snapshots, &internal_snapshot).await?;
-
-    spinner.finish_with_message("Binary snapshot created");
-
-    Progress::step(5, 6, "Writing WAL file");
-    let spinner = Progress::new_spinner("Creating write-ahead log...");
-
-    // Write WAL file with snapshot marker
-    write_wal_file(&directories.wal).await?;
-
-    spinner.finish_with_message("WAL file created");
-
-    Progress::step(6, 6, "Restoration complete");
-    Progress::success("Snapshot restoration completed successfully!");
-    Progress::info(&format!("Files created in: {}", target_data_dir.display()));
-    Progress::info(&format!("Start QCore with: --data-dir {} --machine {}", target_data_dir.display(), machine_id));
-
-    Ok(())
-}
-
-/// Directory structure for data restoration
-struct DataDirectories {
-    snapshots: PathBuf,
-    wal: PathBuf,
-}
-
-/// Load and parse a JSON snapshot file
-async fn load_json_snapshot(input_path: &PathBuf) -> Result<JsonSnapshot> {
-    let json_content = read_to_string(input_path).await
-        .with_context(|| format!("Failed to read snapshot file: {}", input_path.display()))?;
     
-    serde_json::from_str(&json_content)
-        .with_context(|| format!("Failed to parse JSON snapshot from: {}", input_path.display()))
-}
-
-/// Create target directories for data restoration
-async fn create_target_directories(
-    target_data_dir: &PathBuf, 
-    machine_id: &str, 
-    force: bool
-) -> Result<DataDirectories> {
-    let machine_data_dir = target_data_dir.join(machine_id);
+    // Check if directories already exist and warn user
+    let machine_data_dir = target_data_dir.join(&machine_id);
     let snapshots_dir = machine_data_dir.join("snapshots");
     let wal_dir = machine_data_dir.join("wal");
 
-    // Check if directories already exist and warn user
     if (snapshots_dir.exists() || wal_dir.exists()) && !force {
         Progress::warning("Target directories already exist!");
         Progress::warning(&format!("Snapshots dir: {}", snapshots_dir.display()));
@@ -325,66 +278,71 @@ async fn create_target_directories(
 
     Progress::info(&format!("Creating data structure for machine '{}' in: {}", machine_id, target_data_dir.display()));
 
-    // Create directories
-    tokio::fs::create_dir_all(&snapshots_dir).await
-        .with_context(|| format!("Failed to create snapshots directory: {}", snapshots_dir.display()))?;
-    tokio::fs::create_dir_all(&wal_dir).await
-        .with_context(|| format!("Failed to create WAL directory: {}", wal_dir.display()))?;
+    Progress::step(3, 4, "Performing factory restore");
+    let spinner = Progress::new_spinner("Creating snapshot and WAL files...");
 
-    Ok(DataDirectories {
-        snapshots: snapshots_dir,
-        wal: wal_dir,
-    })
-}
+    // Use the new factory restore function
+    factory_restore_json_snapshot(&snapshot, target_data_dir.clone(), machine_id.clone()).await
+        .context("Failed to perform factory restore")?;
 
-/// Write the internal snapshot to a binary file
-async fn write_snapshot_file(snapshots_dir: &PathBuf, internal_snapshot: &Snapshot) -> Result<()> {
-    let snapshot_filename = "snapshot_0000000000.bin";
-    let snapshot_path = snapshots_dir.join(snapshot_filename);
-    
-    // Serialize the snapshot using bincode for consistency with QCore format
-    let serialized_snapshot = bincode::serialize(internal_snapshot)
-        .context("Failed to serialize snapshot")?;
-    
-    tokio::fs::write(&snapshot_path, &serialized_snapshot).await
-        .with_context(|| format!("Failed to write snapshot file: {}", snapshot_path.display()))?;
-    
-    Progress::info(&format!("Snapshot binary: {} bytes", serialized_snapshot.len()));
+    spinner.finish_with_message("Factory restore completed");
+
+    Progress::step(4, 4, "Factory restoration complete");
+    Progress::success("Factory restoration completed successfully!");
+    Progress::info(&format!("Files created in: {}", target_data_dir.display()));
+    Progress::info(&format!("Start QCore with: --data-dir {} --machine {}", target_data_dir.display(), machine_id));
+
     Ok(())
 }
 
-/// Write a WAL file with snapshot marker
-async fn write_wal_file(wal_dir: &PathBuf) -> Result<()> {
-    let wal_filename = "wal_0000000000.log";
-    let wal_path = wal_dir.join(wal_filename);
+/// Normal restore via StoreProxy: connect to service and apply differences
+async fn normal_restore_snapshot(
+    core_url: &str,
+    username: &str,
+    password: &str,
+    input_path: &PathBuf,
+) -> Result<()> {
+    Progress::step(1, 4, "Loading snapshot file");
+    let spinner = Progress::new_spinner("Reading and parsing JSON...");
+
+    // Read and parse the snapshot file
+    let snapshot = load_json_snapshot(input_path).await?;
+    let entity_count = count_entities_in_tree(&snapshot.tree);
     
-    // Create snapshot marker request
-    let snapshot_request = Request::Snapshot {
-        snapshot_counter: 0,
-        originator: Some("snapshot-tool".to_string()),
-    };
+    spinner.finish_with_message(format!("Loaded {} schemas, {} entities", snapshot.schemas.len(), entity_count));
+
+    Progress::step(2, 4, "Connecting to QCore service");
+    let spinner = Progress::new_spinner("Establishing connection...");
     
-    // Serialize the request to JSON (matching QCore format)
-    let serialized_request = serde_json::to_vec(&snapshot_request)
-        .context("Failed to serialize snapshot request")?;
-    
-    // Write to WAL file with length prefix (matching QCore format)
-    let mut wal_file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&wal_path)
-        .await
-        .with_context(|| format!("Failed to open WAL file: {}", wal_path.display()))?;
-    
-    // Write length prefix (4 bytes little-endian) followed by the serialized data
-    let len_bytes = (serialized_request.len() as u32).to_le_bytes();
-    wal_file.write_all(&len_bytes).await?;
-    wal_file.write_all(&serialized_request).await?;
-    wal_file.flush().await?;
-    
-    Progress::info(&format!("WAL file: {} bytes", 4 + serialized_request.len()));
+    // Connect to the Core service with authentication
+    let mut store = StoreProxy::connect_and_authenticate(core_url, username, password).await
+        .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
+
+    spinner.finish_with_message("Connected successfully");
+
+    Progress::step(3, 4, "Computing and applying differences");
+    let spinner = Progress::new_spinner("Analyzing current state and applying changes...");
+
+    // Use the new restore via proxy function
+    restore_json_snapshot_via_proxy(&mut store, &snapshot).await
+        .context("Failed to restore snapshot via proxy")?;
+
+    spinner.finish_with_message("Changes applied successfully");
+
+    Progress::step(4, 4, "Normal restoration complete");
+    Progress::success("Normal restoration completed successfully!");
+    Progress::info("The QCore service has been updated with the snapshot data.");
+
     Ok(())
+}
+
+/// Load and parse a JSON snapshot file
+async fn load_json_snapshot(input_path: &PathBuf) -> Result<JsonSnapshot> {
+    let json_content = read_to_string(input_path).await
+        .with_context(|| format!("Failed to read snapshot file: {}", input_path.display()))?;
+    
+    serde_json::from_str(&json_content)
+        .with_context(|| format!("Failed to parse JSON snapshot from: {}", input_path.display()))
 }
 
 /// Validate a snapshot file without restoring it
@@ -442,120 +400,6 @@ fn validate_schemas(schemas: &[JsonEntitySchema]) -> Result<()> {
     for schema in schemas {
         schema.to_entity_schema()
             .with_context(|| format!("Schema validation failed for '{}'", schema.entity_type))?;
-    }
-    Ok(())
-}
-
-/// Convert JsonSnapshot to internal Snapshot format
-async fn convert_json_to_internal_snapshot(json_snapshot: &JsonSnapshot) -> Result<Snapshot> {
-    let mut snapshot = Snapshot::default();
-    
-    // Convert schemas
-    convert_schemas_to_internal(&mut snapshot, &json_snapshot.schemas)?;
-    
-    // Convert the entity tree to individual entities and fields
-    let mut entity_counters: HashMap<String, u64> = HashMap::new();
-    let mut total_entities = 0;
-    
-    convert_json_entity_recursive(&json_snapshot.tree, None, &mut snapshot, &mut entity_counters, &mut total_entities)?;
-    
-    Ok(snapshot)
-}
-
-/// Convert JSON schemas to internal format
-fn convert_schemas_to_internal(snapshot: &mut Snapshot, schemas: &[JsonEntitySchema]) -> Result<()> {
-    for json_schema in schemas {
-        let entity_type = EntityType::from(json_schema.entity_type.clone());
-        let schema = json_schema.to_entity_schema()
-            .with_context(|| format!("Failed to convert schema for entity type: {}", json_schema.entity_type))?;
-        
-        snapshot.schemas.insert(entity_type.clone(), schema);
-        if !snapshot.types.contains(&entity_type) {
-            snapshot.types.push(entity_type);
-        }
-    }
-    Ok(())
-}
-
-/// Recursively convert JsonEntity to internal format and populate snapshot
-fn convert_json_entity_recursive(
-    json_entity: &qlib_rs::JsonEntity, 
-    _parent_id: Option<EntityId>,
-    snapshot: &mut Snapshot,
-    entity_counters: &mut HashMap<String, u64>,
-    total_entities: &mut usize,
-) -> Result<EntityId> {
-    let entity_type = EntityType::from(json_entity.entity_type.clone());
-    
-    // Generate a unique entity ID using a counter per type
-    let counter = entity_counters.entry(entity_type.as_ref().to_string()).or_insert(0);
-    let entity_id = EntityId::new(entity_type.as_ref(), *counter);
-    *counter += 1;
-    *total_entities += 1;
-    
-    // Add entity to the snapshot
-    snapshot.entities.entry(entity_type.clone()).or_insert_with(Vec::new).push(entity_id.clone());
-    
-    // Get the schema for this entity type
-    let schema = snapshot.schemas.get(&entity_type)
-        .ok_or_else(|| anyhow::anyhow!("Schema not found for entity type: {}", entity_type.as_ref()))?;
-    
-    // Convert field values
-    let entity_fields = convert_entity_fields(json_entity, schema)?;
-    snapshot.fields.insert(entity_id.clone(), entity_fields);
-    
-    // Handle children recursively
-    handle_entity_children(json_entity, &entity_id, snapshot, entity_counters, total_entities)?;
-    
-    Ok(entity_id)
-}
-
-/// Convert field values for an entity
-fn convert_entity_fields(
-    json_entity: &qlib_rs::JsonEntity,
-    schema: &qlib_rs::EntitySchema<qlib_rs::Single>,
-) -> Result<HashMap<FieldType, Field>> {
-    let mut entity_fields = HashMap::new();
-    
-    for (field_name, json_value) in &json_entity.fields {
-        if field_name == "Children" {
-            // Handle children separately
-            continue;
-        }
-        
-        let field_type = FieldType::from(field_name.clone());
-        if let Some(field_schema) = schema.fields.get(&field_type) {
-            if let Ok(value) = json_value_to_value(json_value, field_schema) {
-                let field = Field {
-                    field_type: field_type.clone(),
-                    value,
-                    write_time: std::time::SystemTime::now(),
-                    writer_id: None,
-                };
-                entity_fields.insert(field_type, field);
-            }
-        }
-    }
-    
-    Ok(entity_fields)
-}
-
-/// Handle the children of an entity during recursive conversion
-fn handle_entity_children(
-    json_entity: &qlib_rs::JsonEntity,
-    entity_id: &EntityId,
-    snapshot: &mut Snapshot,
-    entity_counters: &mut HashMap<String, u64>,
-    total_entities: &mut usize,
-) -> Result<()> {
-    if let Some(children_json) = json_entity.fields.get("Children") {
-        if let Some(children_array) = children_json.as_array() {
-            for child_json_value in children_array {
-                if let Ok(child_json_entity) = serde_json::from_value::<qlib_rs::JsonEntity>(child_json_value.clone()) {
-                    let _ = convert_json_entity_recursive(&child_json_entity, Some(entity_id.clone()), snapshot, entity_counters, total_entities)?;
-                }
-            }
-        }
     }
     Ok(())
 }
