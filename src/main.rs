@@ -1,4 +1,5 @@
-use qlib_rs::{et, ft, notification_channel, now, sadd, schoice, sread, sref, sreflist, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, PushCondition, Snowflake, StoreMessage, StoreTrait, Timestamp};
+use qlib_rs::ft::CURRENT_LEADER;
+use qlib_rs::{et, ft, notification_channel, now, epoch, schoice, sread, sref, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, Snowflake, StoreMessage, StoreTrait, Timestamp};
 use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
@@ -173,12 +174,6 @@ struct AppState {
     /// Permission Cache
     permission_cache: Option<Cache<AsyncStore>>,
 
-    /// Mapping of last known heartbeat timestamps for each candidate
-    candidate_heartbeat_map: HashMap<EntityId, Timestamp>,
-
-    /// Mapping of last known candidate FT request
-    candidate_ft_request_map: HashMap<EntityId, AvailabilityState>,
-
     /// CEL Executor for evaluating authorization conditions
     cel_executor: CelExecutor,
 }
@@ -223,8 +218,6 @@ impl AppState {
             became_unavailable_at: None,
             full_sync_request_pending: false,
             permission_cache: None,
-            candidate_heartbeat_map: HashMap::new(),
-            candidate_ft_request_map: HashMap::new(),
             cel_executor: CelExecutor::new(),
         })
     }
@@ -2378,23 +2371,117 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
             {
                 let fault_tolerances = store.find_entities(&et::fault_tolerance(), None).await?;
                 for ft_entity_id in fault_tolerances {
-                    let fields = store.perform_map(&mut vec![
+                    let ft_fields = store.perform_map(&mut vec![
                         sread!(ft_entity_id.clone(), ft::candidate_list()),
                         sread!(ft_entity_id.clone(), ft::available_list()),
                         sread!(ft_entity_id.clone(), ft::current_leader())
                     ]).await?;
 
-                    let candidates = fields
+                    let candidates = ft_fields
                         .get(&ft::candidate_list())
                         .unwrap()
                         .value()
                         .unwrap()
                         .expect_entity_list()?;
 
-                    candidates
-                        .into_iter()
-                        .filter(|c| {
-                            )
+                    let mut available = Vec::new();
+                    for candidate_id in candidates.iter() {
+                        let candidate_fields = store.perform_map(&mut vec![
+                            sread!(candidate_id.clone(), ft::make_me()),
+                            sread!(candidate_id.clone(), ft::heartbeat()),
+                            sread!(candidate_id.clone(), ft::death_detection_timeout()),
+                        ]).await?;
+
+                        let heartbeat_time = candidate_fields
+                            .get(&ft::heartbeat())
+                            .unwrap()
+                            .write_time()
+                            .unwrap();
+
+                        let make_me = candidate_fields
+                            .get(&ft::make_me())
+                            .unwrap()
+                            .value()
+                            .unwrap()
+                            .expect_choice()?;
+
+                        let death_detection_timeout_duration = candidate_fields
+                            .get(&ft::death_detection_timeout())
+                            .unwrap()
+                            .value()
+                            .unwrap()
+                            .expect_timestamp()?
+                            .duration_since(epoch()).unwrap_or_default();
+
+                        let desired_availability = match make_me {
+                            1 => AvailabilityState::Available,
+                            _ => AvailabilityState::Unavailable,
+                        };
+
+                        if desired_availability == AvailabilityState::Available && 
+                           heartbeat_time + death_detection_timeout_duration > now() {
+                            available.push(candidate_id.clone());
+                        }
+                    }
+
+                    store.perform_mut(&mut vec![
+                        swrite!(ft_entity_id.clone(), ft::available_list(), Some(qlib_rs::Value::EntityList(available.clone()))),
+                    ]).await?;
+
+                    // Now we must promote an available candidate to leader
+                    // if the current leader is no longer available.
+                    // Note that we want to promote to the next available leader in the candidate list
+                    // rather than the first available candidate.
+                    let current_leader = ft_fields
+                        .get(&ft::current_leader())
+                        .unwrap()
+                        .value()
+                        .unwrap()
+                        .expect_entity_reference()?;
+
+                    if current_leader.is_none() {
+                        store.perform_mut(&mut vec![
+                            swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(available.first().cloned())),
+                        ]).await?;
+                    }
+                    else if let Some(current_leader) = current_leader {
+                        if !available.contains(&current_leader) {
+                            // Find the position of the current leader in the candidate list
+                            let current_leader_idx = candidates.iter().position(|c| c.clone() == current_leader.clone());
+                            
+                            if let Some(current_idx) = current_leader_idx {
+                                // Find the next available candidate after the current leader in the candidate list
+                                let mut next_leader = None;
+                                
+                                // Start searching from the position after the current leader
+                                for i in (current_idx + 1)..candidates.len() {
+                                    if available.contains(&candidates[i]) {
+                                        next_leader = Some(candidates[i].clone());
+                                        break;
+                                    }
+                                }
+                                
+                                // If no leader found after current position, wrap around to the beginning
+                                if next_leader.is_none() {
+                                    for i in 0..=current_idx {
+                                        if available.contains(&candidates[i]) {
+                                            next_leader = Some(candidates[i].clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                store.perform_mut(&mut vec![
+                                    swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(next_leader)),
+                                ]).await?;
+                            } else {
+                                // Current leader not found in candidates list, just pick the first available
+                                store.perform_mut(&mut vec![
+                                    swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(available.first().cloned())),
+                                ]).await?;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2430,79 +2517,6 @@ async fn handle_heartbeat_writing(app_state: Arc<RwLock<AppState>>) -> Result<()
 
         tokio::task::yield_now().await;
     }
-}
-
-/// Handle candidate notification processing
-async fn handle_candidate_notifications(app_state: Arc<RwLock<AppState>>) -> Result<()> {
-    info!("Starting candidate notification processor");
-    
-    let (sender, mut receiver) = notification_channel();
-
-    {
-        let state = app_state.read().await;
-        let mut store = state.store.write().await;
-        store.register_notification(
-            NotifyConfig::EntityType {
-                entity_type: et::candidate(),
-                field_type: ft::heartbeat(),
-                trigger_on_change: false,
-                context: Vec::new()
-            },
-            sender.clone()
-        ).await?;
-
-        store.register_notification(
-            NotifyConfig::EntityType {
-                entity_type: et::candidate(),
-                field_type: ft::make_me(),
-                trigger_on_change: false,
-                context: Vec::new()
-            },
-            sender.clone()
-        ).await?;
-
-        store.register_notification(
-            NotifyConfig::EntityType {
-                entity_type: et::candidate(),
-                field_type: ft::make_me_unavailable(),
-                trigger_on_change: true,
-                context: Vec::new()
-            },
-            sender.clone()
-        ).await?;
-    }
-
-    while let Some(notification) = receiver.recv().await {
-        let field_type = notification.current.field_type().unwrap();
-        let entity_id = notification.current.entity_id().unwrap();
-
-        if *field_type == ft::heartbeat() {
-            let mut state = app_state.write().await;
-            
-            state.candidate_heartbeat_map.insert(entity_id.clone(), now());
-        } else if *field_type == ft::make_me() {
-            let mut state = app_state.write().await;
-            state.candidate_ft_request_map.insert(entity_id.clone(), AvailabilityState::Available);
-        } else if *field_type == ft::make_me_unavailable() {
-            let mut state = app_state.write().await;
-            state.candidate_ft_request_map.insert(entity_id.clone(), AvailabilityState::Unavailable);
-            // let mut store = state.store.write().await;
-
-            // let fault_tolerances = store.find_entities(
-            //     &et::fault_tolerance(),
-            //     Some(format!("CandidateList.contains('{}')", entity_id.to_string()))
-            // ).await?;
-
-            // for ft_entity_id in fault_tolerances {
-            //     store.perform_mut(&mut vec![
-            //         ssub!(ft_entity_id.clone(), ft::current_leader(), sref!(Some(entity_id.clone())), PushCondition::Changes),
-            //         ssub!(ft_entity_id.clone(), ft::available_list(), sreflist!(entity_id.clone()), PushCondition::Changes)
-            //     ]).await?;
-            // }
-        }
-    }
-
-    Ok(())
 }
 
 async fn reinit_caches(app_state: Arc<RwLock<AppState>>) -> Result<()> {
@@ -2628,14 +2642,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start the candidate notification processor
-    let app_state_clone = Arc::clone(&app_state);
-    let candidate_notification_task = tokio::spawn(async move {
-        if let Err(e) = handle_candidate_notifications(app_state_clone).await {
-            error!("Candidate notification processor failed: {}", e);
-        }
-    });
-
     // Wait for shutdown signal
     signal::ctrl_c().await?;
     warn!("Received shutdown signal. Stopping Core service...");
@@ -2678,7 +2684,6 @@ async fn main() -> Result<()> {
     outbound_peer_task.abort();
     misc_task.abort();
     heartbeat_task.abort();
-    candidate_notification_task.abort();
 
     Ok(())
 }
