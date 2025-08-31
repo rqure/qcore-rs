@@ -1,4 +1,4 @@
-use qlib_rs::{et, ft, notification_channel, now, sadd, schoice, sreflist, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, Snowflake, StoreMessage, StoreTrait, Timestamp};
+use qlib_rs::{et, ft, notification_channel, now, sadd, schoice, sread, sref, sreflist, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, PushCondition, Snowflake, StoreMessage, StoreTrait, Timestamp};
 use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
@@ -10,6 +10,7 @@ use clap::Parser;
 use anyhow::Result;
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
+use std::vec;
 use tokio::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
@@ -172,11 +173,11 @@ struct AppState {
     /// Permission Cache
     permission_cache: Option<Cache<AsyncStore>>,
 
-    /// Fault Tolerance Cache
-    fault_tolerance_cache: Option<Cache<AsyncStore>>,
-
     /// Mapping of last known heartbeat timestamps for each candidate
     candidate_heartbeat_map: HashMap<EntityId, Timestamp>,
+
+    /// Mapping of last known candidate FT request
+    candidate_ft_request_map: HashMap<EntityId, AvailabilityState>,
 
     /// CEL Executor for evaluating authorization conditions
     cel_executor: CelExecutor,
@@ -222,8 +223,8 @@ impl AppState {
             became_unavailable_at: None,
             full_sync_request_pending: false,
             permission_cache: None,
-            fault_tolerance_cache: None,
             candidate_heartbeat_map: HashMap::new(),
+            candidate_ft_request_map: HashMap::new(),
             cel_executor: CelExecutor::new(),
         })
     }
@@ -2356,13 +2357,46 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
             if let Some(permission_cache) = &mut state.permission_cache {
                 permission_cache.process_notifications();
             }
-            if let Some(fault_tolerance_cache) = &mut state.fault_tolerance_cache {
-                fault_tolerance_cache.process_notifications();
-            }
         }
 
         if is_leader {
-            let fault_tolerances = &app_state.read().await.fault_tolerance_cache;
+            let state = app_state.read().await;
+            let mut store = state.store.write().await;
+
+            // Find us as a candidate
+            let candidate = {
+                let machine = state.config.machine.clone();
+
+                let mut candidates = store.find_entities(
+                    &et::candidate(), 
+                    Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))).await?;
+
+                candidates.pop()
+            };
+
+            // Update available list and current leader
+            {
+                let fault_tolerances = store.find_entities(&et::fault_tolerance(), None).await?;
+                for ft_entity_id in fault_tolerances {
+                    let fields = store.perform_map(&mut vec![
+                        sread!(ft_entity_id.clone(), ft::candidate_list()),
+                        sread!(ft_entity_id.clone(), ft::available_list()),
+                        sread!(ft_entity_id.clone(), ft::current_leader())
+                    ]).await?;
+
+                    let candidates = fields
+                        .get(&ft::candidate_list())
+                        .unwrap()
+                        .value()
+                        .unwrap()
+                        .expect_entity_list()?;
+
+                    candidates
+                        .into_iter()
+                        .filter(|c| {
+                            )
+                }
+            }
         }
 
         tokio::task::yield_now().await;
@@ -2379,7 +2413,7 @@ async fn handle_heartbeat_writing(app_state: Arc<RwLock<AppState>>) -> Result<()
         interval.tick().await;
         
         {
-            let state = app_state.write().await;
+            let state = app_state.read().await;
             let mut store = state.store.write().await;
             let machine = state.config.machine.clone();
 
@@ -2405,7 +2439,7 @@ async fn handle_candidate_notifications(app_state: Arc<RwLock<AppState>>) -> Res
     let (sender, mut receiver) = notification_channel();
 
     {
-        let state = app_state.write().await;
+        let state = app_state.read().await;
         let mut store = state.store.write().await;
         store.register_notification(
             NotifyConfig::EntityType {
@@ -2420,7 +2454,7 @@ async fn handle_candidate_notifications(app_state: Arc<RwLock<AppState>>) -> Res
         store.register_notification(
             NotifyConfig::EntityType {
                 entity_type: et::candidate(),
-                field_type: ft::make_me_available(),
+                field_type: ft::make_me(),
                 trigger_on_change: false,
                 context: Vec::new()
             },
@@ -2446,28 +2480,25 @@ async fn handle_candidate_notifications(app_state: Arc<RwLock<AppState>>) -> Res
             let mut state = app_state.write().await;
             
             state.candidate_heartbeat_map.insert(entity_id.clone(), now());
-        } else if *field_type == ft::make_me_available() {
-            let state = app_state.write().await;
-            let mut store = state.store.write().await;
-
-            let fault_tolerances = store.find_entities(
-                &et::fault_tolerance(),
-                Some(format!("CandidateList.contains('{}')", entity_id.to_string()))
-            ).await?;
-            
-            for ft_entity_id in fault_tolerances {
-                store.perform_mut(&mut vec![
-                    sadd!(ft_entity_id.clone(), ft::available_list(), sreflist!(entity_id.clone()))
-                ]).await?;
-            }
+        } else if *field_type == ft::make_me() {
+            let mut state = app_state.write().await;
+            state.candidate_ft_request_map.insert(entity_id.clone(), AvailabilityState::Available);
         } else if *field_type == ft::make_me_unavailable() {
-            let state = app_state.write().await;
-            let mut store = state.store.write().await;
+            let mut state = app_state.write().await;
+            state.candidate_ft_request_map.insert(entity_id.clone(), AvailabilityState::Unavailable);
+            // let mut store = state.store.write().await;
 
-            let fault_tolerances = store.find_entities(
-                &et::fault_tolerance(),
-                Some(format!("CandidateList.contains('{}')", entity_id.to_string()))
-            ).await?;
+            // let fault_tolerances = store.find_entities(
+            //     &et::fault_tolerance(),
+            //     Some(format!("CandidateList.contains('{}')", entity_id.to_string()))
+            // ).await?;
+
+            // for ft_entity_id in fault_tolerances {
+            //     store.perform_mut(&mut vec![
+            //         ssub!(ft_entity_id.clone(), ft::current_leader(), sref!(Some(entity_id.clone())), PushCondition::Changes),
+            //         ssub!(ft_entity_id.clone(), ft::available_list(), sreflist!(entity_id.clone()), PushCondition::Changes)
+            //     ]).await?;
+            // }
         }
     }
 
@@ -2482,13 +2513,6 @@ async fn reinit_caches(app_state: Arc<RwLock<AppState>>) -> Result<()> {
         et::permission(),
         vec![ft::resource_type(), ft::resource_field()],
         vec![ft::scope(), ft::condition()]
-    ).await?);
-
-    state.fault_tolerance_cache = Some(Cache::new(
-        state.store.clone(),
-        et::fault_tolerance(),
-        vec![ft::name()],
-        vec![ft::candidate_list(), ft::available_list(), ft::current_leader()]
     ).await?);
 
     Ok(())

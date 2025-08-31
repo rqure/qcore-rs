@@ -82,16 +82,10 @@
           "options": ["Trigger"]
         },
         {
-          "name": "MakeMeAvailable",
+          "name": "MakeMe",
           "dataType": "Choice",
-          "default": "Trigger",
-          "options": ["Trigger"]
-        },
-        {
-          "name": "MakeMeUnavailable",
-          "dataType": "Choice",
-          "default": "Trigger",
-          "options": ["Trigger"]
+          "default": "Unavailable",
+          "options": ["Unavailable", "Available"]
         },
         {
           "name": "DeathDetectionTimeout",
