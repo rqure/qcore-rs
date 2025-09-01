@@ -129,9 +129,6 @@ struct AppState {
     /// Connected outbound peers with message senders
     connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
 
-    /// Set of currently connected inbound peer addresses
-    connected_inbound_peers: HashSet<String>,
-
     /// Connected clients with message senders
     connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
 
@@ -181,8 +178,7 @@ struct AppState {
 #[derive(Debug, Clone)]
 struct PeerInfo {
     machine_id: String,
-    startup_time: u64,
-    last_seen: u64,
+    startup_time: u64
 }
 
 impl AppState {
@@ -200,7 +196,6 @@ impl AppState {
             is_fully_synced: false,
             peer_info: HashMap::new(),
             connected_outbound_peers: HashMap::new(),
-            connected_inbound_peers: HashSet::new(),
             connected_clients: HashMap::new(),
             client_notification_senders: HashMap::new(),
             client_notification_configs: HashMap::new(),
@@ -296,12 +291,6 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     let ws_stream = accept_async(stream).await?;
     debug!("WebSocket connection established with peer: {}", peer_addr);
     
-    // Add peer to connected inbound peers
-    {
-        let mut state = app_state.write().await;
-        state.connected_inbound_peers.insert(peer_addr.to_string());
-    }
-    
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
     // Handle incoming messages from peer
@@ -388,12 +377,8 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     // Remove peer from connected inbound peers when connection ends
     {
         let mut state = app_state.write().await;
-        state.connected_inbound_peers.remove(&peer_addr.to_string());
-        // Also remove from peer_info if present
-        state.peer_info.retain(|_, info| {
-            // Remove peers that haven't been seen recently (this connection ending)
-            let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
-            current_time - info.last_seen < 60 // Keep peers seen within last 60 seconds
+        state.peer_info.retain(|addr, _| {
+            addr != &peer_addr.to_string()
         });
     }
     
@@ -408,17 +393,14 @@ async fn handle_peer_message(
     ws_sender: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
     app_state: Arc<RwLock<AppState>>,
 ) {
-    let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
-
     match peer_msg {
         PeerMessage::Startup { machine_id, startup_time } => {
             // Update peer information
             {
                 let mut state = app_state.write().await;
-                state.peer_info.insert(machine_id.clone(), PeerInfo {
+                state.peer_info.insert(peer_addr.to_string(), PeerInfo {
                     machine_id: machine_id.clone(),
                     startup_time,
-                    last_seen: current_time,
                 });
                 
                 // Determine leadership locally based on startup times
@@ -660,15 +642,6 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
         }
     }
     
-    {
-        let mut state = app_state.write().await;
-        state.connected_outbound_peers.remove(peer_addr);
-        // Also remove from peer_info when connection ends
-        state.peer_info.retain(|_, info| {
-            let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
-            current_time - info.last_seen < 60 // Keep peers seen within last 60 seconds
-        });
-    }
     outgoing_task.abort();
     
     info!("Outbound peer connection closed: {}", peer_addr);
