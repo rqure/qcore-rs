@@ -2523,7 +2523,8 @@ async fn handle_heartbeat_writing(app_state: Arc<RwLock<AppState>>) -> Result<()
 
             if let Some(candidate) = candidates.first() {
                 store.perform_mut(&mut vec![
-                    swrite!(candidate.clone(), ft::heartbeat(), schoice!(0))
+                    swrite!(candidate.clone(), ft::heartbeat(), schoice!(0)),
+                    swrite!(candidate.clone(), ft::make_me(), schoice!(1), PushCondition::Changes)
                 ]).await?;
             }
         }
