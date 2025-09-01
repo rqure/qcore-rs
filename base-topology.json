@@ -68,7 +68,39 @@
         {
           "name": "Secret",
           "dataType": "String",
-          "default": ""
+          "default": "",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "AuthMethod",
+          "dataType": "Choice",
+          "default": "Native",
+          "choices": ["Native", "LDAP", "OpenID Connect"],
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "Active",
+          "dataType": "Bool",
+          "default": true,
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "FailedAttempts",
+          "dataType": "Int",
+          "default": 0,
+          "storageScope": "Runtime"
+        },
+        {
+          "name": "LockedUntil",
+          "dataType": "Timestamp",
+          "default": 0,
+          "storageScope": "Runtime"
+        },
+        {
+          "name": "LastLogin",
+          "dataType": "Timestamp",
+          "default": 0,
+          "storageScope": "Runtime"
         }
       ]
     },
@@ -80,13 +112,13 @@
           "name": "Heartbeat",
           "dataType": "Choice",
           "default": "Trigger",
-          "options": ["Trigger"]
+          "choices": ["Trigger"]
         },
         {
           "name": "MakeMe",
           "dataType": "Choice",
           "default": "Unavailable",
-          "options": ["Unavailable", "Available"]
+          "choices": ["Unavailable", "Available"]
         },
         {
           "name": "DeathDetectionTimeout",
@@ -104,7 +136,7 @@
           "name": "Status",
           "dataType": "Choice",
           "default": "Offline",
-          "options": ["Offline", "Online"]
+          "choices": ["Offline", "Online"]
         }
       ]
     },
@@ -116,14 +148,7 @@
     {
       "entityType": "User",
       "inheritsFrom": ["Subject"],
-      "fields": [
-        {
-          "name": "AuthMethod",
-          "dataType": "Choice",
-          "default": "Native",
-          "options": ["Native", "LDAP", "OpenID Connect"]
-        }
-      ]
+      "fields": []
     },
     {
       "entityType": "Permission",
@@ -133,7 +158,7 @@
           "name": "Scope",
           "dataType": "Choice",
           "default": "Read Only",
-          "options": ["Read Only", "Read and Write"],
+          "choices": ["Read Only", "Read and Write"],
           "storageScope": "Configuration"
         },
         {
@@ -199,7 +224,9 @@
         "Children": [
           {
             "entityType": "User",
-            "Name": "qei"
+            "Name": "qei",
+            "Secret": "__hashpw__(qei)",
+            "Active": true
           }
         ]
       }
