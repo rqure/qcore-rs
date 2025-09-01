@@ -1,5 +1,4 @@
-use qlib_rs::ft::CURRENT_LEADER;
-use qlib_rs::{et, ft, notification_channel, now, epoch, schoice, sread, sref, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, Snowflake, StoreMessage, StoreTrait, Timestamp};
+use qlib_rs::{epoch, et, ft, notification_channel, now, schoice, sread, sref, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, PushCondition, Snowflake, StoreMessage, StoreTrait};
 use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
@@ -2357,7 +2356,7 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
             let mut store = state.store.write().await;
 
             // Find us as a candidate
-            let candidate = {
+            let me_as_candidate = {
                 let machine = state.config.machine.clone();
 
                 let mut candidates = store.find_entities(
@@ -2425,60 +2424,74 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
                     }
 
                     store.perform_mut(&mut vec![
-                        swrite!(ft_entity_id.clone(), ft::available_list(), Some(qlib_rs::Value::EntityList(available.clone()))),
+                        swrite!(ft_entity_id.clone(), ft::available_list(), Some(qlib_rs::Value::EntityList(available.clone())), PushCondition::Changes),
                     ]).await?;
 
-                    // Now we must promote an available candidate to leader
-                    // if the current leader is no longer available.
-                    // Note that we want to promote to the next available leader in the candidate list
-                    // rather than the first available candidate.
-                    let current_leader = ft_fields
-                        .get(&ft::current_leader())
-                        .unwrap()
-                        .value()
-                        .unwrap()
-                        .expect_entity_reference()?;
+                    let mut handle_me_as_candidate = false;
+                    if let Some(me_as_candidate) = &me_as_candidate {
+                        // If we're not in the candidate list, we can't be leader
+                        if candidates.contains(me_as_candidate) {
+                            handle_me_as_candidate = true;
 
-                    if current_leader.is_none() {
-                        store.perform_mut(&mut vec![
-                            swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(available.first().cloned())),
-                        ]).await?;
+                            store.perform_mut(&mut vec![
+                                swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(Some(me_as_candidate.clone())), PushCondition::Changes)
+                            ]).await?;
+                        }
                     }
-                    else if let Some(current_leader) = current_leader {
-                        if !available.contains(&current_leader) {
-                            // Find the position of the current leader in the candidate list
-                            let current_leader_idx = candidates.iter().position(|c| c.clone() == current_leader.clone());
-                            
-                            if let Some(current_idx) = current_leader_idx {
-                                // Find the next available candidate after the current leader in the candidate list
-                                let mut next_leader = None;
+
+                    if !handle_me_as_candidate {
+                        // Now we must promote an available candidate to leader
+                        // if the current leader is no longer available.
+                        // Note that we want to promote to the next available leader in the candidate list
+                        // rather than the first available candidate.
+                        let current_leader = ft_fields
+                            .get(&ft::current_leader())
+                            .unwrap()
+                            .value()
+                            .unwrap()
+                            .expect_entity_reference()?;
+
+                        if current_leader.is_none() {
+                            store.perform_mut(&mut vec![
+                                swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(available.first().cloned()), PushCondition::Changes),
+                            ]).await?;
+                        }
+                        else if let Some(current_leader) = current_leader {
+                            if !available.contains(&current_leader) {
+                                // Find the position of the current leader in the candidate list
+                                let current_leader_idx = candidates.iter().position(|c| c.clone() == current_leader.clone());
                                 
-                                // Start searching from the position after the current leader
-                                for i in (current_idx + 1)..candidates.len() {
-                                    if available.contains(&candidates[i]) {
-                                        next_leader = Some(candidates[i].clone());
-                                        break;
-                                    }
-                                }
-                                
-                                // If no leader found after current position, wrap around to the beginning
-                                if next_leader.is_none() {
-                                    for i in 0..=current_idx {
+                                if let Some(current_idx) = current_leader_idx {
+                                    // Find the next available candidate after the current leader in the candidate list
+                                    let mut next_leader = None;
+                                    
+                                    // Start searching from the position after the current leader
+                                    for i in (current_idx + 1)..candidates.len() {
                                         if available.contains(&candidates[i]) {
                                             next_leader = Some(candidates[i].clone());
                                             break;
                                         }
                                     }
+                                    
+                                    // If no leader found after current position, wrap around to the beginning
+                                    if next_leader.is_none() {
+                                        for i in 0..=current_idx {
+                                            if available.contains(&candidates[i]) {
+                                                next_leader = Some(candidates[i].clone());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    store.perform_mut(&mut vec![
+                                        swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(next_leader), PushCondition::Changes),
+                                    ]).await?;
+                                } else {
+                                    // Current leader not found in candidates list, just pick the first available
+                                    store.perform_mut(&mut vec![
+                                        swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(available.first().cloned()), PushCondition::Changes),
+                                    ]).await?;
                                 }
-                                
-                                store.perform_mut(&mut vec![
-                                    swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(next_leader)),
-                                ]).await?;
-                            } else {
-                                // Current leader not found in candidates list, just pick the first available
-                                store.perform_mut(&mut vec![
-                                    swrite!(ft_entity_id.clone(), ft::current_leader(), sref!(available.first().cloned())),
-                                ]).await?;
                             }
                         }
                     }
