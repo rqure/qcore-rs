@@ -2,6 +2,7 @@
   "schemas": [
     {
       "entityType": "Object",
+      "inheritsFrom": [],
       "fields": [
         {
           "name": "Name",
@@ -73,6 +74,7 @@
     },
     {
       "entityType": "Candidate",
+      "inheritsFrom": [],
       "fields": [
         {
           "name": "Heartbeat",
@@ -88,7 +90,7 @@
         },
         {
           "name": "DeathDetectionTimeout",
-          "dataType": "Integer",
+          "dataType": "Int",
           "default": 5000,
           "storageScope": "Configuration"
         }

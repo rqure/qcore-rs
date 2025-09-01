@@ -59,8 +59,8 @@ enum Commands {
         data_dir: Option<PathBuf>,
         
         /// Target machine ID for the data directory structure (defaults to "restored")
-        #[arg(long, default_value = "restored")]
-        machine_id: String,
+        #[arg(long)]
+        machine: String,
     },
     /// Normal restore: Connect to QCore service and apply differences from JSON snapshot
     Restore {
@@ -148,8 +148,8 @@ async fn main() -> Result<()> {
         Commands::Take { output, pretty } => {
             take_snapshot(&config.core_url, &username, &password, &output, pretty).await
         }
-        Commands::FactoryRestore { input, force, data_dir, machine_id } => {
-            factory_restore_snapshot(&input, force, data_dir, machine_id).await
+        Commands::FactoryRestore { input, force, data_dir, machine } => {
+            factory_restore_snapshot(&input, force, data_dir, machine).await
         }
         Commands::Restore { input } => {
             normal_restore_snapshot(&config.core_url, &username, &password, &input).await
