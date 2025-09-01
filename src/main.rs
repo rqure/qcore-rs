@@ -34,11 +34,6 @@ struct StateSnapshot {
     config: Config,
     startup_time: u64,
     availability_state: AvailabilityState,
-    is_leader: bool,
-    current_leader: Option<String>,
-    is_fully_synced: bool,
-    became_unavailable_at: Option<u64>,
-    full_sync_request_pending: bool,
 }
 
 impl StateSnapshot {
@@ -268,11 +263,6 @@ impl AppState {
             config: core.config.clone(),
             startup_time: core.startup_time,
             availability_state: core.availability_state.clone(),
-            is_leader: core.is_leader,
-            current_leader: core.current_leader.clone(),
-            is_fully_synced: core.is_fully_synced,
-            became_unavailable_at: core.became_unavailable_at,
-            full_sync_request_pending: core.full_sync_request_pending,
         }
     }
     
@@ -292,27 +282,6 @@ impl AppState {
     async fn get_snapshots_dir(&self) -> PathBuf {
         let machine_data_dir = self.get_machine_data_dir().await;
         machine_data_dir.join("snapshots")
-    }
-
-    /// Set the availability state and handle state transitions
-    async fn set_availability_state(&self, new_state: AvailabilityState) {
-        let mut core = self.core_state.write().await;
-        if core.availability_state != new_state {
-            info!("Availability state transition: {:?} -> {:?}", core.availability_state, new_state);
-            
-            // Track when we become unavailable for grace period timing
-            if matches!(new_state, AvailabilityState::Unavailable) {
-                let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
-                core.became_unavailable_at = Some(current_time);
-                core.full_sync_request_pending = false; // Reset pending flag
-                info!("Became unavailable at timestamp: {}, starting grace period", current_time);
-            } else if matches!(new_state, AvailabilityState::Available) {
-                core.became_unavailable_at = None;
-                core.full_sync_request_pending = false;
-            }
-            
-            core.availability_state = new_state;
-        }
     }
 
     /// Force disconnect all connected clients (used when transitioning to unavailable)
