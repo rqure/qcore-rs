@@ -961,19 +961,20 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
         // All other messages require authentication
         _ => {
             // Check if client is authenticated
-            let is_authenticated = if let Some(ref addr) = client_addr {
+            let client_id = if let Some(ref addr) = client_addr {
                 let state = app_state.read().await;
-                state.authenticated_clients.contains_key(addr)
+                state.authenticated_clients.get(addr).cloned()
             } else {
-                false // No client address means not authenticated
+                None // No client address means not authenticated
             };
             
-            if !is_authenticated {
+            if client_id.is_none() {
                 return StoreMessage::Error {
                     id: "unknown".to_string(),
                     error: "Authentication required".to_string(),
                 };
             }
+            let client_id = client_id.unwrap();
             
             match message {
                 StoreMessage::Authenticate { .. } |
@@ -1063,78 +1064,57 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
                 }
                 
                 StoreMessage::Perform { id, mut requests } => {
-                    // Check if the client is authorized to perform these requests
-                    if let Some(client_addr) = &client_addr {
-                        // Get the authenticated subject ID for this client
-                        let subject_id = {
-                            let state = app_state.read().await;
-                            state.authenticated_clients.get(client_addr).cloned()
-                        };
+                    let permission_cache = &app_state.read().await.permission_cache;
 
-                        if let Some(subject_id) = subject_id {
-                            let permission_cache = &app_state.read().await.permission_cache;
-
-                            if let Some(permission_cache) = permission_cache {
-                                // Check authorization for each request
-                                for request in &requests {
-                                        if let Some(entity_id) = request.entity_id() {
-                                            if let Some(field_type) = request.field_type() {
-                                                match get_scope(
-                                                    app_state.read().await.store.clone(),
-                                                    &mut app_state.write().await.cel_executor,
-                                                    permission_cache,
-                                                    &subject_id,
-                                                    entity_id,
-                                                    field_type,
-                                                ).await {
-                                                    Ok(scope) => {
-                                                        if scope == AuthorizationScope::None {
-                                                            return StoreMessage::PerformResponse {
-                                                                id,
-                                                                response: Err(format!(
-                                                                    "Access denied: Subject {} is not authorized to access {} on entity {}",
-                                                                subject_id,
-                                                                field_type,
-                                                                entity_id
-                                                            )),
-                                                        };
-                                                    }
-                                                    // For write operations, check if we have write access
-                                                    if matches!(request, qlib_rs::Request::Write { .. } | qlib_rs::Request::Create { .. } | qlib_rs::Request::Delete { .. } | qlib_rs::Request::SchemaUpdate { .. }) {
-                                                        if scope == AuthorizationScope::ReadOnly {
-                                                            return StoreMessage::PerformResponse {
-                                                                id,
-                                                                response: Err(format!(
-                                                                    "Access denied: Subject {} only has read access to {} on entity {}",
-                                                                    subject_id,
-                                                                    field_type,
-                                                                    entity_id
-                                                                )),
-                                                            };
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
+                    if let Some(permission_cache) = permission_cache {
+                        // Check authorization for each request
+                        for request in &requests {
+                                if let Some(entity_id) = request.entity_id() {
+                                    if let Some(field_type) = request.field_type() {
+                                        match get_scope(
+                                            app_state.read().await.store.clone(),
+                                            &mut app_state.write().await.cel_executor,
+                                            permission_cache,
+                                            &client_id,
+                                            entity_id,
+                                            field_type,
+                                        ).await {
+                                            Ok(scope) => {
+                                                if scope == AuthorizationScope::None {
                                                     return StoreMessage::PerformResponse {
                                                         id,
-                                                        response: Err(format!("Authorization check failed: {:?}", e)),
+                                                        response: Err(format!(
+                                                            "Access denied: Subject {} is not authorized to access {} on entity {}",
+                                                        client_id,
+                                                        field_type,
+                                                        entity_id
+                                                    )),
+                                                };
+                                            }
+                                            // For write operations, check if we have write access
+                                            if matches!(request, qlib_rs::Request::Write { .. } | qlib_rs::Request::Create { .. } | qlib_rs::Request::Delete { .. } | qlib_rs::Request::SchemaUpdate { .. }) {
+                                                if scope == AuthorizationScope::ReadOnly {
+                                                    return StoreMessage::PerformResponse {
+                                                        id,
+                                                        response: Err(format!(
+                                                            "Access denied: Subject {} only has read access to {} on entity {}",
+                                                            client_id,
+                                                            field_type,
+                                                            entity_id
+                                                        )),
                                                     };
                                                 }
                                             }
                                         }
+                                        Err(e) => {
+                                            return StoreMessage::PerformResponse {
+                                                id,
+                                                response: Err(format!("Authorization check failed: {:?}", e)),
+                                            };
+                                        }
                                     }
                                 }
-                            } else {
-                                return StoreMessage::PerformResponse {
-                                    id,
-                                    response: Err("Authorization cache not available".to_string()),
-                                };
                             }
-                        } else {
-                            return StoreMessage::PerformResponse {
-                                id,
-                                response: Err("Client is not authenticated".to_string()),
-                            };
                         }
                     } else {
                         return StoreMessage::PerformResponse {
@@ -1145,9 +1125,9 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<RwLock<App
 
                     let machine = app_state.read().await.config.machine.clone();
 
-                    // Allow write operations on any peer
                     requests.iter_mut().for_each(|req| {
                         req.try_set_originator(machine.clone());
+                        req.try_set_writer_id(client_id.clone());
                     });
 
                     match app_state
