@@ -130,6 +130,60 @@ cargo run --bin qcore-client -- read "User$123" "age"
 cargo run --bin qcore-client -- read "User$123" "email"
 ```
 
+## Tools
+
+qcore-rs includes several command-line tools for interacting with and managing the data store:
+
+### qcore-client
+
+The main client tool for performing CRUD operations on the data store.
+
+```bash
+# Get cluster metrics and status
+cargo run --bin qcore-client -- metrics
+
+# Create, read, write, and delete entities
+cargo run --bin qcore-client -- create User --name "John Doe"
+cargo run --bin qcore-client -- read "User$123" "name"
+cargo run --bin qcore-client -- write "User$123" "age" "30"
+cargo run --bin qcore-client -- delete "User$123"
+```
+
+### snapshot-tool
+
+Tool for taking and restoring JSON snapshots of the data store.
+
+```bash
+# Take a snapshot
+cargo run --bin snapshot-tool take --output backup.json
+
+# Restore from snapshot
+cargo run --bin snapshot-tool restore --input backup.json
+
+# Factory restore (creates data files directly)
+cargo run --bin snapshot-tool factory-restore --input backup.json --machine-id restored
+
+# Validate a snapshot file
+cargo run --bin snapshot-tool validate --input backup.json
+```
+
+### tree-tool
+
+Display the hierarchical tree structure of the data store, similar to the Unix `tree` command.
+
+```bash
+# Display the complete tree structure
+cargo run --bin tree-tool
+
+# Show with entity types and IDs
+cargo run --bin tree-tool --verbose
+
+# Limit depth and start from specific entity
+cargo run --bin tree-tool --max-depth 3 --start-from "Folder$123"
+```
+
+For detailed usage information, see [README_tree_tool.md](README_tree_tool.md).
+
 ## Node Discovery
 
 The system supports automatic node discovery using multicast DNS (mDNS). This allows nodes to find each other on local networks without manual configuration.

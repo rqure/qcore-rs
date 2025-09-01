@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "snapshot-tool"
 path = "src/bin/snapshot-tool.rs"
 
+[[bin]]
+name = "tree-tool"
+path = "src/bin/tree-tool.rs"
+
 [dependencies]
 anyhow = "1.0"
 bincode = "1.3"
