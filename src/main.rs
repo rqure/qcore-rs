@@ -17,6 +17,7 @@ use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
+use time;
 
 /// Application availability state
 #[derive(Debug, Clone, PartialEq)]
@@ -1221,7 +1222,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 
                 StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
                     match app_state
-                        .read().await
                         .store
                         .read().await
                         .find_entities_paginated(&entity_type, page_opts, filter).await {
@@ -1238,7 +1238,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 
                 StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
                     match app_state
-                        .read().await
                         .store
                         .read().await
                         .find_entities_exact(&entity_type, page_opts, filter).await {
@@ -1255,7 +1254,6 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 
                 StoreMessage::GetEntityTypes { id, page_opts } => {
                     match app_state
-                        .read().await
                         .store
                         .read().await
                         .get_entity_types_paginated(page_opts).await {
@@ -1507,8 +1505,7 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
     
     // Get a clone of the write channel receiver
     let receiver = {
-        let state = app_state.read().await;
-        let store = &state.store;
+        let store = &app_state.store;
         let store_guard = store.read().await;
         store_guard.inner().get_write_channel_receiver()
     };
@@ -1533,8 +1530,8 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                 
                 // Collect all requests that originated from this machine for batch synchronization
                 let current_machine = {
-                    let state = app_state.read().await;
-                    state.config.machine.clone()
+                    let core = app_state.core_state.read().await;
+                    core.config.machine.clone()
                 };
                 
                 let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
@@ -1554,8 +1551,8 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                     
                     // Send to all connected outbound peers using PeerMessage
                     let peers_to_notify = {
-                        let state = app_state.read().await;
-                        state.connected_outbound_peers.clone()
+                        let connections = app_state.connections.read().await;
+                        connections.connected_outbound_peers.clone()
                     };
                     
                     // Create a batch sync message
@@ -1719,19 +1716,22 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
             };
             
             // Store snapshot count and machine ID before dropping locks
-            let wal_files_count = wal_state.wal_files_since_snapshot;
+            let _wal_files_count = wal_state.wal_files_since_snapshot;
             
             // Save the snapshot to disk
             match save_snapshot(&snapshot, app_state.clone()).await {
                 Ok(snapshot_counter) => {
                     // Reset the WAL files counter
-                    let mut state = app_state.write().await;
-                    state.wal_files_since_snapshot = 0;
+                    let mut wal_state = app_state.wal_state.write().await;
+                    wal_state.wal_files_since_snapshot = 0;
                     info!("Snapshot saved successfully after WAL rollover");
                     
                     // Write a snapshot marker to the WAL to indicate the snapshot point
-                    let machine_id = state.config.machine.clone();
-                    drop(state); // Release the lock before writing to WAL
+                    let machine_id = {
+                        let core = app_state.core_state.read().await;
+                        core.config.machine.clone()
+                    };
+                    drop(wal_state); // Release the lock before writing to WAL
                     
                     let snapshot_request = qlib_rs::Request::Snapshot {
                         snapshot_counter,
@@ -1748,8 +1748,8 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
             }
             
             // Re-acquire the state locks for cleanup
-            let wal_state = app_state.wal_state.read().await;
-            let core_state = app_state.core_state.read().await;
+            let _wal_state = app_state.wal_state.read().await;
+            let _core_state = app_state.core_state.read().await;
         }
         
         // Clean up old WAL files if we exceed the maximum
@@ -2260,31 +2260,31 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
         
         // Check if we need to send a full sync request after grace period
         let (should_send_full_sync, is_leader) = {
-            let state = app_state.read().await;
+            let core = app_state.core_state.read().await;
             
             // Only check if we're unavailable, not the leader, not fully synced, and haven't sent a request yet
-            if matches!(state.availability_state, AvailabilityState::Unavailable) &&
-               !state.is_leader &&
-               !state.is_fully_synced &&
-               !state.full_sync_request_pending {
+            if matches!(core.availability_state, AvailabilityState::Unavailable) &&
+               !core.is_leader &&
+               !core.is_fully_synced &&
+               !core.full_sync_request_pending {
                 
-                if let Some(became_unavailable_at) = state.became_unavailable_at {
+                if let Some(became_unavailable_at) = core.became_unavailable_at {
                     let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
                     
-                    let grace_period_secs = state.config.full_sync_grace_period_secs;
+                    let grace_period_secs = core.config.full_sync_grace_period_secs;
                     let elapsed = current_time.saturating_sub(became_unavailable_at);
                     
                     if elapsed >= grace_period_secs {
                         // Grace period has expired, check if we have a known leader
-                        (state.current_leader.clone(), state.is_leader)
+                        (core.current_leader.clone(), core.is_leader)
                     } else {
-                        (None, state.is_leader)
+                        (None, core.is_leader)
                     }
                 } else {
-                    (None, state.is_leader)
+                    (None, core.is_leader)
                 }
             } else {
-                (None, state.is_leader)
+                (None, core.is_leader)
             }
         };
         
@@ -2293,14 +2293,14 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
             
             // Mark that we're sending a request to avoid duplicates
             {
-                let mut state = app_state.write().await;
-                state.full_sync_request_pending = true;
+                let mut core = app_state.core_state.write().await;
+                core.full_sync_request_pending = true;
             }
             
             // Send FullSyncRequest to the leader through any connected outbound peer
             let machine_id = {
-                let state = app_state.read().await;
-                state.config.machine.clone()
+                let core = app_state.core_state.read().await;
+                core.config.machine.clone()
             };
             
             let full_sync_request = PeerMessage::FullSyncRequest {
@@ -2312,10 +2312,10 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                 
                 // Try to send to any connected outbound peer
                 let sent = {
-                    let state = app_state.read().await;
+                    let connections = app_state.connections.read().await;
                     let mut sent = false;
                     
-                    for (peer_addr, sender) in &state.connected_outbound_peers {
+                    for (peer_addr, sender) in &connections.connected_outbound_peers {
                         if let Err(e) = sender.send(message.clone()) {
                             warn!("Failed to send FullSyncRequest to peer {}: {}", peer_addr, e);
                         } else {
@@ -2330,31 +2330,33 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                 if !sent {
                     warn!("No connected outbound peers available to send FullSyncRequest to leader {}", leader_machine_id);
                     // Reset the pending flag so we can try again later
-                    let mut state = app_state.write().await;
-                    state.full_sync_request_pending = false;
+                    let mut core = app_state.core_state.write().await;
+                    core.full_sync_request_pending = false;
                 }
             } else {
                 error!("Failed to serialize FullSyncRequest");
-                let mut state = app_state.write().await;
-                state.full_sync_request_pending = false;
+                let mut core = app_state.core_state.write().await;
+                core.full_sync_request_pending = false;
             }
         }
 
         // Process cache notifications
         {
-            let mut state = app_state.write().await;
-            if let Some(permission_cache) = &mut state.permission_cache {
-                permission_cache.process_notifications();
+            let mut permission_cache = app_state.permission_cache.write().await;
+            if let Some(cache) = permission_cache.as_mut() {
+                cache.process_notifications();
             }
         }
 
         if is_leader {
-            let state = app_state.read().await;
-            let mut store = state.store.write().await;
+            let mut store = app_state.store.write().await;
 
             // Find us as a candidate
             let me_as_candidate = {
-                let machine = state.config.machine.clone();
+                let machine = {
+                    let core = app_state.core_state.read().await;
+                    core.config.machine.clone()
+                };
 
                 let mut candidates = store.find_entities(
                     &et::candidate(), 
@@ -2511,9 +2513,11 @@ async fn handle_heartbeat_writing(app_state: Arc<AppState>) -> Result<()> {
         interval.tick().await;
         
         {
-            let state = app_state.read().await;
-            let mut store = state.store.write().await;
-            let machine = state.config.machine.clone();
+            let mut store = app_state.store.write().await;
+            let machine = {
+                let core = app_state.core_state.read().await;
+                core.config.machine.clone()
+            };
 
             let candidates = store.find_entities(
                 &et::candidate(), 
@@ -2532,10 +2536,10 @@ async fn handle_heartbeat_writing(app_state: Arc<AppState>) -> Result<()> {
 }
 
 async fn reinit_caches(app_state: Arc<AppState>) -> Result<()> {
-    let mut state = app_state.write().await;
+    let mut permission_cache = app_state.permission_cache.write().await;
 
-    state.permission_cache = Some(Cache::new(
-        state.store.clone(),
+    *permission_cache = Some(Cache::new(
+        app_state.store.clone(),
         et::permission(),
         vec![ft::resource_type(), ft::resource_field()],
         vec![ft::scope(), ft::condition()]
@@ -2589,8 +2593,8 @@ async fn main() -> Result<()> {
         
         // Initialize the snapshot file counter
         let next_snapshot_counter = get_next_snapshot_counter(app_state.clone()).await?;
-        let mut state = app_state.write().await;
-        state.snapshot_file_counter = next_snapshot_counter;
+        let mut wal_state = app_state.wal_state.write().await;
+        wal_state.snapshot_file_counter = next_snapshot_counter;
     }
 
     // Replay WAL files to bring the store up to date
@@ -2672,7 +2676,10 @@ async fn main() -> Result<()> {
             // This helps during replay to know that the state was snapshotted at shutdown
             let snapshot_request = qlib_rs::Request::Snapshot {
                 snapshot_counter,
-                originator: Some(app_state.read().await.config.machine.clone()),
+                originator: Some({
+                    let core = app_state.core_state.read().await;
+                    core.config.machine.clone()
+                }),
             };
             
             if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
