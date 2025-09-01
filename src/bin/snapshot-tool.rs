@@ -558,7 +558,7 @@ fn compute_snapshot_diff(current: &JsonSnapshot, target: &JsonSnapshot) -> Resul
                     });
                 }
             }
-            None => {
+            _ => {
                 schema_changes.push(SchemaChange::Added((*target_schema).clone()));
             }
         }
