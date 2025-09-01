@@ -31,7 +31,7 @@
     },
     {
       "entityType": "Root",
-      "inheritsFrom": "Object",
+      "inheritsFrom": ["Object"],
       "fields": [
         {
           "name": "CreatedEntity",
@@ -52,17 +52,17 @@
     },
     {
       "entityType": "Folder",
-      "inheritsFrom": "Object",
+      "inheritsFrom": ["Object"],
       "fields": []
     },
     {
       "entityType": "Machine",
-      "inheritsFrom": "Object",
+      "inheritsFrom": ["Object"],
       "fields": []
     },
     {
       "entityType": "Subject",
-      "inheritsFrom": "Object",
+      "inheritsFrom": ["Object"],
       "fields": [
         {
           "name": "Secret",
@@ -73,7 +73,7 @@
     },
     {
       "entityType": "Candidate",
-      "inheritsFrom": "Subject",
+      "inheritsFrom": ["Subject"],
       "fields": [
         {
           "name": "Heartbeat",
@@ -103,17 +103,17 @@
     },
     {
       "entityType": "Service",
-      "inheritsFrom": "Candidate",
+      "inheritsFrom": ["Candidate"],
       "fields": []
     },
     {
       "entityType": "Tool",
-      "inheritsFrom": "Subject",
+      "inheritsFrom": ["Subject"],
       "fields": []
     },
     {
       "entityType": "User",
-      "inheritsFrom": "Subject",
+      "inheritsFrom": ["Subject"],
       "fields": [
         {
           "name": "AuthMethod",
@@ -125,7 +125,7 @@
     },
     {
       "entityType": "Permission",
-      "inheritsFrom": "Object",
+      "inheritsFrom": ["Object"],
       "fields": [
         {
           "name": "Scope",
@@ -156,7 +156,7 @@
     },
     {
       "entityType": "FaultTolerance",
-      "inheritsFrom": "Object",
+      "inheritsFrom": ["Object"],
       "fields": [
         {
           "name": "CandidateList",

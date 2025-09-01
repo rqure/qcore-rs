@@ -465,8 +465,8 @@ fn print_snapshot_summary(snapshot: &JsonSnapshot) {
     Progress::info(&format!("Snapshot contains {} schemas:", snapshot.schemas.len()));
     
     for schema in &snapshot.schemas {
-        let inheritance = if let Some(ref inherits) = schema.inherits_from {
-            format!(" (inherits from {})", inherits)
+        let inheritance = if !schema.inherits_from.is_empty() {
+            format!(" (inherits from {})", schema.inherits_from.join(", "))
         } else {
             String::new()
         };
@@ -717,8 +717,8 @@ fn format_diff_report_text(diff: &SnapshotDiff) -> String {
             match change {
                 SchemaChange::Added(schema) => {
                     report.push_str(&format!("+ ADDED SCHEMA: {}\n", schema.entity_type));
-                    if let Some(ref inherits) = schema.inherits_from {
-                        report.push_str(&format!("  Inherits from: {}\n", inherits));
+                    if !schema.inherits_from.is_empty() {
+                        report.push_str(&format!("  Inherits from: {}\n", schema.inherits_from.join(", ")));
                     }
                     report.push_str(&format!("  Fields: {}\n", schema.fields.len()));
                 }
