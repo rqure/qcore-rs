@@ -12,7 +12,7 @@ use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use std::vec;
 use tokio::sync::RwLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::path::PathBuf;
@@ -187,10 +187,7 @@ struct PeerInfo {
 
 impl AppState {
     async fn new(config: Config) -> Result<Self> {
-        let startup_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
 
         let store = Arc::new(RwLock::new(AsyncStore::new(Arc::new(Snowflake::new()))));
         
@@ -243,10 +240,7 @@ impl AppState {
             
             // Track when we become unavailable for grace period timing
             if matches!(new_state, AvailabilityState::Unavailable) {
-                let current_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
                 self.became_unavailable_at = Some(current_time);
                 self.full_sync_request_pending = false; // Reset pending flag
                 info!("Became unavailable at timestamp: {}, starting grace period", current_time);
@@ -398,10 +392,7 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
         // Also remove from peer_info if present
         state.peer_info.retain(|_, info| {
             // Remove peers that haven't been seen recently (this connection ending)
-            let current_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
             current_time - info.last_seen < 60 // Keep peers seen within last 60 seconds
         });
     }
@@ -417,10 +408,7 @@ async fn handle_peer_message(
     ws_sender: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
     app_state: Arc<RwLock<AppState>>,
 ) {
-    let current_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
 
     match peer_msg {
         PeerMessage::Startup { machine_id, startup_time } => {
@@ -677,10 +665,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<RwLock<
         state.connected_outbound_peers.remove(peer_addr);
         // Also remove from peer_info when connection ends
         state.peer_info.retain(|_, info| {
-            let current_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
             current_time - info.last_seen < 60 // Keep peers seen within last 60 seconds
         });
     }
@@ -2269,10 +2254,7 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
                !state.full_sync_request_pending {
                 
                 if let Some(became_unavailable_at) = state.became_unavailable_at {
-                    let current_time = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
                     
                     let grace_period_secs = state.config.full_sync_grace_period_secs;
                     let elapsed = current_time.saturating_sub(became_unavailable_at);
@@ -2404,13 +2386,14 @@ async fn handle_misc_tasks(app_state: Arc<RwLock<AppState>>) -> Result<()> {
                             .unwrap()
                             .expect_choice()?;
 
-                        let death_detection_timeout_duration = candidate_fields
+                        let death_detection_timeout_timestamp = candidate_fields
                             .get(&ft::death_detection_timeout())
                             .unwrap()
                             .value()
                             .unwrap()
-                            .expect_timestamp()?
-                            .duration_since(epoch()).unwrap_or_default();
+                            .expect_timestamp()?;
+                        
+                        let death_detection_timeout_duration = death_detection_timeout_timestamp - epoch();
 
                         let desired_availability = match make_me {
                             1 => AvailabilityState::Available,
