@@ -73,7 +73,6 @@
     },
     {
       "entityType": "Candidate",
-      "inheritsFrom": ["Subject"],
       "fields": [
         {
           "name": "Heartbeat",
@@ -92,7 +91,13 @@
           "dataType": "Integer",
           "default": 5000,
           "storageScope": "Configuration"
-        },
+        }
+      ]
+    },
+    {
+      "entityType": "Service",
+      "inheritsFrom": ["Subject", "Candidate"],
+      "fields": [
         {
           "name": "Status",
           "dataType": "Choice",
@@ -100,11 +105,6 @@
           "options": ["Offline", "Online"]
         }
       ]
-    },
-    {
-      "entityType": "Service",
-      "inheritsFrom": ["Candidate"],
-      "fields": []
     },
     {
       "entityType": "Tool",
