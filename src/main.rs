@@ -330,11 +330,6 @@ impl AppState {
 /// Handle a single peer WebSocket connection
 #[instrument(skip(stream, app_state), fields(peer_addr = %peer_addr))]
 async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAddr, app_state: Arc<AppState>) -> Result<()> {
-    let machine = {
-        let core = app_state.core_state.read().await;
-        core.config.machine.clone()
-    };
-
     info!("Accepting inbound peer connection");
     
     let ws_stream = accept_async(stream).await?;
@@ -355,41 +350,7 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
                         handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, app_state.clone()).await;
                     }
                     Err(_) => {
-                        // Try to parse as a Request for synchronization (legacy support)
-                        match serde_json::from_str::<qlib_rs::Request>(&text) {
-                            Ok(request) => {
-                                debug!("Received legacy sync request from peer");
-                                
-                                // Apply the request to our store if it doesn't already have an originator
-                                // (to avoid infinite loops) and ensure the current timestamp is preserved
-                                if let Some(originator) = request.originator() {
-                                    if *originator != machine {
-                                        let store = app_state.store.clone();
-                                        let mut store_guard = store.write().await;
-                                        
-                                        let mut requests = vec![request];
-                                        if let Err(e) = store_guard.perform_mut(&mut requests).await {
-                                            error!(error = %e, "Failed to apply sync request from peer");
-                                        } else {
-                                            debug!("Successfully applied sync request from peer");
-                                        }
-                                    }
-                                } else {
-                                    debug!("Ignoring request without originator from peer");
-                                }
-                            }
-                            Err(_) => {
-                                // Not a sync request, treat as regular peer message
-                                debug!("Received non-sync message from peer");
-                                
-                                // Echo back for now - this would be replaced with actual peer protocol handling
-                                let response = Message::Text(format!("{{\"type\":\"echo\",\"data\":{}}}", text));
-                                if let Err(e) = ws_sender.send(response).await {
-                                    error!(error = %e, "Failed to send response to peer");
-                                    break;
-                                }
-                            }
-                        }
+                        debug!("Received non-peer text message from peer, ignoring")
                     }
                 }
             }
