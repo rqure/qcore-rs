@@ -1608,12 +1608,20 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
         };
         
         match requests {
-            Some(requests) => {
+            Some(mut requests) => {
                 debug!(
                     count = requests.len(),
                     requests = ?requests,
                     "Writing requests to WAL"
                 );
+                
+                // Collect all requests that originated from this machine for batch synchronization
+                let current_machine = {
+                    let core = app_state.core_state.read().await;
+                    core.config.machine.clone()
+                };
+
+                requests.iter_mut().for_each(|req| req.try_set_originator(current_machine.clone()));
                 
                 // Write all requests to WAL file - the requests have already been applied to the store
                 for request in &requests {
@@ -1624,12 +1632,6 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                         );
                     }
                 }
-                
-                // Collect all requests that originated from this machine for batch synchronization
-                let current_machine = {
-                    let core = app_state.core_state.read().await;
-                    core.config.machine.clone()
-                };
                 
                 let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
                     .filter(|request| {
