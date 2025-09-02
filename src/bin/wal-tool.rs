@@ -54,6 +54,10 @@ struct Config {
     #[arg(long)]
     field_type: Option<String>,
 
+    /// Filter by entity type
+    #[arg(long)]
+    entity_type: Option<String>,
+
     /// Show verbose output with all request details
     #[arg(long, short)]
     verbose: bool,
@@ -65,7 +69,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "wal_tool=info".to_string())
+                .unwrap_or_else(|_| "wal_tool=warn".to_string())
         )
         .with_target(false)
         .without_time()
@@ -313,6 +317,31 @@ impl WalReader {
             }
         }
 
+        // Check entity type filter
+        if let Some(ref filter_entity_type) = self.config.entity_type {
+            match request {
+                Request::Read { entity_id, .. } | Request::Write { entity_id, .. } | Request::Delete { entity_id, .. } => {
+                    if entity_id.get_type().as_ref() != filter_entity_type {
+                        return false;
+                    }
+                },
+                Request::Create { entity_type, .. } => {
+                    if entity_type.as_ref() != filter_entity_type {
+                        return false;
+                    }
+                },
+                Request::SchemaUpdate { schema, .. } => {
+                    if schema.entity_type.as_ref() != filter_entity_type {
+                        return false;
+                    }
+                },
+                Request::Snapshot { .. } => {
+                    // Snapshots don't have entity types, so they don't match entity type filters
+                    return false;
+                }
+            }
+        }
+
         true
     }
 
@@ -403,26 +432,56 @@ impl WalReader {
     }
 
     async fn follow_mode(&self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
-        info!("Entering follow mode - monitoring for new WAL files...");
+        info!("Entering follow mode - monitoring for new WAL entries...");
         
-        // In a real implementation, we would use inotify or similar to watch for file changes
-        // For now, we'll poll periodically
-        let mut last_processed_files = self.find_wal_files().await?;
+        // Keep track of file sizes to detect new content
+        let mut file_positions: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
+        
+        // Initialize positions for existing files
+        let initial_files = self.find_wal_files().await?;
+        for (file_path, _counter) in &initial_files {
+            if let Ok(metadata) = tokio::fs::metadata(file_path).await {
+                file_positions.insert(file_path.clone(), metadata.len());
+            }
+        }
+        
+        info!("Following {} WAL files for new entries", file_positions.len());
         
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             
             let current_files = self.find_wal_files().await?;
             
-            // Process any new files
+            // Check for new files
             for (file_path, _counter) in &current_files {
-                if !last_processed_files.iter().any(|(path, _)| path == file_path) {
+                if !file_positions.contains_key(file_path) {
                     info!("New WAL file detected: {}", file_path.display());
                     self.process_wal_file(file_path, start_time, end_time).await?;
+                    
+                    // Track this new file
+                    if let Ok(metadata) = tokio::fs::metadata(file_path).await {
+                        file_positions.insert(file_path.clone(), metadata.len());
+                    }
                 }
             }
             
-            last_processed_files = current_files;
+            // Check existing files for new content
+            for (file_path, last_size) in file_positions.clone().iter() {
+                if let Ok(metadata) = tokio::fs::metadata(file_path).await {
+                    let current_size = metadata.len();
+                    if current_size > *last_size {
+                        // File has grown, process new content
+                        if let Err(e) = self.process_wal_file_from_offset(file_path, *last_size as usize, start_time, end_time).await {
+                            warn!("Failed to process new content in {}: {}", file_path.display(), e);
+                        } else {
+                            file_positions.insert(file_path.clone(), current_size);
+                        }
+                    }
+                }
+            }
+            
+            // Remove files that no longer exist
+            file_positions.retain(|path, _| path.exists());
             
             // Check if we should stop due to end time
             if let Some(end) = end_time {
@@ -433,6 +492,57 @@ impl WalReader {
             }
         }
         
+        Ok(())
+    }
+
+    async fn process_wal_file_from_offset(&self, wal_path: &PathBuf, start_offset: usize, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+        let mut file = File::open(wal_path).await?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).await?;
+
+        if start_offset >= buffer.len() {
+            return Ok(()); // Nothing new to process
+        }
+
+        let mut offset = start_offset;
+        let mut entries_processed = 0;
+
+        while offset < buffer.len() {
+            // Read length prefix (4 bytes)
+            if offset + 4 > buffer.len() {
+                break; // Not enough data for length prefix
+            }
+
+            let len_bytes = [buffer[offset], buffer[offset+1], buffer[offset+2], buffer[offset+3]];
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            offset += 4;
+
+            // Read the serialized request
+            if offset + len > buffer.len() {
+                break; // Incomplete request
+            }
+
+            let request_data = &buffer[offset..offset + len];
+            offset += len;
+
+            // Parse the request
+            match serde_json::from_slice::<Request>(request_data) {
+                Ok(request) => {
+                    if self.should_show_request(&request, start_time, end_time) {
+                        self.print_request(&request, wal_path, entries_processed);
+                        entries_processed += 1;
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to parse request in {}: {}", wal_path.display(), e);
+                }
+            }
+        }
+
+        if entries_processed > 0 {
+            info!("Processed {} new entries from {}", entries_processed, wal_path.display());
+        }
+
         Ok(())
     }
 }
