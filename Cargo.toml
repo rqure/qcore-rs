@@ -19,8 +19,13 @@ path = "src/bin/tree-tool.rs"
 name = "wal-tool"
 path = "src/bin/wal-tool.rs"
 
+[[bin]]
+name = "select-tool"
+path = "src/bin/select-tool.rs"
+
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 bincode = "1.3"
 clap = { version = "4.5.45", features = ["derive"] }
 futures-util = "0.3"
