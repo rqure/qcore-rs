@@ -623,18 +623,19 @@ async fn handle_peer_message(
                 core.config.machine.clone()
             };
             
-            // Check if any request in the batch originated from a different machine
-            let should_apply = requests.iter().any(|request| {
-                if let Some(originator) = request.originator() {
-                    *originator != our_machine_id
-                } else {
-                    false
-                }
-            });
+            // Filter requests to only include those with valid originators (different from our machine)
+            let mut requests_to_apply: Vec<_> = requests.into_iter()
+                .filter(|request| {
+                    if let Some(originator) = request.originator() {
+                        *originator != our_machine_id
+                    } else {
+                        false
+                    }
+                })
+                .collect();
             
-            if should_apply {
+            if !requests_to_apply.is_empty() {
                 let mut store_guard = app_state.store.write().await;
-                let mut requests_to_apply = requests;
                 if let Err(e) = store_guard.perform_mut(&mut requests_to_apply).await {
                     error!(
                         error = %e,
@@ -648,7 +649,7 @@ async fn handle_peer_message(
                     );
                 }
             } else {
-                debug!("Ignoring sync requests without originator from peer");
+                debug!("No valid sync requests to apply from peer");
             }
         }
     }
