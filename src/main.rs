@@ -426,51 +426,52 @@ async fn handle_peer_message(
             let our_machine_id = state_snapshot.config.machine.clone();
             
             // Find the earliest (largest) startup time among all known peers including ourselves
-            let peer_info = app_state.peer_info.read().await;
-            let earliest_startup = peer_info.values()
-                .map(|p| p.startup_time)
-                .min()
-                .unwrap_or(our_startup_time)
-                .min(our_startup_time);
-            
-            let mut should_be_leader = our_startup_time <= earliest_startup;
-            
-            // Handle startup time ties
-            if our_startup_time == earliest_startup {
-                let peers_with_same_time: Vec<_> = peer_info.values()
-                    .filter(|p| p.startup_time == our_startup_time)
-                    .collect();
+            let (should_be_leader, earliest_startup) = {
+                let peer_info = app_state.peer_info.read().await;
+                let earliest_startup = peer_info.values()
+                    .map(|p| p.startup_time)
+                    .min()
+                    .unwrap_or(our_startup_time)
+                    .min(our_startup_time);
                 
-                if !peers_with_same_time.is_empty() {
-                    // We have a tie, use machine_id as tiebreaker
-                    info!(
-                        peer_count = peers_with_same_time.len(),
-                        startup_time = our_startup_time,
-                        "Startup time tie detected, using machine_id as tiebreaker"
-                    );
+                let mut should_be_leader = our_startup_time <= earliest_startup;
+                
+                // Handle startup time ties
+                if our_startup_time == earliest_startup {
+                    let peers_with_same_time: Vec<_> = peer_info.values()
+                        .filter(|p| p.startup_time == our_startup_time)
+                        .collect();
                     
-                    let mut all_machine_ids = peers_with_same_time.iter()
-                        .map(|p| p.machine_id.as_str())
-                        .collect::<Vec<_>>();
-                    all_machine_ids.push(our_machine_id.as_str());
-                    
-                    let min_machine_id = all_machine_ids.iter().min().unwrap();
-                    should_be_leader = **min_machine_id == our_machine_id;
+                    if !peers_with_same_time.is_empty() {
+                        // We have a tie, use machine_id as tiebreaker
+                        info!(
+                            peer_count = peers_with_same_time.len(),
+                            startup_time = our_startup_time,
+                            "Startup time tie detected, using machine_id as tiebreaker"
+                        );
+                        
+                        let mut all_machine_ids = peers_with_same_time.iter()
+                            .map(|p| p.machine_id.as_str())
+                            .collect::<Vec<_>>();
+                        all_machine_ids.push(our_machine_id.as_str());
+                        
+                        let min_machine_id = all_machine_ids.iter().min().unwrap();
+                        should_be_leader = **min_machine_id == our_machine_id;
+                    }
                 }
-            }
-            
-            drop(peer_info); // Release peer_info lock
+
+                (should_be_leader, earliest_startup)
+            };
             
             // Update leadership status
-            let mut core_state = app_state.core_state.write().await;
             if should_be_leader {
+                let mut core_state = app_state.core_state.write().await;
                 core_state.is_leader = true;
                 core_state.current_leader = Some(our_machine_id.clone());
                 core_state.is_fully_synced = true;
                 let new_state = AvailabilityState::Available;
                 let old_state = core_state.availability_state.clone();
                 core_state.availability_state = new_state.clone();
-                drop(core_state); // Release lock before async call
                 
                 if old_state != new_state {
                     info!(
@@ -485,28 +486,33 @@ async fn handle_peer_message(
                     "Elected as leader"
                 );
             } else {
-                core_state.is_leader = false;
-                let new_state = AvailabilityState::Unavailable;
-                let old_state = core_state.availability_state.clone();
-                core_state.availability_state = new_state.clone();
-                
                 let leader = {
-                    let peer_info = app_state.peer_info.read().await;
-                    peer_info.values()
-                        .filter(|p| p.startup_time <= earliest_startup)
-                        .min_by_key(|p| (&p.startup_time, &p.machine_id))
-                        .map(|p| p.machine_id.clone())
+                    let mut core_state = app_state.core_state.write().await;
+                    core_state.is_leader = false;
+                    let new_state = AvailabilityState::Unavailable;
+                    let old_state = core_state.availability_state.clone();
+                    core_state.availability_state = new_state.clone();
+                    
+                    let leader = {
+                        let peer_info = app_state.peer_info.read().await;
+                        peer_info.values()
+                            .filter(|p| p.startup_time <= earliest_startup)
+                            .min_by_key(|p| (&p.startup_time, &p.machine_id))
+                            .map(|p| p.machine_id.clone())
+                    };
+                    core_state.current_leader = leader.clone();
+                                
+                    if old_state != new_state {
+                        info!(
+                            old_state = ?old_state,
+                            new_state = ?new_state,
+                            "Availability state transition"
+                        );
+                    }
+
+                    leader
                 };
-                core_state.current_leader = leader.clone();
-                drop(core_state); // Release lock before async calls
-                
-                if old_state != new_state {
-                    info!(
-                        old_state = ?old_state,
-                        new_state = ?new_state,
-                        "Availability state transition"
-                    );
-                }
+
                 app_state.force_disconnect_all_clients().await;
                 info!(
                     leader = ?leader,
@@ -2793,14 +2799,39 @@ async fn handle_heartbeat_writing(app_state: Arc<AppState>) -> Result<()> {
 }
 
 async fn reinit_caches(app_state: Arc<AppState>) -> Result<()> {
-    let mut permission_cache = app_state.permission_cache.write().await;
+    {
+        let mut permission_cache = app_state.permission_cache.write().await;
 
-    *permission_cache = Some(Cache::new(
-        app_state.store.clone(),
-        et::permission(),
-        vec![ft::resource_type(), ft::resource_field()],
-        vec![ft::scope(), ft::condition()]
-    ).await?);
+        *permission_cache = Some(Cache::new(
+            app_state.store.clone(),
+            et::permission(),
+            vec![ft::resource_type(), ft::resource_field()],
+            vec![ft::scope(), ft::condition()]
+        ).await?);
+    }
+
+    {
+        let mut store = app_state.store.write().await;
+        
+        let me_as_candidate = {
+            let machine = {
+                let core = app_state.core_state.read().await;
+                core.config.machine.clone()
+            };
+
+            let mut candidates = store.find_entities(
+                &et::candidate(), 
+                Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))).await?;
+
+            candidates.pop()
+        };
+
+        if let Some(candidate_id) = &me_as_candidate {
+            store.inner_mut().default_writer_id = Some(candidate_id.clone());
+        } else {
+            store.inner_mut().default_writer_id = None;
+        }
+    }
 
     Ok(())
 }
