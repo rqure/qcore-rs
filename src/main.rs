@@ -2811,7 +2811,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "qcore_rs=info,tokio=warn,tokio_tungstenite=warn".to_string())
+                .unwrap_or_else(|_| "qcore_rs=debug,tokio=warn,tokio_tungstenite=warn".to_string())
         )
         .with_target(true)
         .with_thread_ids(true)
