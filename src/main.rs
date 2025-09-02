@@ -5,7 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error, debug, instrument};
 use clap::Parser;
 use anyhow::Result;
 use std::collections::{HashSet, HashMap};
@@ -289,13 +289,21 @@ impl AppState {
         let mut connections = self.connections.write().await;
         
         if !connections.connected_clients.is_empty() {
-            info!("Force disconnecting {} clients due to unavailable state", connections.connected_clients.len());
+            let client_count = connections.connected_clients.len();
+            info!(
+                client_count = client_count,
+                "Force disconnecting clients due to unavailable state"
+            );
             
             // Send close messages to all connected clients
             let disconnect_message = Message::Close(None);
             for (client_addr, sender) in &connections.connected_clients {
                 if let Err(e) = sender.send(disconnect_message.clone()) {
-                    warn!("Failed to send close message to client {}: {}", client_addr, e);
+                    warn!(
+                        client_addr = %client_addr,
+                        error = %e,
+                        "Failed to send close message to client"
+                    );
                 }
             }
             
@@ -309,23 +317,28 @@ impl AppState {
             
             for (client_addr, configs) in connections.client_notification_configs.drain() {
                 // Note: Notifications will be cleaned up when the channels close
-                debug!("Cleared {} notification configs for disconnected client {}", configs.len(), client_addr);
+                debug!(
+                    client_addr = %client_addr,
+                    config_count = configs.len(),
+                    "Cleared notification configs for disconnected client"
+                );
             }
         }
     }
 }
 
 /// Handle a single peer WebSocket connection
+#[instrument(skip(stream, app_state), fields(peer_addr = %peer_addr))]
 async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::SocketAddr, app_state: Arc<AppState>) -> Result<()> {
     let machine = {
         let core = app_state.core_state.read().await;
         core.config.machine.clone()
     };
 
-    info!("New peer connection from: {}", peer_addr);
+    info!("Accepting inbound peer connection");
     
     let ws_stream = accept_async(stream).await?;
-    debug!("WebSocket connection established with peer: {}", peer_addr);
+    debug!("WebSocket handshake completed");
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
@@ -333,19 +346,19 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                debug!("Received text from peer {}: {}", peer_addr, text);
+                debug!(message_length = text.len(), "Received text message from peer");
                 
                 // Try to parse as a PeerMessage first
                 match serde_json::from_str::<PeerMessage>(&text) {
                     Ok(peer_msg) => {
-                        debug!("Received peer message from {}: {:?}", peer_addr, peer_msg);
+                        debug!(message_type = ?std::mem::discriminant(&peer_msg), "Processing peer message");
                         handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, app_state.clone()).await;
                     }
                     Err(_) => {
                         // Try to parse as a Request for synchronization (legacy support)
                         match serde_json::from_str::<qlib_rs::Request>(&text) {
                             Ok(request) => {
-                                debug!("Received sync request from peer {}: {:?}", peer_addr, request);
+                                debug!("Received legacy sync request from peer");
                                 
                                 // Apply the request to our store if it doesn't already have an originator
                                 // (to avoid infinite loops) and ensure the current timestamp is preserved
@@ -356,23 +369,23 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
                                         
                                         let mut requests = vec![request];
                                         if let Err(e) = store_guard.perform_mut(&mut requests).await {
-                                            error!("Failed to apply sync request from peer {}: {}", peer_addr, e);
+                                            error!(error = %e, "Failed to apply sync request from peer");
                                         } else {
-                                            debug!("Successfully applied sync request from peer {}", peer_addr);
+                                            debug!("Successfully applied sync request from peer");
                                         }
                                     }
                                 } else {
-                                    debug!("Ignoring request without originator from peer {}", peer_addr);
+                                    debug!("Ignoring request without originator from peer");
                                 }
                             }
                             Err(_) => {
                                 // Not a sync request, treat as regular peer message
-                                debug!("Received non-sync message from peer {}", peer_addr);
+                                debug!("Received non-sync message from peer");
                                 
                                 // Echo back for now - this would be replaced with actual peer protocol handling
                                 let response = Message::Text(format!("{{\"type\":\"echo\",\"data\":{}}}", text));
                                 if let Err(e) = ws_sender.send(response).await {
-                                    error!("Failed to send response to peer {}: {}", peer_addr, e);
+                                    error!(error = %e, "Failed to send response to peer");
                                     break;
                                 }
                             }
@@ -381,29 +394,29 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
                 }
             }
             Ok(Message::Binary(data)) => {
-                debug!("Received binary data from peer {}: {} bytes", peer_addr, data.len());
+                debug!(data_length = data.len(), "Received binary data from peer");
                 // Handle binary messages - could be used for efficient data transfer
             }
             Ok(Message::Ping(payload)) => {
-                debug!("Received ping from peer: {}", peer_addr);
+                debug!("Received ping from peer");
                 if let Err(e) = ws_sender.send(Message::Pong(payload)).await {
-                    error!("Failed to send pong to peer {}: {}", peer_addr, e);
+                    error!(error = %e, "Failed to send pong to peer");
                     break;
                 }
             }
             Ok(Message::Pong(_)) => {
-                debug!("Received pong from peer: {}", peer_addr);
+                debug!("Received pong from peer");
             }
             Ok(Message::Close(_)) => {
-                info!("Peer {} closed connection", peer_addr);
+                info!("Peer closed connection gracefully");
                 break;
             }
             Ok(Message::Frame(_)) => {
                 // Handle raw frames if needed - typically not used directly
-                debug!("Received raw frame from peer: {}", peer_addr);
+                debug!("Received raw frame from peer");
             }
             Err(e) => {
-                error!("WebSocket error with peer {}: {}", peer_addr, e);
+                error!(error = %e, "WebSocket error with peer");
                 break;
             }
         }
@@ -417,11 +430,12 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
         });
     }
     
-    info!("Peer connection closed: {}", peer_addr);
+    info!("Peer connection terminated");
     Ok(())
 }
 
 /// Handle a peer message and respond appropriately
+#[instrument(skip(peer_msg, ws_sender, app_state), fields(peer_addr = %peer_addr))]
 async fn handle_peer_message(
     peer_msg: PeerMessage,
     peer_addr: &std::net::SocketAddr,
@@ -430,6 +444,12 @@ async fn handle_peer_message(
 ) {
     match peer_msg {
         PeerMessage::Startup { machine_id, startup_time } => {
+            info!(
+                remote_machine_id = %machine_id, 
+                remote_startup_time = startup_time,
+                "Processing startup message from peer"
+            );
+            
             // Update peer information
             {
                 let mut peer_info = app_state.peer_info.write().await;
@@ -462,7 +482,11 @@ async fn handle_peer_message(
                 
                 if !peers_with_same_time.is_empty() {
                     // We have a tie, use machine_id as tiebreaker
-                    info!("Startup time tie detected with {} peers. Using machine_id as tiebreaker.", peers_with_same_time.len());
+                    info!(
+                        peer_count = peers_with_same_time.len(),
+                        startup_time = our_startup_time,
+                        "Startup time tie detected, using machine_id as tiebreaker"
+                    );
                     
                     let mut all_machine_ids = peers_with_same_time.iter()
                         .map(|p| p.machine_id.as_str())
@@ -488,9 +512,17 @@ async fn handle_peer_message(
                 drop(core_state); // Release lock before async call
                 
                 if old_state != new_state {
-                    info!("Availability state transition: {:?} -> {:?}", old_state, new_state);
+                    info!(
+                        old_state = ?old_state,
+                        new_state = ?new_state,
+                        "Availability state transition"
+                    );
                 }
-                info!("We are the leader based on startup time comparison (startup_time: {})", our_startup_time);
+                info!(
+                    our_startup_time = our_startup_time,
+                    earliest_startup = earliest_startup,
+                    "Elected as leader"
+                );
             } else {
                 core_state.is_leader = false;
                 let new_state = AvailabilityState::Unavailable;
@@ -508,18 +540,31 @@ async fn handle_peer_message(
                 drop(core_state); // Release lock before async calls
                 
                 if old_state != new_state {
-                    info!("Availability state transition: {:?} -> {:?}", old_state, new_state);
+                    info!(
+                        old_state = ?old_state,
+                        new_state = ?new_state,
+                        "Availability state transition"
+                    );
                 }
                 app_state.force_disconnect_all_clients().await;
-                info!("Leader determined: {:?} (our startup_time: {})", leader, our_startup_time);
+                info!(
+                    leader = ?leader,
+                    our_startup_time = our_startup_time,
+                    earliest_startup = earliest_startup,
+                    "Leader determined, stepping down"
+                );
             }
             
-            debug!("Updated peer info for {}: startup_time={}", machine_id, startup_time);
+            debug!(
+                remote_machine_id = %machine_id,
+                startup_time = startup_time,
+                "Updated peer information"
+            );
         }
         
         PeerMessage::FullSyncRequest { machine_id } => {
             // Any peer can respond to sync requests
-            info!("Received full sync request from {}, sending snapshot", machine_id);
+            info!(requesting_machine = %machine_id, "Received full sync request, preparing snapshot");
             
             // Take a snapshot and send it
             let snapshot = {
@@ -531,9 +576,16 @@ async fn handle_peer_message(
             
             if let Ok(response_json) = serde_json::to_string(&response) {
                 if let Err(e) = ws_sender.send(Message::Text(response_json)).await {
-                    error!("Failed to send full sync response to peer {}: {}", peer_addr, e);
+                    error!(
+                        error = %e,
+                        requesting_machine = %machine_id,
+                        "Failed to send full sync response"
+                    );
                 } else {
-                    info!("Sent full sync snapshot to {}", machine_id);
+                    info!(
+                        requesting_machine = %machine_id,
+                        "Successfully sent full sync snapshot"
+                    );
                 }
             }
         }
@@ -561,7 +613,10 @@ async fn handle_peer_message(
             // Save the snapshot to disk for persistence
             match save_snapshot(&snapshot, app_state.clone()).await {
                 Ok(snapshot_counter) => {
-                    info!("Snapshot saved to disk during full sync");
+                    info!(
+                        snapshot_counter = snapshot_counter,
+                        "Snapshot saved to disk during full sync"
+                    );
                     
                     // Write a snapshot marker to the WAL to indicate the sync point
                     // This helps during replay to know that the state was synced at this point
@@ -576,7 +631,11 @@ async fn handle_peer_message(
                     };
                     
                     if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
-                        error!("Failed to write snapshot marker to WAL: {}", e);
+                        error!(
+                            error = %e,
+                            snapshot_counter = snapshot_counter,
+                            "Failed to write snapshot marker to WAL"
+                        );
                     }
 
                     match reinit_caches(app_state.clone()).await {
@@ -584,12 +643,12 @@ async fn handle_peer_message(
                             info!("Caches reinitialized successfully");
                         }
                         Err(e) => {
-                            error!("Failed to reinitialize caches: {}", e);
+                            error!(error = %e, "Failed to reinitialize caches");
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Failed to save snapshot during full sync: {}", e);
+                    error!(error = %e, "Failed to save snapshot during full sync");
                 }
             }
             
@@ -616,24 +675,32 @@ async fn handle_peer_message(
                 let mut store_guard = app_state.store.write().await;
                 let mut requests_to_apply = requests;
                 if let Err(e) = store_guard.perform_mut(&mut requests_to_apply).await {
-                    error!("Failed to apply sync requests from peer {}: {}", peer_addr, e);
+                    error!(
+                        error = %e,
+                        request_count = requests_to_apply.len(),
+                        "Failed to apply sync requests from peer"
+                    );
                 } else {
-                    debug!("Successfully applied {} sync requests from peer {}", requests_to_apply.len(), peer_addr);
+                    debug!(
+                        request_count = requests_to_apply.len(),
+                        "Successfully applied sync requests from peer"
+                    );
                 }
             } else {
-                debug!("Ignoring sync requests without originator from peer {}", peer_addr);
+                debug!("Ignoring sync requests without originator from peer");
             }
         }
     }
 }
 
 /// Handle a single outbound peer WebSocket connection
+#[instrument(skip(app_state), fields(peer_addr = %peer_addr))]
 async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppState>) -> Result<()> {
-    info!("Attempting to connect to peer: {}", peer_addr);
+    info!("Attempting to connect to outbound peer");
     
     let ws_url = format!("ws://{}", peer_addr);
     let (ws_stream, _response) = connect_async(&ws_url).await?;
-    info!("WebSocket connection established with outbound peer: {}", peer_addr);
+    info!("Successfully connected to outbound peer");
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
@@ -657,7 +724,18 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
     };
     if let Ok(startup_json) = serde_json::to_string(&startup) {
         if let Err(e) = ws_sender.send(Message::Text(startup_json)).await {
-            error!("Failed to send initial startup message to peer {}: {}", peer_addr, e);
+            error!(
+                error = %e,
+                machine_id = %machine,
+                startup_time = startup_time,
+                "Failed to send initial startup message"
+            );
+        } else {
+            debug!(
+                machine_id = %machine,
+                startup_time = startup_time,
+                "Sent startup message to peer"
+            );
         }
     }
     
@@ -666,7 +744,11 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
     let outgoing_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             if let Err(e) = ws_sender.send(message).await {
-                error!("Failed to send message to peer {}: {}", peer_addr_clone, e);
+                error!(
+                    error = %e,
+                    peer_addr = %peer_addr_clone,
+                    "Failed to send message to peer"
+                );
                 break;
             }
         }
@@ -677,31 +759,31 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
         match msg {
             Ok(Message::Text(_text)) => {
                 // Ignore all text messages - message handling is done in handle_inbound_peer_connection
-                debug!("Ignoring received text message from outbound peer {} (handled via inbound connection)", peer_addr);
+                debug!("Ignoring received text message from outbound peer (handled via inbound connection)");
             }
             Ok(Message::Binary(_data)) => {
                 // Ignore binary data - message handling is done in handle_inbound_peer_connection
-                debug!("Ignoring received binary data from outbound peer {} (handled via inbound connection)", peer_addr);
+                debug!("Ignoring received binary data from outbound peer (handled via inbound connection)");
             }
             Ok(Message::Ping(_payload)) => {
                 // Respond to pings to keep connection alive
-                debug!("Received ping from outbound peer: {}", peer_addr);
+                debug!("Received ping from outbound peer");
                 // Note: We can't easily send pong here since ws_sender is in the outgoing task
                 // The ping/pong will be handled by the WebSocket implementation
             }
             Ok(Message::Pong(_)) => {
-                debug!("Received pong from outbound peer: {}", peer_addr);
+                debug!("Received pong from outbound peer");
             }
             Ok(Message::Close(_)) => {
-                info!("Outbound peer {} closed connection", peer_addr);
+                info!("Outbound peer closed connection gracefully");
                 break;
             }
             Ok(Message::Frame(_)) => {
                 // Handle raw frames if needed - typically not used directly
-                debug!("Received raw frame from outbound peer: {}", peer_addr);
+                debug!("Received raw frame from outbound peer");
             }
             Err(e) => {
-                error!("WebSocket error with outbound peer {}: {}", peer_addr, e);
+                error!(error = %e, "WebSocket error with outbound peer");
                 break;
             }
         }
@@ -709,26 +791,27 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
     
     outgoing_task.abort();
     
-    info!("Outbound peer connection closed: {}", peer_addr);
+    info!("Outbound peer connection terminated");
     Ok(())
 }
 
 /// Handle a single client WebSocket connection that uses StoreProxy protocol
+#[instrument(skip(stream, app_state), fields(client_addr = %client_addr))]
 async fn handle_client_connection(stream: TcpStream, client_addr: std::net::SocketAddr, app_state: Arc<AppState>) -> Result<()> {
-    info!("New client connection from: {}", client_addr);
+    info!("Accepting client connection");
     
     // Check if the application is available for client connections
     {
         let state_snapshot = app_state.get_state_snapshot().await;
         if !state_snapshot.is_available() {
-            info!("Rejecting client connection from {} - application is unavailable", client_addr);
+            info!("Rejecting client connection - application unavailable");
             // Don't accept the WebSocket connection, just return
             return Ok(());
         }
     }
     
     let ws_stream = accept_async(stream).await?;
-    debug!("WebSocket connection established with client: {}", client_addr);
+    debug!("WebSocket handshake completed");
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
@@ -738,24 +821,24 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     let first_message = match auth_timeout {
         Ok(Some(Ok(Message::Text(text)))) => text,
         Ok(Some(Ok(Message::Close(_)))) => {
-            info!("Client {} closed connection before authentication", client_addr);
+            info!("Client closed connection before authentication");
             return Ok(());
         }
         Ok(Some(Err(e))) => {
-            error!("WebSocket error from client {} during authentication: {}", client_addr, e);
+            error!(error = %e, "WebSocket error from client during authentication");
             return Ok(());
         }
         Ok(None) => {
-            info!("Client {} closed connection before authentication", client_addr);
+            info!("Client closed connection before authentication");
             return Ok(());
         }
         Ok(Some(Ok(_))) => {
-            error!("Client {} sent non-text message during authentication", client_addr);
+            error!("Client sent non-text message during authentication");
             let _ = ws_sender.close().await;
             return Ok(());
         }
         Err(_) => {
-            info!("Client {} authentication timeout", client_addr);
+            info!("Client authentication timeout");
             let _ = ws_sender.close().await;
             return Ok(());
         }
@@ -767,7 +850,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
             serde_json::from_str::<StoreMessage>(&first_message).unwrap()
         }
         _ => {
-            error!("Client {} first message was not authentication", client_addr);
+            error!("Client first message was not authentication");
             let _ = ws_sender.close().await;
             return Ok(());
         }
@@ -780,14 +863,14 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     let auth_response_text = match serde_json::to_string(&auth_response) {
         Ok(text) => text,
         Err(e) => {
-            error!("Failed to serialize authentication response: {}", e);
+            error!(error = %e, "Failed to serialize authentication response");
             let _ = ws_sender.close().await;
             return Ok(());
         }
     };
     
     if let Err(e) = ws_sender.send(Message::Text(auth_response_text)).await {
-        error!("Failed to send authentication response to client {}: {}", client_addr, e);
+        error!(error = %e, "Failed to send authentication response to client");
         return Ok(());
     }
     
@@ -798,12 +881,12 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     };
     
     if !is_authenticated {
-        info!("Client {} authentication failed, closing connection", client_addr);
+        info!("Client authentication failed, closing connection");
         let _ = ws_sender.close().await;
         return Ok(());
     }
     
-    info!("Client {} authenticated successfully", client_addr);
+    info!("Client authenticated successfully");
     
     // Now proceed with normal client handling
     // Create a channel for sending messages to this client
@@ -828,14 +911,24 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
             let notification_msg = StoreMessage::Notification { notification };
             if let Ok(notification_text) = serde_json::to_string(&notification_msg) {
                 if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)) {
-                    error!("Failed to send notification to client {}: {}", client_addr_clone_notif, e);
+                    error!(
+                        client_addr = %client_addr_clone_notif,
+                        error = %e,
+                        "Failed to send notification to client"
+                    );
                     break;
                 }
             } else {
-                error!("Failed to serialize notification for client {}", client_addr_clone_notif);
+                error!(
+                    client_addr = %client_addr_clone_notif,
+                    "Failed to serialize notification for client"
+                );
             }
         }
-        debug!("Notification task ended for client {}", client_addr_clone_notif);
+        debug!(
+            client_addr = %client_addr_clone_notif,
+            "Notification task ended for client"
+        );
     });
     
     // Spawn a task to handle outgoing messages to the client
@@ -847,7 +940,11 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
         
         while let Some(message) = rx.recv().await {
             if let Err(e) = ws_sender.send(message).await {
-                error!("Failed to send message to client {}: {}", client_addr_clone, e);
+                error!(
+                    client_addr = %client_addr_clone,
+                    error = %e,
+                    "Failed to send message to client"
+                );
                 break;
             }
         }
@@ -863,7 +960,10 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                debug!("Received text from client {}: {}", client_addr, text);
+                debug!(
+                    message_length = text.len(),
+                    "Received text message from client"
+                );
                 
                 // Parse the StoreMessage
                 match serde_json::from_str::<StoreMessage>(&text) {
@@ -875,18 +975,22 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                         let response_text = match serde_json::to_string(&response_msg) {
                             Ok(text) => text,
                             Err(e) => {
-                                error!("Failed to serialize response: {}", e);
+                                error!(error = %e, "Failed to serialize response");
                                 continue;
                             }
                         };
                         
                         if let Err(e) = tx.send(Message::Text(response_text)) {
-                            error!("Failed to send response to client {}: {}", client_addr, e);
+                            error!(error = %e, "Failed to send response to client");
                             break;
                         }
                     }
                     Err(e) => {
-                        error!("Failed to parse StoreMessage from client {}: {}", client_addr, e);
+                        error!(
+                            error = %e,
+                            message_length = text.len(),
+                            "Failed to parse StoreMessage from client"
+                        );
                         // Send error response
                         let error_msg = StoreMessage::Error {
                             id: uuid::Uuid::new_v4().to_string(),
@@ -899,28 +1003,28 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                 }
             }
             Ok(Message::Binary(_data)) => {
-                debug!("Received binary data from client {}", client_addr);
+                debug!("Received binary data from client");
                 // For now, we only handle text messages for StoreProxy protocol
             }
             Ok(Message::Ping(payload)) => {
-                debug!("Received ping from client: {}", client_addr);
+                debug!("Received ping from client");
                 if let Err(e) = tx.send(Message::Pong(payload)) {
-                    error!("Failed to send pong to client {}: {}", client_addr, e);
+                    error!(error = %e, "Failed to send pong to client");
                     break;
                 }
             }
             Ok(Message::Pong(_)) => {
-                debug!("Received pong from client: {}", client_addr);
+                debug!("Received pong from client");
             }
             Ok(Message::Close(_)) => {
-                info!("Client {} closed connection", client_addr);
+                info!("Client closed connection gracefully");
                 break;
             }
             Ok(Message::Frame(_)) => {
-                debug!("Received raw frame from client: {}", client_addr);
+                debug!("Received raw frame from client");
             }
             Err(e) => {
-                error!("WebSocket error with client {}: {}", client_addr, e);
+                error!(error = %e, "WebSocket error with client");
                 break;
             }
         }
@@ -947,9 +1051,17 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                 for config in configs {
                     let removed = store_guard.unregister_notification(&config, &sender).await;
                     if removed {
-                        debug!("Cleaned up notification config for disconnected client {}: {:?}", client_addr_string, config);
+                        debug!(
+                            client_addr = %client_addr_string,
+                            config = ?config,
+                            "Cleaned up notification config for disconnected client"
+                        );
                     } else {
-                        warn!("Failed to clean up notification config for disconnected client {}: {:?}", client_addr_string, config);
+                        warn!(
+                            client_addr = %client_addr_string,
+                            config = ?config,
+                            "Failed to clean up notification config for disconnected client"
+                        );
                     }
                 }
                 
@@ -967,7 +1079,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     outgoing_task.abort();
     notification_task.abort();
     
-    info!("Client connection closed: {}", client_addr);
+    info!("Client connection terminated");
     Ok(())
 }
 
@@ -1253,16 +1365,24 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                                         .client_notification_configs
                                         .entry(client_addr.clone())
                                         .or_insert_with(HashSet::new)
-                                        .insert(config);
+                                        .insert(config.clone());
                                     
-                                    debug!("Registered notification for client {}", client_addr);
+                                    debug!(
+                                        client_addr = %client_addr,
+                                        config = ?config,
+                                        "Registered notification for client"
+                                    );
                                     StoreMessage::RegisterNotificationResponse {
                                         id,
                                         response: Ok(()),
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Failed to register notification for client {}: {:?}", client_addr, e);
+                                    error!(
+                                        client_addr = %client_addr,
+                                        error = ?e,
+                                        "Failed to register notification for client"
+                                    );
                                     StoreMessage::RegisterNotificationResponse {
                                         id,
                                         response: Err(format!("Failed to register notification: {:?}", e)),
@@ -1270,7 +1390,10 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                                 }
                             }
                         } else {
-                            error!("No notification sender found for client {}", client_addr);
+                            error!(
+                                client_addr = %client_addr,
+                                "No notification sender found for client"
+                            );
                             StoreMessage::RegisterNotificationResponse {
                                 id,
                                 response: Err("Client notification sender not found".to_string()),
@@ -1305,13 +1428,21 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                                 }
                             }
                             
-                            debug!("Unregistered notification for client {}: removed: {}", client_addr, removed);
+                            debug!(
+                                client_addr = %client_addr,
+                                config = ?config,
+                                removed = removed,
+                                "Unregistered notification for client"
+                            );
                             StoreMessage::UnregisterNotificationResponse {
                                 id,
                                 response: removed,
                             }
                         } else {
-                            error!("No notification sender found for client {}", client_addr);
+                            error!(
+                                client_addr = %client_addr,
+                                "No notification sender found for client"
+                            );
                             StoreMessage::UnregisterNotificationResponse {
                                 id,
                                 response: false,
@@ -1351,7 +1482,11 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 }
                 
                 StoreMessage::Error { id, error } => {
-                    warn!("Received error message from client: {} - {}", id, error);
+                    warn!(
+                        message_id = %id,
+                        error_message = %error,
+                        "Received error message from client"
+                    );
                     StoreMessage::Error {
                         id: uuid::Uuid::new_v4().to_string(),
                         error: "Server received error message from client".to_string(),
@@ -1363,6 +1498,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
 }
 
 /// Start the client WebSocket server task
+#[instrument(skip(app_state))]
 async fn start_client_server(app_state: Arc<AppState>) -> Result<()> {
     let addr = {
         let core_state = app_state.core_state.read().await;
@@ -1370,20 +1506,26 @@ async fn start_client_server(app_state: Arc<AppState>) -> Result<()> {
     };
     
     let listener = TcpListener::bind(&addr).await?;
-    info!("Client WebSocket server listening on {}", addr);
+    info!(bind_address = %addr, "Client WebSocket server started");
     
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
+                debug!(client_addr = %client_addr, "Accepted new client connection");
+                
                 let app_state_clone = Arc::clone(&app_state);
                 tokio::spawn(async move {
                     if let Err(e) = handle_client_connection(stream, client_addr, app_state_clone).await {
-                        error!("Error handling client connection from {}: {}", client_addr, e);
+                        error!(
+                            error = %e,
+                            client_addr = %client_addr,
+                            "Error handling client connection"
+                        );
                     }
                 });
             }
             Err(e) => {
-                error!("Failed to accept client connection: {}", e);
+                error!(error = %e, "Failed to accept client connection");
                 // Continue listening despite individual connection errors
             }
         }
@@ -1391,6 +1533,7 @@ async fn start_client_server(app_state: Arc<AppState>) -> Result<()> {
 }
 
 /// Start the peer WebSocket server task
+#[instrument(skip(app_state))]
 async fn start_inbound_peer_server(app_state: Arc<AppState>) -> Result<()> {
     let addr = {
         let core_state = app_state.core_state.read().await;
@@ -1398,20 +1541,26 @@ async fn start_inbound_peer_server(app_state: Arc<AppState>) -> Result<()> {
     };
     
     let listener = TcpListener::bind(&addr).await?;
-    info!("Peer WebSocket server listening on {}", addr);
+    info!(bind_address = %addr, "Peer WebSocket server started");
     
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                debug!(peer_addr = %peer_addr, "Accepted new peer connection");
+                
                 let app_state_clone = Arc::clone(&app_state);
                 tokio::spawn(async move {
                     if let Err(e) = handle_inbound_peer_connection(stream, peer_addr, app_state_clone).await {
-                        error!("Error handling peer connection from {}: {}", peer_addr, e);
+                        error!(
+                            error = %e,
+                            peer_addr = %peer_addr,
+                            "Error handling peer connection"
+                        );
                     }
                 });
             }
             Err(e) => {
-                error!("Failed to accept peer connection: {}", e);
+                error!(error = %e, "Failed to accept peer connection");
                 // Continue listening despite individual connection errors
             }
         }
@@ -1443,7 +1592,10 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
         };
         
         for peer_addr in peers_to_connect {
-            info!("Attempting to connect to unconnected peer: {}", peer_addr);
+            info!(
+                peer_addr = %peer_addr,
+                "Attempting to connect to unconnected peer"
+            );
             
             let peer_addr_clone = peer_addr.clone();
             let app_state_clone = Arc::clone(&app_state);
@@ -1451,13 +1603,20 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
             tokio::spawn(async move {
                 // Attempt connection
                 if let Err(e) = handle_outbound_peer_connection(&peer_addr_clone, app_state_clone.clone()).await {
-                    error!("Failed to connect to peer {}: {}", peer_addr_clone, e);
+                    error!(
+                        peer_addr = %peer_addr_clone,
+                        error = %e,
+                        "Failed to connect to peer"
+                    );
                     
                     // Remove from connected set on failure
                     let mut connections = app_state_clone.connections.write().await;
                     connections.connected_outbound_peers.remove(&peer_addr_clone);
                 } else {
-                    info!("Connection to peer {} ended", peer_addr_clone);
+                    info!(
+                        peer_addr = %peer_addr_clone,
+                        "Connection to peer ended"
+                    );
                     
                     // Remove from connected set when connection ends
                     let mut connections = app_state_clone.connections.write().await;
@@ -1488,12 +1647,19 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
         
         match requests {
             Some(requests) => {
-                debug!("Writing {} requests to WAL: {:?}", requests.len(), requests);
+                debug!(
+                    count = requests.len(),
+                    requests = ?requests,
+                    "Writing requests to WAL"
+                );
                 
                 // Write all requests to WAL file - the requests have already been applied to the store
                 for request in &requests {
                     if let Err(e) = write_request_to_wal(request, app_state.clone()).await {
-                        error!("Failed to write request to WAL: {}", e);
+                        error!(
+                            error = %e,
+                            "Failed to write request to WAL"
+                        );
                     }
                 }
                 
@@ -1516,7 +1682,10 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                 
                 // Send batch of requests to peers for synchronization if we have any
                 if !requests_to_sync.is_empty() {
-                    debug!("Sending {} requests to peers for synchronization", requests_to_sync.len());
+                    debug!(
+                        count = requests_to_sync.len(),
+                        "Sending requests to peers for synchronization"
+                    );
                     
                     // Send to all connected outbound peers using PeerMessage
                     let peers_to_notify = {
@@ -1536,14 +1705,25 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                             
                             for (peer_addr, sender) in &peers_to_notify {
                                 if let Err(e) = sender.send(message.clone()) {
-                                    warn!("Failed to send sync requests to peer {}: {}", peer_addr, e);
+                                    warn!(
+                                        peer_addr = %peer_addr,
+                                        error = %e,
+                                        "Failed to send sync requests to peer"
+                                    );
                                 } else {
-                                    debug!("Sent {} sync requests to peer: {}", requests_to_sync.len(), peer_addr);
+                                    debug!(
+                                        peer_addr = %peer_addr,
+                                        count = requests_to_sync.len(),
+                                        "Sent sync requests to peer"
+                                    );
                                 }
                             }
                         }
                         Err(e) => {
-                            error!("Failed to serialize sync message for peer synchronization: {}", e);
+                            error!(
+                                error = %e,
+                                "Failed to serialize sync message for peer synchronization"
+                            );
                         }
                     }
                 }
@@ -1580,9 +1760,16 @@ async fn cleanup_old_wal_files(wal_dir: &PathBuf, max_files: usize) -> Result<()
     if wal_files.len() > max_files {
         let files_to_remove = wal_files.len() - max_files;
         for i in 0..files_to_remove {
-            info!("Removing old WAL file: {}", wal_files[i].display());
+            info!(
+                wal_file = %wal_files[i].display(),
+                "Removing old WAL file"
+            );
             if let Err(e) = remove_file(&wal_files[i]).await {
-                error!("Failed to remove old WAL file {}: {}", wal_files[i].display(), e);
+                error!(
+                    wal_file = %wal_files[i].display(),
+                    error = %e,
+                    "Failed to remove old WAL file"
+                );
             }
         }
     }
@@ -1608,7 +1795,10 @@ async fn write_request_to_wal_direct(request: &qlib_rs::Request, app_state: Arc<
         let wal_filename = format!("wal_{:010}.log", wal_state.wal_file_counter);
         let wal_path = wal_dir.join(&wal_filename);
         
-        info!("Creating new WAL file for direct write: {}", wal_path.display());
+        info!(
+            wal_file = %wal_path.display(),
+            "Creating new WAL file for direct write"
+        );
         
         let file = OpenOptions::new()
             .create(true)
@@ -1631,13 +1821,17 @@ async fn write_request_to_wal_direct(request: &qlib_rs::Request, app_state: Arc<
         
         wal_state.current_wal_size += 4 + serialized_len;
         
-        debug!("Wrote {} bytes to WAL file (direct)", serialized_len + 4);
+        debug!(
+            bytes_written = serialized_len + 4,
+            "Wrote request to WAL file (direct)"
+        );
     }
     
     Ok(())
 }
 
 /// Write a request to the WAL file
+#[instrument(skip(request, app_state), fields(request_size = ?request))]
 async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppState>) -> Result<()> {
     // Serialize the request to JSON
     let serialized = serde_json::to_vec(request)?;
@@ -1659,7 +1853,13 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
         let wal_filename = format!("wal_{:010}.log", wal_state.wal_file_counter);
         let wal_path = wal_dir.join(&wal_filename);
         
-        info!("Creating new WAL file: {}", wal_path.display());
+        info!(
+            wal_file = %wal_path.display(),
+            wal_counter = wal_state.wal_file_counter,
+            current_size = wal_state.current_wal_size,
+            max_size = core_state.config.wal_max_file_size,
+            "Creating new WAL file"
+        );
         
         let file = OpenOptions::new()
             .create(true)
@@ -1676,7 +1876,10 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
         let should_snapshot = wal_state.wal_files_since_snapshot >= core_state.config.snapshot_wal_interval;
         
         if should_snapshot {
-            info!("Taking snapshot after {} WAL file rollovers", wal_state.wal_files_since_snapshot);
+            info!(
+                wal_files_count = wal_state.wal_files_since_snapshot,
+                "Taking snapshot after WAL file rollovers"
+            );
             
             // Take a snapshot
             let snapshot = {
@@ -1708,11 +1911,17 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
                     };
                     
                     if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
-                        error!("Failed to write snapshot marker to WAL: {}", e);
+                        error!(
+                            error = %e,
+                            "Failed to write snapshot marker to WAL"
+                        );
                     }
                 }
                 Err(e) => {
-                    error!("Failed to save snapshot after WAL rollover: {}", e);
+                    error!(
+                        error = %e,
+                        "Failed to save snapshot after WAL rollover"
+                    );
                 }
             }
             
@@ -1725,7 +1934,10 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
         let max_files = core_state.config.wal_max_files;
         let wal_dir = app_state.get_wal_dir().await;
         if let Err(e) = cleanup_old_wal_files(&wal_dir, max_files).await {
-            error!("Failed to clean up old WAL files: {}", e);
+            error!(
+                error = %e,
+                "Failed to clean up old WAL files"
+            );
         }
     }
     
@@ -1739,13 +1951,17 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
         
         wal_state.current_wal_size += 4 + serialized_len;
         
-        debug!("Wrote {} bytes to WAL file", serialized_len + 4);
+        debug!(
+            bytes_written = serialized_len + 4,
+            "Wrote request to WAL file"
+        );
     }
     
     Ok(())
 }
 
 /// Save a snapshot to disk and return the snapshot counter that was used
+#[instrument(skip(snapshot, app_state))]
 async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<AppState>) -> Result<u64> {
     let mut wal_state = app_state.wal_state.write().await;
     
@@ -1761,7 +1977,11 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<AppState>) -
     let snapshot_filename = format!("snapshot_{:010}.bin", current_snapshot_counter);
     let snapshot_path = snapshot_dir.join(&snapshot_filename);
     
-    info!("Saving snapshot to: {}", snapshot_path.display());
+    info!(
+        snapshot_file = %snapshot_path.display(),
+        snapshot_counter = current_snapshot_counter,
+        "Saving snapshot"
+    );
     
     // Serialize the snapshot using bincode for efficiency
     let serialized = bincode::serialize(snapshot)?;
@@ -1777,7 +1997,11 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<AppState>) -
     file.write_all(&serialized).await?;
     file.flush().await?;
     
-    info!("Snapshot saved successfully, {} bytes", serialized.len());
+    info!(
+        snapshot_size_bytes = serialized.len(),
+        snapshot_counter = current_snapshot_counter,
+        "Snapshot saved successfully"
+    );
     
     // Clean up old snapshots using the configured limit
     let max_files = {
@@ -1785,7 +2009,10 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<AppState>) -
         core.config.snapshot_max_files
     };
     if let Err(e) = cleanup_old_snapshots(&snapshot_dir, max_files).await {
-        error!("Failed to clean up old snapshots: {}", e);
+        error!(
+            error = %e,
+            "Failed to clean up old snapshots"
+        );
     }
     
     Ok(current_snapshot_counter)
@@ -1830,7 +2057,11 @@ async fn load_latest_snapshot(app_state: Arc<AppState>) -> Result<Option<(qlib_r
     
     // Load the latest snapshot
     let (latest_snapshot_path, latest_counter) = snapshot_files.last().unwrap();
-    info!("Loading snapshot from: {} (counter: {})", latest_snapshot_path.display(), latest_counter);
+    info!(
+        snapshot_file = %latest_snapshot_path.display(),
+        snapshot_counter = latest_counter,
+        "Loading snapshot"
+    );
     
     let mut file = File::open(latest_snapshot_path).await?;
     let mut buffer = Vec::new();
@@ -1842,7 +2073,10 @@ async fn load_latest_snapshot(app_state: Arc<AppState>) -> Result<Option<(qlib_r
             Ok(Some((snapshot, *latest_counter)))
         }
         Err(e) => {
-            error!("Failed to deserialize snapshot: {}", e);
+            error!(
+                error = %e,
+                "Failed to deserialize snapshot"
+            );
             Ok(None)
         }
     }
@@ -1872,9 +2106,16 @@ async fn cleanup_old_snapshots(snapshot_dir: &PathBuf, max_files: usize) -> Resu
     if snapshot_files.len() > max_files {
         let files_to_remove = snapshot_files.len() - max_files;
         for i in 0..files_to_remove {
-            info!("Removing old snapshot file: {}", snapshot_files[i].display());
+            info!(
+                snapshot_file = %snapshot_files[i].display(),
+                "Removing old snapshot file"
+            );
             if let Err(e) = remove_file(&snapshot_files[i]).await {
-                error!("Failed to remove old snapshot file {}: {}", snapshot_files[i].display(), e);
+                error!(
+                    snapshot_file = %snapshot_files[i].display(),
+                    error = %e,
+                    "Failed to remove old snapshot file"
+                );
             }
         }
     }
@@ -1924,7 +2165,10 @@ async fn replay_wal_files(app_state: Arc<AppState>) -> Result<()> {
     // Find the most recent snapshot marker across all WAL files
     let mut most_recent_snapshot: Option<(PathBuf, u64, usize)> = None; // (file_path, wal_counter, offset_after_snapshot)
     
-    info!("Scanning {} WAL files to find the most recent snapshot marker", wal_files.len());
+    info!(
+        wal_files_count = wal_files.len(),
+        "Scanning WAL files to find the most recent snapshot marker"
+    );
     
     for (wal_file, counter) in &wal_files {
         if let Ok(snapshot_info) = find_most_recent_snapshot_in_wal(wal_file).await {
@@ -1945,31 +2189,59 @@ async fn replay_wal_files(app_state: Arc<AppState>) -> Result<()> {
     }
     
     if let Some((snapshot_wal_file, snapshot_counter, snapshot_offset)) = most_recent_snapshot {
-        info!("Starting replay from WAL file {} (counter: {}) at offset {}", 
-              snapshot_wal_file.display(), snapshot_counter, snapshot_offset);
+        info!(
+            wal_file = %snapshot_wal_file.display(),
+            wal_counter = snapshot_counter,
+            offset = snapshot_offset,
+            "Starting replay from WAL file"
+        );
         
         // First, replay the partial WAL file that contains the snapshot (from the offset)
         if let Err(e) = replay_wal_file_from_offset(&snapshot_wal_file, snapshot_offset, app_state.clone()).await {
-            error!("Failed to replay WAL file {} from offset {}: {}", snapshot_wal_file.display(), snapshot_offset, e);
+            error!(
+                wal_file = %snapshot_wal_file.display(),
+                offset = snapshot_offset,
+                error = %e,
+                "Failed to replay WAL file from offset"
+            );
         }
         
         // Then replay all subsequent WAL files completely
         for (wal_file, counter) in &wal_files {
             if counter > &snapshot_counter {
-                info!("Replaying complete WAL file: {} (counter: {})", wal_file.display(), counter);
+                info!(
+                    wal_file = %wal_file.display(),
+                    wal_counter = counter,
+                    "Replaying complete WAL file"
+                );
                 if let Err(e) = replay_single_wal_file(wal_file, app_state.clone()).await {
-                    error!("Failed to replay WAL file {}: {}", wal_file.display(), e);
+                    error!(
+                        wal_file = %wal_file.display(),
+                        error = %e,
+                        "Failed to replay WAL file"
+                    );
                 }
             }
         }
     } else {
-        info!("No snapshot markers found in WAL files, replaying all {} files completely", wal_files.len());
+        info!(
+            wal_files_count = wal_files.len(),
+            "No snapshot markers found in WAL files, replaying all files completely"
+        );
         
         // No snapshot markers found, replay all WAL files completely
         for (wal_file, counter) in &wal_files {
-            info!("Replaying WAL file: {} (counter: {})", wal_file.display(), counter);
+            info!(
+                wal_file = %wal_file.display(),
+                wal_counter = counter,
+                "Replaying WAL file"
+            );
             if let Err(e) = replay_single_wal_file(wal_file, app_state.clone()).await {
-                error!("Failed to replay WAL file {}: {}", wal_file.display(), e);
+                error!(
+                    wal_file = %wal_file.display(),
+                    error = %e,
+                    "Failed to replay WAL file"
+                );
             }
         }
     }
@@ -2022,7 +2294,10 @@ async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<AppState>) ->
     let mut requests_processed = 0;
     let mut offset = 0;
     
-    info!("Replaying complete WAL file: {}", wal_path.display());
+    info!(
+        wal_file = %wal_path.display(),
+        "Replaying complete WAL file"
+    );
     
     while offset < buffer.len() {
         // Read length prefix (4 bytes)
@@ -2036,7 +2311,10 @@ async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<AppState>) ->
         
         // Read the serialized request
         if offset + len > buffer.len() {
-            error!("Incomplete request in WAL file at offset {}", offset);
+            error!(
+                offset = offset,
+                "Incomplete request in WAL file"
+            );
             break;
         }
         
@@ -2045,11 +2323,19 @@ async fn replay_single_wal_file(wal_path: &PathBuf, app_state: Arc<AppState>) ->
         
         // Apply the request using the helper function
         if let Err(e) = apply_wal_request(request_data, &app_state, &mut requests_processed).await {
-            error!("Failed to apply request at offset {}: {}", offset - len, e);
+            error!(
+                offset = offset - len,
+                error = %e,
+                "Failed to apply request at offset"
+            );
         }
     }
     
-    info!("Replayed {} requests from {}", requests_processed, wal_path.display());
+    info!(
+        requests_processed = requests_processed,
+        wal_file = %wal_path.display(),
+        "Replayed requests from WAL file"
+    );
     Ok(())
 }
 
@@ -2076,7 +2362,11 @@ where
         
         // Read the serialized request
         if offset + len > buffer.len() {
-            error!("Incomplete request in WAL file at offset {}", offset);
+            error!(
+                offset = offset,
+                wal_file = %wal_path.display(),
+                "Incomplete request in WAL file"
+            );
             break;
         }
         
@@ -2107,7 +2397,11 @@ async fn find_most_recent_snapshot_in_wal(wal_path: &PathBuf) -> Result<Option<(
             if matches!(request, qlib_rs::Request::Snapshot { .. }) {
                 last_snapshot_offset = Some(offset + request_data.len());
                 last_snapshot_request = Some(request);
-                debug!("Found snapshot marker at offset {} in {}", offset, wal_path.display());
+                debug!(
+                    offset = offset,
+                    wal_file = %wal_path.display(),
+                    "Found snapshot marker"
+                );
             }
         }
         Ok(true) // Continue processing
@@ -2129,7 +2423,11 @@ async fn replay_wal_file_from_offset(wal_path: &PathBuf, start_offset: usize, ap
     let mut requests_processed = 0;
     let mut offset = start_offset;
     
-    info!("Replaying WAL file {} from offset {}", wal_path.display(), start_offset);
+    info!(
+        wal_file = %wal_path.display(),
+        start_offset = start_offset,
+        "Replaying WAL file from offset"
+    );
     
     while offset < buffer.len() {
         // Read length prefix (4 bytes)
@@ -2143,7 +2441,11 @@ async fn replay_wal_file_from_offset(wal_path: &PathBuf, start_offset: usize, ap
         
         // Read the serialized request
         if offset + len > buffer.len() {
-            error!("Incomplete request in WAL file at offset {}", offset);
+            error!(
+                offset = offset,
+                wal_file = %wal_path.display(),
+                "Incomplete request in WAL file"
+            );
             break;
         }
         
@@ -2152,11 +2454,20 @@ async fn replay_wal_file_from_offset(wal_path: &PathBuf, start_offset: usize, ap
         
         // Deserialize and apply the request
         if let Err(e) = apply_wal_request(request_data, &app_state, &mut requests_processed).await {
-            error!("Failed to apply request at offset {}: {}", offset - len, e);
+            error!(
+                offset = offset - len,
+                error = %e,
+                "Failed to apply request at offset"
+            );
         }
     }
     
-    info!("Replayed {} requests from {} (starting from offset {})", requests_processed, wal_path.display(), start_offset);
+    info!(
+        requests_processed = requests_processed,
+        wal_file = %wal_path.display(),
+        start_offset = start_offset,
+        "Replayed requests from WAL file starting from offset"
+    );
     Ok(())
 }
 
@@ -2258,7 +2569,10 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
         };
         
         if let Some(leader_machine_id) = should_send_full_sync {
-            info!("Grace period expired, sending FullSyncRequest to leader: {}", leader_machine_id);
+            info!(
+                leader_machine_id = %leader_machine_id,
+                "Grace period expired, sending FullSyncRequest to leader"
+            );
             
             // Mark that we're sending a request to avoid duplicates
             {
@@ -2286,9 +2600,16 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                     
                     for (peer_addr, sender) in &connections.connected_outbound_peers {
                         if let Err(e) = sender.send(message.clone()) {
-                            warn!("Failed to send FullSyncRequest to peer {}: {}", peer_addr, e);
+                            warn!(
+                                peer_addr = %peer_addr,
+                                error = %e,
+                                "Failed to send FullSyncRequest to peer"
+                            );
                         } else {
-                            info!("Sent FullSyncRequest to peer: {}", peer_addr);
+                            info!(
+                                peer_addr = %peer_addr,
+                                "Sent FullSyncRequest to peer"
+                            );
                             sent = true;
                             break; // Only need to send to one peer
                         }
@@ -2297,7 +2618,10 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                 };
                 
                 if !sent {
-                    warn!("No connected outbound peers available to send FullSyncRequest to leader {}", leader_machine_id);
+                    warn!(
+                        leader_machine_id = %leader_machine_id,
+                        "No connected outbound peers available to send FullSyncRequest to leader"
+                    );
                     // Reset the pending flag so we can try again later
                     let mut core = app_state.core_state.write().await;
                     core.full_sync_request_pending = false;
@@ -2521,15 +2845,29 @@ async fn reinit_caches(app_state: Arc<AppState>) -> Result<()> {
 async fn main() -> Result<()> {
     let config = Config::parse();
 
+    // Initialize tracing with better structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "qcore_rs=info,tokio=warn".to_string())
+                .unwrap_or_else(|_| "qcore_rs=info,tokio=warn,tokio_tungstenite=warn".to_string())
         )
-        .with_target(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(cfg!(debug_assertions))
+        .with_line_number(cfg!(debug_assertions))
         .init();
 
-    info!(?config, "Starting Core service with configuration");
+    let machine_id = &config.machine;
+    let peer_port = config.peer_port;
+    let client_port = config.client_port;
+    
+    info!(
+        machine_id = %machine_id,
+        peer_port = peer_port,
+        client_port = client_port,
+        data_dir = %config.data_dir,
+        "Starting QCore service"
+    );
 
     // Create shared application state
     let app_state = Arc::new(AppState::new(config).await?);
@@ -2539,12 +2877,18 @@ async fn main() -> Result<()> {
         let next_wal_counter = get_next_wal_counter(app_state.clone()).await?;
         let mut wal_state = app_state.wal_state.write().await;
         wal_state.wal_file_counter = next_wal_counter;
-        info!("Initialized WAL file counter to {}", next_wal_counter);
+        info!(
+            wal_counter = next_wal_counter,
+            "Initialized WAL file counter"
+        );
     }
 
     // Load the latest snapshot if available
     if let Some((snapshot, snapshot_counter)) = load_latest_snapshot(app_state.clone()).await? {
-        info!("Restoring store from snapshot (counter: {})", snapshot_counter);
+        info!(
+            snapshot_counter = snapshot_counter,
+            "Restoring store from snapshot"
+        );
         
         // Initialize the snapshot file counter to continue from the next number
         let next_snapshot_counter = get_next_snapshot_counter(app_state.clone()).await?;
@@ -2571,7 +2915,10 @@ async fn main() -> Result<()> {
     // in the WAL files and start replaying from that point
     info!("Replaying WAL files");
     if let Err(e) = replay_wal_files(app_state.clone()).await {
-        error!("Failed to replay WAL files: {}", e);
+        error!(
+            error = %e,
+            "Failed to replay WAL files"
+        );
         return Err(e);
     }
 
@@ -2582,7 +2929,10 @@ async fn main() -> Result<()> {
     let app_state_clone = Arc::clone(&app_state);
     let write_channel_task = tokio::spawn(async move {
         if let Err(e) = consume_write_channel(app_state_clone).await {
-            error!("Write channel consumer failed: {}", e);
+            error!(
+                error = %e,
+                "Write channel consumer failed"
+            );
         }
     });
 
@@ -2590,7 +2940,10 @@ async fn main() -> Result<()> {
     let app_state_clone = Arc::clone(&app_state);
     let peer_server_task = tokio::spawn(async move {
         if let Err(e) = start_inbound_peer_server(app_state_clone).await {
-            error!("Peer server failed: {}", e);
+            error!(
+                error = %e,
+                "Peer server failed"
+            );
         }
     });
 
@@ -2598,7 +2951,10 @@ async fn main() -> Result<()> {
     let app_state_clone = Arc::clone(&app_state);
     let client_server_task = tokio::spawn(async move {
         if let Err(e) = start_client_server(app_state_clone).await {
-            error!("Client server failed: {}", e);
+            error!(
+                error = %e,
+                "Client server failed"
+            );
         }
     });
 
@@ -2606,7 +2962,10 @@ async fn main() -> Result<()> {
     let app_state_clone = Arc::clone(&app_state);
     let outbound_peer_task = tokio::spawn(async move {
         if let Err(e) = manage_outbound_peer_connections(app_state_clone).await {
-            error!("Outbound peer connection manager failed: {}", e);
+            error!(
+                error = %e,
+                "Outbound peer connection manager failed"
+            );
         }
     });
 
@@ -2614,7 +2973,10 @@ async fn main() -> Result<()> {
     let app_state_clone = Arc::clone(&app_state);
     let misc_task = tokio::spawn(async move {
         if let Err(e) = handle_misc_tasks(app_state_clone).await {
-            error!("Misc tasks handler failed: {}", e);
+            error!(
+                error = %e,
+                "Misc tasks handler failed"
+            );
         }
     });
 
@@ -2622,13 +2984,16 @@ async fn main() -> Result<()> {
     let app_state_clone = Arc::clone(&app_state);
     let heartbeat_task = tokio::spawn(async move {
         if let Err(e) = handle_heartbeat_writing(app_state_clone).await {
-            error!("Heartbeat writer failed: {}", e);
+            error!(
+                error = %e,
+                "Heartbeat writer failed"
+            );
         }
     });
 
     // Wait for shutdown signal
     signal::ctrl_c().await?;
-    warn!("Received shutdown signal. Stopping Core service...");
+    warn!("Received shutdown signal, initiating graceful shutdown");
 
     // Take a final snapshot before shutting down
     info!("Taking final snapshot before shutdown");
@@ -2639,7 +3004,10 @@ async fn main() -> Result<()> {
     
     match save_snapshot(&snapshot, app_state.clone()).await {
         Ok(snapshot_counter) => {
-            info!("Final snapshot saved successfully");
+            info!(
+                snapshot_counter = snapshot_counter,
+                "Final snapshot saved successfully"
+            );
             
             // Write a snapshot marker to the WAL to indicate the final snapshot point
             // This helps during replay to know that the state was snapshotted at shutdown
@@ -2652,17 +3020,18 @@ async fn main() -> Result<()> {
             };
             
             if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
-                error!("Failed to write final snapshot marker to WAL: {}", e);
+                error!(error = %e, "Failed to write final snapshot marker to WAL");
             } else {
                 info!("Final snapshot marker written to WAL");
             }
         }
         Err(e) => {
-            error!("Failed to save final snapshot: {}", e);
+            error!(error = %e, "Failed to save final snapshot");
         }
     }
 
     // Abort all tasks
+    info!("Stopping all background tasks");
     write_channel_task.abort();
     peer_server_task.abort();
     client_server_task.abort();
@@ -2670,5 +3039,6 @@ async fn main() -> Result<()> {
     misc_task.abort();
     heartbeat_task.abort();
 
+    info!("QCore service shutdown complete");
     Ok(())
 }

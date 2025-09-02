@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::fs::{read_to_string, write};
+use tracing::{info, warn, error, debug};
 
 /// Command-line tool for taking and restoring JSON snapshots from QCore service
 #[derive(Parser)]
@@ -116,29 +117,45 @@ impl Progress {
     }
 
     fn success(msg: &str) {
-        println!("[SUCCESS] {}", msg);
+        info!(target: "snapshot_tool::success", "{}", msg);
     }
 
     fn info(msg: &str) {
-        println!("[INFO] {}", msg);
+        info!(target: "snapshot_tool::info", "{}", msg);
     }
 
     fn warning(msg: &str) {
-        println!("[WARNING] {}", msg);
+        warn!(target: "snapshot_tool::warning", "{}", msg);
     }
 
     fn error(msg: &str) {
-        eprintln!("[ERROR] {}", msg);
+        error!(target: "snapshot_tool::error", "{}", msg);
     }
 
     fn step(step: usize, total: usize, msg: &str) {
-        println!("[{}/{}] {}", step, total, msg);
+        debug!(target: "snapshot_tool::step", step = step, total = total, "{}", msg);
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing for CLI tools
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "snapshot_tool=info".to_string())
+        )
+        .with_target(false)
+        .without_time()
+        .init();
+
     let config = Config::parse();
+    
+    info!(
+        core_url = %config.core_url,
+        command = ?std::mem::discriminant(&config.command),
+        "Starting snapshot tool"
+    );
 
     // Get credentials from environment if available
     let username = std::env::var("QCORE_USERNAME").unwrap_or(config.username);
@@ -416,7 +433,7 @@ async fn report_snapshot_diff(
             .with_context(|| format!("Failed to write report to {}", output.display()))?;
         Progress::success(&format!("Report written to {}", output.display()));
     } else {
-        println!("{}", report_content);
+        info!("{}", report_content);
     }
 
     Progress::success("Report generation completed successfully!");

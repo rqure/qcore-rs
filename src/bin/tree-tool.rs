@@ -4,6 +4,7 @@ use qlib_rs::{StoreProxy, EntityId, EntityType, FieldType, Value};
 use std::pin::Pin;
 use std::boxed::Box;
 use std::future::Future;
+use tracing::{info, warn};
 
 /// Command-line tool for displaying the tree structure of the QCore data store
 #[derive(Parser)]
@@ -53,19 +54,39 @@ struct TreeNode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing for CLI tools
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "tree_tool=info".to_string())
+        )
+        .with_target(false)
+        .without_time()
+        .init();
+
     let config = Config::parse();
+    
+    info!(
+        core_url = %config.core_url,
+        max_depth = config.max_depth,
+        show_types = config.show_types,
+        show_ids = config.show_ids,
+        verbose = config.verbose,
+        start_from = ?config.start_from,
+        "Starting tree tool"
+    );
 
     // Get credentials from environment if available
     let username = std::env::var("QCORE_USERNAME").unwrap_or(config.username.clone());
     let password = std::env::var("QCORE_PASSWORD").unwrap_or(config.password.clone());
 
-    println!("Connecting to QCore service at {}...", config.core_url);
+    info!(core_url = %config.core_url, "Connecting to QCore service");
     
     // Connect to the Core service with authentication
     let mut store = StoreProxy::connect_and_authenticate(&config.core_url, &username, &password).await
         .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
 
-    println!("Connected successfully. Building tree structure...");
+    info!("Connected successfully, building tree structure");
 
     // Determine the starting entity
     let root_entity_id = if let Some(start_id) = &config.start_from {
@@ -82,6 +103,7 @@ async fn main() -> Result<()> {
         .context("Failed to build tree structure")?;
 
     // Print the tree
+    info!("Tree structure built successfully");
     println!("\nTree structure:");
     print_tree(&tree, "", true, &config);
 
@@ -100,7 +122,7 @@ async fn find_root_entity(store: &mut StoreProxy) -> Result<EntityId> {
     }
 
     if entities.len() > 1 {
-        println!("Warning: Multiple Root entities found, using the first one");
+        warn!("Multiple Root entities found, using the first one");
     }
 
     Ok(entities[0].clone())
@@ -139,10 +161,15 @@ fn build_tree(
         // Recursively build child nodes
         let mut children = Vec::new();
         for child_id in children_ids {
+            let child_id_str = child_id.get_id().to_string();
             match build_tree(store, child_id, max_depth, current_depth + 1).await {
                 Ok(child_node) => children.push(child_node),
                 Err(e) => {
-                    eprintln!("Warning: Failed to build tree for child entity: {}", e);
+                    warn!(
+                        child_id = %child_id_str,
+                        error = %e,
+                        "Failed to build tree for child entity"
+                    );
                     // Continue with other children instead of failing completely
                 }
             }
