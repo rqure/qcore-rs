@@ -6,6 +6,7 @@ use tracing::{info, debug};
 use serde_json;
 use base64::{Engine as _, engine::general_purpose};
 use std::pin::Pin;
+use std::time::{Instant, Duration};
 
 /// Command-line tool for querying entities from the QCore data store with CEL filter support
 #[derive(Parser)]
@@ -73,6 +74,10 @@ struct Config {
     /// Verbose output (show debug information)
     #[arg(long, short)]
     verbose: bool,
+
+    /// Show performance metrics (timing and data transfer stats)
+    #[arg(long)]
+    metrics: bool,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -153,8 +158,101 @@ struct EntityDisplay {
     fields: HashMap<String, DisplayValue>,
 }
 
+/// Performance metrics for query execution
+#[derive(Debug, Clone)]
+struct QueryMetrics {
+    connection_time: Duration,
+    query_time: Duration,
+    field_fetch_time: Duration,
+    total_time: Duration,
+    entities_found: usize,
+    pages_fetched: usize,
+    fields_fetched: usize,
+    failed_fields: usize,
+}
+
+impl QueryMetrics {
+    fn new() -> Self {
+        Self {
+            connection_time: Duration::from_secs(0),
+            query_time: Duration::from_secs(0),
+            field_fetch_time: Duration::from_secs(0),
+            total_time: Duration::from_secs(0),
+            entities_found: 0,
+            pages_fetched: 0,
+            fields_fetched: 0,
+            failed_fields: 0,
+        }
+    }
+
+    fn format_duration(d: &Duration) -> String {
+        let nanos = d.as_nanos();
+        
+        if nanos < 1_000 {
+            format!("{}ns", nanos)
+        } else if nanos < 1_000_000 {
+            format!("{:.1}μs", nanos as f64 / 1_000.0)
+        } else if nanos < 1_000_000_000 {
+            format!("{:.1}ms", nanos as f64 / 1_000_000.0)
+        } else {
+            format!("{:.2}s", d.as_secs_f64())
+        }
+    }
+
+    fn print_metrics(&self) {
+        println!("\n=== Performance Metrics ===");
+        println!("Connection time: {}", Self::format_duration(&self.connection_time));
+        println!("Query execution: {}", Self::format_duration(&self.query_time));
+        println!("Field fetching:  {}", Self::format_duration(&self.field_fetch_time));
+        println!("Total time:      {}", Self::format_duration(&self.total_time));
+        println!();
+        println!("Entities found:  {}", self.entities_found);
+        println!("Pages fetched:   {}", self.pages_fetched);
+        println!("Fields fetched:  {} ({} failed)", self.fields_fetched, self.failed_fields);
+        
+        if self.entities_found > 0 {
+            let avg_query_nanos = self.query_time.as_nanos() as f64 / self.pages_fetched as f64;
+            let avg_field_nanos = if self.fields_fetched > 0 {
+                self.field_fetch_time.as_nanos() as f64 / self.fields_fetched as f64
+            } else {
+                0.0
+            };
+            
+            let avg_query_str = if avg_query_nanos < 1_000.0 {
+                format!("{:.0}ns", avg_query_nanos)
+            } else if avg_query_nanos < 1_000_000.0 {
+                format!("{:.1}μs", avg_query_nanos / 1_000.0)
+            } else {
+                format!("{:.1}ms", avg_query_nanos / 1_000_000.0)
+            };
+            
+            let avg_field_str = if avg_field_nanos < 1_000.0 {
+                format!("{:.0}ns", avg_field_nanos)
+            } else if avg_field_nanos < 1_000_000.0 {
+                format!("{:.1}μs", avg_field_nanos / 1_000.0)
+            } else {
+                format!("{:.1}ms", avg_field_nanos / 1_000_000.0)
+            };
+            
+            println!();
+            println!("Average per page: {}", avg_query_str);
+            println!("Average per field: {}", avg_field_str);
+        }
+        
+        let throughput = if self.total_time.as_secs_f64() > 0.0 {
+            self.entities_found as f64 / self.total_time.as_secs_f64()
+        } else {
+            0.0
+        };
+        println!("Entity throughput: {:.1} entities/sec", throughput);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let total_start = Instant::now();
+    let mut metrics = QueryMetrics::new();
+
     // Initialize tracing for CLI tools
     let log_level = if std::env::var("RUST_LOG").is_ok() {
         std::env::var("RUST_LOG").unwrap()
@@ -189,8 +287,10 @@ async fn main() -> Result<()> {
     info!(core_url = %config.core_url, "Connecting to QCore service");
     
     // Connect to the Core service with authentication
+    let connection_start = Instant::now();
     let mut store = StoreProxy::connect_and_authenticate(&config.core_url, &username, &password).await
         .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
+    metrics.connection_time = connection_start.elapsed();
 
     info!("Connected successfully");
 
@@ -198,8 +298,12 @@ async fn main() -> Result<()> {
     let entity_type = EntityType::from(config.entity_type.as_str());
 
     // Execute the query
-    let results = execute_query(&mut store, &entity_type, config.filter.as_deref(), config.exact, config.limit, config.page_size).await
+    let query_start = Instant::now();
+    let (results, pages_fetched) = execute_query(&mut store, &entity_type, config.filter.as_deref(), config.exact, config.limit, config.page_size).await
         .context("Failed to execute query")?;
+    metrics.query_time = query_start.elapsed();
+    metrics.entities_found = results.len();
+    metrics.pages_fetched = pages_fetched;
 
     info!("Found {} matching entities", results.len());
 
@@ -207,8 +311,14 @@ async fn main() -> Result<()> {
     let fields_to_display = parse_fields(&config.fields);
 
     // Fetch field values for the results
-    let entities_with_data = fetch_entity_data(&mut store, &results, &fields_to_display).await
+    let field_fetch_start = Instant::now();
+    let (entities_with_data, fields_fetched, failed_fields) = fetch_entity_data(&mut store, &results, &fields_to_display).await
         .context("Failed to fetch entity data")?;
+    metrics.field_fetch_time = field_fetch_start.elapsed();
+    metrics.fields_fetched = fields_fetched;
+    metrics.failed_fields = failed_fields;
+
+    metrics.total_time = total_start.elapsed();
 
     // Display results
     display_results(&entities_with_data, &config).await
@@ -219,6 +329,11 @@ async fn main() -> Result<()> {
         export_results(&entities_with_data, export_path).await
             .context("Failed to export results")?;
         info!("Results exported to {}", export_path.display());
+    }
+
+    // Show metrics if requested
+    if config.metrics {
+        metrics.print_metrics();
     }
 
     Ok(())
@@ -232,10 +347,11 @@ async fn execute_query(
     exact: bool,
     limit: usize,
     page_size: usize,
-) -> Result<Vec<EntityId>> {
+) -> Result<(Vec<EntityId>, usize)> {
     let mut results = Vec::new();
     let mut page_opts: Option<PageOpts> = Some(PageOpts::new(page_size, None));
     let mut total_fetched = 0;
+    let mut pages_fetched = 0;
 
     info!(
         entity_type = %entity_type.as_ref(),
@@ -250,6 +366,8 @@ async fn execute_query(
         } else {
             store.find_entities_paginated(entity_type, page_opts.clone(), filter.map(|s| s.to_string())).await?
         };
+
+        pages_fetched += 1;
 
         if page_result.items.is_empty() {
             break;
@@ -275,7 +393,7 @@ async fn execute_query(
         page_opts = Some(PageOpts::new(page_size, page_result.next_cursor));
     }
 
-    Ok(results)
+    Ok((results, pages_fetched))
 }
 
 /// Parse the fields parameter into a list of field names
@@ -295,8 +413,10 @@ async fn fetch_entity_data(
     store: &mut StoreProxy,
     entity_ids: &[EntityId],
     fields: &[String],
-) -> Result<Vec<EntityDisplay>> {
+) -> Result<(Vec<EntityDisplay>, usize, usize)> {
     let mut results = Vec::new();
+    let mut fields_fetched = 0;
+    let mut failed_fields = 0;
 
     for entity_id in entity_ids {
         debug!("Fetching data for entity: {}", entity_id);
@@ -310,13 +430,20 @@ async fn fetch_entity_data(
         // Fetch each requested field
         for field_name in fields {
             let display_value = fetch_field_value(store, entity_id, field_name).await;
+            
+            // Count metrics
+            fields_fetched += 1;
+            if matches!(display_value, DisplayValue::Error(_)) {
+                failed_fields += 1;
+            }
+            
             entity_display.fields.insert(field_name.clone(), display_value);
         }
 
         results.push(entity_display);
     }
 
-    Ok(results)
+    Ok((results, fields_fetched, failed_fields))
 }
 
 /// Fetch a single field value for an entity
