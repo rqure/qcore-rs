@@ -594,6 +594,7 @@ async fn handle_peer_message(
                     
                     let snapshot_request = qlib_rs::Request::Snapshot {
                         snapshot_counter,
+                        timestamp: Some(now()),
                         originator: Some(machine_id),
                     };
                     
@@ -636,6 +637,12 @@ async fn handle_peer_message(
                         *originator != our_machine_id
                     } else {
                         false
+                    }
+                })
+                .filter(|request| {
+                    match request {
+                        qlib_rs::Request::Snapshot { .. } => false, // Ignore snapshot requests from peers
+                        _ => true,
                     }
                 })
                 .collect();
@@ -1876,6 +1883,7 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
                     
                     let snapshot_request = qlib_rs::Request::Snapshot {
                         snapshot_counter,
+                        timestamp: Some(now()),
                         originator: Some(machine_id),
                     };
                     
@@ -3008,6 +3016,7 @@ async fn main() -> Result<()> {
             // This helps during replay to know that the state was snapshotted at shutdown
             let snapshot_request = qlib_rs::Request::Snapshot {
                 snapshot_counter,
+                timestamp: Some(now()),
                 originator: Some({
                     let core = app_state.core_state.read().await;
                     core.config.machine.clone()

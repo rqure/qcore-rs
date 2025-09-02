@@ -594,7 +594,7 @@ impl WalReader {
         };
 
         match request {
-            Request::Create { entity_type, parent_id, name, created_entity_id, originator } => {
+            Request::Create { entity_type, parent_id, name, created_entity_id, timestamp: _, originator } => {
                 WalCreateEntry {
                     timestamp: timestamp_str,
                     operation: "CREATE".to_string(),
@@ -620,7 +620,7 @@ impl WalReader {
         };
 
         match request {
-            Request::Delete { entity_id, originator } => {
+            Request::Delete { entity_id, timestamp: _, originator } => {
                 WalDeleteEntry {
                     timestamp: timestamp_str,
                     operation: "DELETE".to_string(),
@@ -643,7 +643,7 @@ impl WalReader {
         };
 
         match request {
-            Request::SchemaUpdate { schema, originator } => {
+            Request::SchemaUpdate { schema, timestamp: _, originator } => {
                 WalSystemEntry {
                     timestamp: timestamp_str,
                     operation: "SCHEMA".to_string(),
@@ -652,7 +652,7 @@ impl WalReader {
                     location,
                 }
             },
-            Request::Snapshot { snapshot_counter, originator } => {
+            Request::Snapshot { snapshot_counter, timestamp: _, originator } => {
                 WalSystemEntry {
                     timestamp: timestamp_str,
                     operation: "SNAPSHOT".to_string(),
