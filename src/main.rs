@@ -130,8 +130,8 @@ struct Config {
     #[arg(long, default_value = "./data")]
     data_dir: String,
 
-    /// Maximum WAL file size in bytes
-    #[arg(long, default_value_t = 1024 * 1024)]
+    /// Maximum WAL file size in MB
+    #[arg(long, default_value_t = 1)]
     wal_max_file_size: usize,
 
     /// Maximum number of WAL files to keep
@@ -1813,7 +1813,7 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
     
     // Check if we need to create a new WAL file
     let should_create_new_file = wal_state.current_wal_file.is_none() || 
-       wal_state.current_wal_size + serialized_len > core_state.config.wal_max_file_size;
+       wal_state.current_wal_size + serialized_len > core_state.config.wal_max_file_size * 1024 * 1024;
     
     if should_create_new_file {
         // Create WAL directory if it doesn't exist
@@ -1828,7 +1828,7 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
             wal_file = %wal_path.display(),
             wal_counter = wal_state.wal_file_counter,
             current_size = wal_state.current_wal_size,
-            max_size = core_state.config.wal_max_file_size,
+            max_size = core_state.config.wal_max_file_size * 1024 * 1024,
             "Creating new WAL file"
         );
         
