@@ -1014,26 +1014,27 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
         // Unregister all notifications for this client from the store
         if let Some(configs) = client_configs {
             if let Some(sender) = notification_sender {
-                let mut store_guard = app_state.store.write().await;
-                
-                for config in configs {
-                    let removed = store_guard.unregister_notification(&config, &sender).await;
-                    if removed {
-                        debug!(
-                            client_addr = %client_addr_string,
-                            config = ?config,
-                            "Cleaned up notification config for disconnected client"
-                        );
-                    } else {
-                        warn!(
-                            client_addr = %client_addr_string,
-                            config = ?config,
-                            "Failed to clean up notification config for disconnected client"
-                        );
+                {
+                    let mut store_guard = app_state.store.write().await;
+                    
+                    for config in configs {
+                        let removed = store_guard.unregister_notification(&config, &sender).await;
+                        if removed {
+                            debug!(
+                                client_addr = %client_addr_string,
+                                config = ?config,
+                                "Cleaned up notification config for disconnected client"
+                            );
+                        } else {
+                            warn!(
+                                client_addr = %client_addr_string,
+                                config = ?config,
+                                "Failed to clean up notification config for disconnected client"
+                            );
+                        }
                     }
                 }
-                
-                drop(store_guard);
+
                 // The notification sender being dropped will close the channel
                 drop(sender);
             }
@@ -1857,23 +1858,21 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
                 store_guard.inner().take_snapshot()
             };
             
-            // Store snapshot count and machine ID before dropping locks
-            let _wal_files_count = wal_state.wal_files_since_snapshot;
-            
             // Save the snapshot to disk
             match save_snapshot(&snapshot, app_state.clone()).await {
                 Ok(snapshot_counter) => {
                     // Reset the WAL files counter
-                    let mut wal_state = app_state.wal_state.write().await;
-                    wal_state.wal_files_since_snapshot = 0;
-                    info!("Snapshot saved successfully after WAL rollover");
-                    
+                    {
+                        let mut wal_state = app_state.wal_state.write().await;
+                        wal_state.wal_files_since_snapshot = 0;
+                        info!("Snapshot saved successfully after WAL rollover");
+                    }
+
                     // Write a snapshot marker to the WAL to indicate the snapshot point
                     let machine_id = {
                         let core = app_state.core_state.read().await;
                         core.config.machine.clone()
                     };
-                    drop(wal_state); // Release the lock before writing to WAL
                     
                     let snapshot_request = qlib_rs::Request::Snapshot {
                         snapshot_counter,
@@ -2888,11 +2887,12 @@ async fn main() -> Result<()> {
         // Initialize the snapshot file counter to continue from the next number
         let next_snapshot_counter = get_next_snapshot_counter(app_state.clone()).await?;
         
-        let mut store_guard = app_state.store.write().await;
-        store_guard.inner_mut().disable_notifications();
-        store_guard.inner_mut().restore_snapshot(snapshot);
-        store_guard.inner_mut().enable_notifications();
-        drop(store_guard);
+        {
+            let mut store_guard = app_state.store.write().await;
+            store_guard.inner_mut().disable_notifications();
+            store_guard.inner_mut().restore_snapshot(snapshot);
+            store_guard.inner_mut().enable_notifications();
+        }
         
         let mut wal_state = app_state.wal_state.write().await;
         wal_state.snapshot_file_counter = next_snapshot_counter;
