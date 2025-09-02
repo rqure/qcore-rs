@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use qlib_rs::Request;
 use std::path::PathBuf;
+use tabled::{Table, Tabled};
 use tokio::fs::{File, read_dir};
 use tokio::io::AsyncReadExt;
 use time::OffsetDateTime;
@@ -63,6 +64,82 @@ struct Config {
     verbose: bool,
 }
 
+/// Represents a row in the WAL output table for Read/Write operations
+#[derive(Tabled)]
+struct WalReadWriteEntry {
+    #[tabled(rename = "Timestamp")]
+    timestamp: String,
+    #[tabled(rename = "Op")]
+    operation: String,
+    #[tabled(rename = "Entity")]
+    entity: String,
+    #[tabled(rename = "Field")]
+    field: String,
+    #[tabled(rename = "Value")]
+    value: String,
+    #[tabled(rename = "Push")]
+    push: String,
+    #[tabled(rename = "Adjust")]
+    adjust: String,
+    #[tabled(rename = "Writer")]
+    writer: String,
+    #[tabled(rename = "Orig")]
+    originator: String,
+    #[tabled(rename = "File:Row")]
+    location: String,
+}
+
+/// Represents a row in the WAL output table for Create operations
+#[derive(Tabled)]
+struct WalCreateEntry {
+    #[tabled(rename = "Timestamp")]
+    timestamp: String,
+    #[tabled(rename = "Op")]
+    operation: String,
+    #[tabled(rename = "EntityType")]
+    entity_type: String,
+    #[tabled(rename = "Name")]
+    name: String,
+    #[tabled(rename = "Parent")]
+    parent: String,
+    #[tabled(rename = "CreatedID")]
+    created_id: String,
+    #[tabled(rename = "Orig")]
+    originator: String,
+    #[tabled(rename = "File:Row")]
+    location: String,
+}
+
+/// Represents a row in the WAL output table for Delete operations
+#[derive(Tabled)]
+struct WalDeleteEntry {
+    #[tabled(rename = "Timestamp")]
+    timestamp: String,
+    #[tabled(rename = "Op")]
+    operation: String,
+    #[tabled(rename = "Entity")]
+    entity: String,
+    #[tabled(rename = "Orig")]
+    originator: String,
+    #[tabled(rename = "File:Row")]
+    location: String,
+}
+
+/// Represents a row in the WAL output table for Schema/Snapshot operations
+#[derive(Tabled)]
+struct WalSystemEntry {
+    #[tabled(rename = "Timestamp")]
+    timestamp: String,
+    #[tabled(rename = "Op")]
+    operation: String,
+    #[tabled(rename = "Target")]
+    target: String,
+    #[tabled(rename = "Orig")]
+    originator: String,
+    #[tabled(rename = "File:Row")]
+    location: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for CLI tools
@@ -99,7 +176,7 @@ async fn main() -> Result<()> {
         "Starting WAL tool"
     );
 
-    let wal_reader = WalReader::new(config)?;
+    let mut wal_reader = WalReader::new(config)?;
     wal_reader.read_wal_files(start_time, end_time).await?;
 
     Ok(())
@@ -140,6 +217,10 @@ struct WalReader {
     config: Config,
     wal_dir: PathBuf,
     request_type_filter: Option<Vec<String>>,
+    read_write_entries: Vec<WalReadWriteEntry>,
+    create_entries: Vec<WalCreateEntry>,
+    delete_entries: Vec<WalDeleteEntry>,
+    system_entries: Vec<WalSystemEntry>,
 }
 
 impl WalReader {
@@ -158,10 +239,14 @@ impl WalReader {
             config,
             wal_dir,
             request_type_filter,
+            read_write_entries: Vec::new(),
+            create_entries: Vec::new(),
+            delete_entries: Vec::new(),
+            system_entries: Vec::new(),
         })
     }
 
-    async fn read_wal_files(&self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+    async fn read_wal_files(&mut self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
         if !self.wal_dir.exists() {
             return Err(anyhow::anyhow!("WAL directory does not exist: {}", self.wal_dir.display()));
         }
@@ -179,6 +264,15 @@ impl WalReader {
         // Process each WAL file in order
         for (wal_file, _counter) in &wal_files {
             self.process_wal_file(wal_file, start_time, end_time).await?;
+        }
+
+        // Print collected entries as tables (if not in follow mode)
+        if !self.config.follow {
+            if self.config.raw {
+                // In raw mode, we already printed JSON
+            } else {
+                self.print_all_tables();
+            }
         }
 
         // If follow mode is enabled, continue monitoring for new files
@@ -212,7 +306,7 @@ impl WalReader {
         Ok(wal_files)
     }
 
-    async fn process_wal_file(&self, wal_path: &PathBuf, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+    async fn process_wal_file(&mut self, wal_path: &PathBuf, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
         info!("Processing WAL file: {}", wal_path.display());
 
         let mut file = File::open(wal_path).await?;
@@ -246,7 +340,13 @@ impl WalReader {
             match serde_json::from_slice::<Request>(request_data) {
                 Ok(request) => {
                     if self.should_show_request(&request, start_time, end_time) {
-                        self.print_request(&request, wal_path, entries_processed);
+                        if self.config.follow {
+                            // In follow mode, print immediately as table
+                            self.print_request_immediate(&request, wal_path, entries_processed);
+                        } else {
+                            // Collect for batch table display
+                            self.collect_request(&request, wal_path, entries_processed);
+                        }
                         entries_processed += 1;
                     }
                 },
@@ -345,7 +445,21 @@ impl WalReader {
         true
     }
 
-    fn print_request(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) {
+    /// Collect request for batch table display
+    fn collect_request(&mut self, request: &Request, wal_path: &PathBuf, entry_index: usize) {
+        if self.config.raw {
+            // Print raw JSON immediately
+            if let Ok(json) = serde_json::to_string(request) {
+                println!("{}", json);
+            }
+            return;
+        }
+
+        self.create_and_store_entry(request, wal_path, entry_index);
+    }
+
+    /// Print request immediately (for follow mode)
+    fn print_request_immediate(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) {
         if self.config.raw {
             // Print raw JSON
             if let Ok(json) = serde_json::to_string(request) {
@@ -354,84 +468,260 @@ impl WalReader {
             return;
         }
 
-        // Format timestamp
-        let timestamp_str = if let Some(write_time) = request.write_time() {
+        // For follow mode, create temporary entries and print them immediately
+        match request {
+            Request::Read { .. } | Request::Write { .. } => {
+                let entry = self.create_read_write_entry(request, wal_path, entry_index);
+                let table = Table::new(&[entry]);
+                println!("{}", table);
+            },
+            Request::Create { .. } => {
+                let entry = self.create_create_entry(request, wal_path, entry_index);
+                let table = Table::new(&[entry]);
+                println!("{}", table);
+            },
+            Request::Delete { .. } => {
+                let entry = self.create_delete_entry(request, wal_path, entry_index);
+                let table = Table::new(&[entry]);
+                println!("{}", table);
+            },
+            Request::SchemaUpdate { .. } | Request::Snapshot { .. } => {
+                let entry = self.create_system_entry(request, wal_path, entry_index);
+                let table = Table::new(&[entry]);
+                println!("{}", table);
+            },
+        }
+    }
+
+    /// Create and store entries in appropriate collections
+    fn create_and_store_entry(&mut self, request: &Request, wal_path: &PathBuf, entry_index: usize) {
+        match request {
+            Request::Read { .. } | Request::Write { .. } => {
+                let entry = self.create_read_write_entry(request, wal_path, entry_index);
+                self.read_write_entries.push(entry);
+            },
+            Request::Create { .. } => {
+                let entry = self.create_create_entry(request, wal_path, entry_index);
+                self.create_entries.push(entry);
+            },
+            Request::Delete { .. } => {
+                let entry = self.create_delete_entry(request, wal_path, entry_index);
+                self.delete_entries.push(entry);
+            },
+            Request::SchemaUpdate { .. } | Request::Snapshot { .. } => {
+                let entry = self.create_system_entry(request, wal_path, entry_index);
+                self.system_entries.push(entry);
+            },
+        }
+    }
+
+    /// Print all collected tables
+    fn print_all_tables(&self) {
+        if !self.read_write_entries.is_empty() {
+            println!("\n=== READ/WRITE Operations ===");
+            let table = Table::new(&self.read_write_entries);
+            println!("{}", table);
+        }
+
+        if !self.create_entries.is_empty() {
+            println!("\n=== CREATE Operations ===");
+            let table = Table::new(&self.create_entries);
+            println!("{}", table);
+        }
+
+        if !self.delete_entries.is_empty() {
+            println!("\n=== DELETE Operations ===");
+            let table = Table::new(&self.delete_entries);
+            println!("{}", table);
+        }
+
+        if !self.system_entries.is_empty() {
+            println!("\n=== SYSTEM Operations (Schema/Snapshot) ===");
+            let table = Table::new(&self.system_entries);
+            println!("{}", table);
+        }
+    }
+
+    /// Create a Read/Write entry
+    fn create_read_write_entry(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) -> WalReadWriteEntry {
+        let timestamp_str = self.format_timestamp(request);
+        let location = if self.config.verbose {
+            format!("{}:{}", wal_path.file_name().unwrap().to_string_lossy(), entry_index)
+        } else {
+            String::new()
+        };
+
+        match request {
+            Request::Read { entity_id, field_type, value, writer_id, .. } => {
+                WalReadWriteEntry {
+                    timestamp: timestamp_str,
+                    operation: "READ".to_string(),
+                    entity: Self::format_entity_id(entity_id),
+                    field: field_type.as_ref().to_string(),
+                    value: Self::format_value_clean(value),
+                    push: "-".to_string(),
+                    adjust: "-".to_string(),
+                    writer: writer_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "system".to_string()),
+                    originator: "-".to_string(),
+                    location,
+                }
+            },
+            Request::Write { entity_id, field_type, value, push_condition, adjust_behavior, writer_id, originator, .. } => {
+                WalReadWriteEntry {
+                    timestamp: timestamp_str,
+                    operation: "WRITE".to_string(),
+                    entity: Self::format_entity_id(entity_id),
+                    field: field_type.as_ref().to_string(),
+                    value: Self::format_value_clean(value),
+                    push: format!("{:?}", push_condition),
+                    adjust: format!("{}", adjust_behavior),
+                    writer: writer_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "system".to_string()),
+                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    location,
+                }
+            },
+            _ => unreachable!("create_read_write_entry called with non-read/write request"),
+        }
+    }
+
+    /// Create a Create entry
+    fn create_create_entry(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) -> WalCreateEntry {
+        let timestamp_str = self.format_timestamp(request);
+        let location = if self.config.verbose {
+            format!("{}:{}", wal_path.file_name().unwrap().to_string_lossy(), entry_index)
+        } else {
+            String::new()
+        };
+
+        match request {
+            Request::Create { entity_type, parent_id, name, created_entity_id, originator } => {
+                WalCreateEntry {
+                    timestamp: timestamp_str,
+                    operation: "CREATE".to_string(),
+                    entity_type: entity_type.as_ref().to_string(),
+                    name: name.clone(),
+                    parent: parent_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "root".to_string()),
+                    created_id: created_entity_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "auto".to_string()),
+                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    location,
+                }
+            },
+            _ => unreachable!("create_create_entry called with non-create request"),
+        }
+    }
+
+    /// Create a Delete entry
+    fn create_delete_entry(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) -> WalDeleteEntry {
+        let timestamp_str = self.format_timestamp(request);
+        let location = if self.config.verbose {
+            format!("{}:{}", wal_path.file_name().unwrap().to_string_lossy(), entry_index)
+        } else {
+            String::new()
+        };
+
+        match request {
+            Request::Delete { entity_id, originator } => {
+                WalDeleteEntry {
+                    timestamp: timestamp_str,
+                    operation: "DELETE".to_string(),
+                    entity: Self::format_entity_id(entity_id),
+                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    location,
+                }
+            },
+            _ => unreachable!("create_delete_entry called with non-delete request"),
+        }
+    }
+
+    /// Create a System entry (Schema/Snapshot)
+    fn create_system_entry(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) -> WalSystemEntry {
+        let timestamp_str = self.format_timestamp(request);
+        let location = if self.config.verbose {
+            format!("{}:{}", wal_path.file_name().unwrap().to_string_lossy(), entry_index)
+        } else {
+            String::new()
+        };
+
+        match request {
+            Request::SchemaUpdate { schema, originator } => {
+                WalSystemEntry {
+                    timestamp: timestamp_str,
+                    operation: "SCHEMA".to_string(),
+                    target: schema.entity_type.as_ref().to_string(),
+                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    location,
+                }
+            },
+            Request::Snapshot { snapshot_counter, originator } => {
+                WalSystemEntry {
+                    timestamp: timestamp_str,
+                    operation: "SNAPSHOT".to_string(),
+                    target: format!("#{}", snapshot_counter),
+                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    location,
+                }
+            },
+            _ => unreachable!("create_system_entry called with non-system request"),
+        }
+    }
+
+    /// Format timestamp consistently
+    fn format_timestamp(&self, request: &Request) -> String {
+        if let Some(write_time) = request.write_time() {
             if self.config.relative_time {
                 format_relative_time(write_time)
             } else {
+                // Show full timestamp
                 write_time.format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_else(|_| "Invalid timestamp".to_string())
             }
         } else {
             "No timestamp".to_string()
-        };
-
-        // Format the request based on type
-        match request {
-            Request::Read { entity_id, field_type, value, writer_id, .. } => {
-                if self.config.verbose {
-                    println!("[{}] READ {} {} -> {:?} (writer: {:?}) [{}:{}]", 
-                        timestamp_str, entity_id.get_id(), field_type.as_ref(), value, writer_id,
-                        wal_path.file_name().unwrap().to_string_lossy(), entry_index);
-                } else {
-                    println!("[{}] READ {} {} -> {:?}", 
-                        timestamp_str, entity_id.get_id(), field_type.as_ref(), value);
-                }
-            },
-            Request::Write { entity_id, field_type, value, push_condition, adjust_behavior, writer_id, originator, .. } => {
-                if self.config.verbose {
-                    println!("[{}] WRITE {} {} = {:?} (push: {:?}, adjust: {}, writer: {:?}, originator: {:?}) [{}:{}]",
-                        timestamp_str, entity_id.get_id(), field_type.as_ref(), value, push_condition, adjust_behavior, writer_id, originator,
-                        wal_path.file_name().unwrap().to_string_lossy(), entry_index);
-                } else {
-                    println!("[{}] WRITE {} {} = {:?}",
-                        timestamp_str, entity_id.get_id(), field_type.as_ref(), value);
-                }
-            },
-            Request::Create { entity_type, parent_id, name, created_entity_id, originator } => {
-                if self.config.verbose {
-                    println!("[{}] CREATE {} '{}' (parent: {:?}, id: {:?}, originator: {:?}) [{}:{}]",
-                        timestamp_str, entity_type.as_ref(), name, parent_id, created_entity_id, originator,
-                        wal_path.file_name().unwrap().to_string_lossy(), entry_index);
-                } else {
-                    println!("[{}] CREATE {} '{}'", 
-                        timestamp_str, entity_type.as_ref(), name);
-                }
-            },
-            Request::Delete { entity_id, originator } => {
-                if self.config.verbose {
-                    println!("[{}] DELETE {} (originator: {:?}) [{}:{}]",
-                        timestamp_str, entity_id.get_id(), originator,
-                        wal_path.file_name().unwrap().to_string_lossy(), entry_index);
-                } else {
-                    println!("[{}] DELETE {}", 
-                        timestamp_str, entity_id.get_id());
-                }
-            },
-            Request::SchemaUpdate { schema, originator } => {
-                if self.config.verbose {
-                    println!("[{}] SCHEMA_UPDATE {} (originator: {:?}) [{}:{}]",
-                        timestamp_str, schema.entity_type.as_ref(), originator,
-                        wal_path.file_name().unwrap().to_string_lossy(), entry_index);
-                } else {
-                    println!("[{}] SCHEMA_UPDATE {}", 
-                        timestamp_str, schema.entity_type.as_ref());
-                }
-            },
-            Request::Snapshot { snapshot_counter, originator } => {
-                if self.config.verbose {
-                    println!("[{}] SNAPSHOT #{} (originator: {:?}) [{}:{}]",
-                        timestamp_str, snapshot_counter, originator,
-                        wal_path.file_name().unwrap().to_string_lossy(), entry_index);
-                } else {
-                    println!("[{}] SNAPSHOT #{}", 
-                        timestamp_str, snapshot_counter);
-                }
-            }
         }
     }
 
-    async fn follow_mode(&self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+    /// Format entity ID in a clean, readable way
+    fn format_entity_id(entity_id: &qlib_rs::EntityId) -> String {
+        format!("{}${}", entity_id.get_type().as_ref(), entity_id.get_id())
+    }
+
+    /// Format value in a clean way without Rust type annotations
+    fn format_value_clean(value: &Option<qlib_rs::Value>) -> String {
+        match value {
+            Some(qlib_rs::Value::String(s)) => format!("\"{}\"", s),
+            Some(qlib_rs::Value::Int(i)) => i.to_string(),
+            Some(qlib_rs::Value::Float(f)) => f.to_string(),
+            Some(qlib_rs::Value::Bool(b)) => b.to_string(),
+            Some(qlib_rs::Value::Choice(c)) => c.to_string(),
+            Some(qlib_rs::Value::EntityList(list)) => {
+                if list.is_empty() {
+                    "[]".to_string()
+                } else if list.len() <= 3 {
+                    format!("[{}]", list.iter().map(Self::format_entity_id).collect::<Vec<_>>().join(", "))
+                } else {
+                    format!("[{}, ... {} more]", 
+                        list.iter().take(2).map(Self::format_entity_id).collect::<Vec<_>>().join(", "),
+                        list.len() - 2)
+                }
+            },
+            Some(qlib_rs::Value::EntityReference(Some(entity_id))) => Self::format_entity_id(entity_id),
+            Some(qlib_rs::Value::EntityReference(None)) => "null".to_string(),
+            Some(qlib_rs::Value::Blob(blob)) => {
+                if blob.len() <= 16 {
+                    format!("blob[{}]", blob.len())
+                } else {
+                    format!("blob[{} bytes]", blob.len())
+                }
+            },
+            Some(qlib_rs::Value::Timestamp(ts)) => {
+                ts.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "invalid_timestamp".to_string())
+            },
+            None => "null".to_string(),
+        }
+    }
+
+    async fn follow_mode(&mut self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
         info!("Entering follow mode - monitoring for new WAL entries...");
         
         // Keep track of file sizes to detect new content
@@ -495,7 +785,7 @@ impl WalReader {
         Ok(())
     }
 
-    async fn process_wal_file_from_offset(&self, wal_path: &PathBuf, start_offset: usize, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+    async fn process_wal_file_from_offset(&mut self, wal_path: &PathBuf, start_offset: usize, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
         let mut file = File::open(wal_path).await?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).await?;
@@ -529,7 +819,7 @@ impl WalReader {
             match serde_json::from_slice::<Request>(request_data) {
                 Ok(request) => {
                     if self.should_show_request(&request, start_time, end_time) {
-                        self.print_request(&request, wal_path, entries_processed);
+                        self.print_request_immediate(&request, wal_path, entries_processed);
                         entries_processed += 1;
                     }
                 },
