@@ -159,7 +159,7 @@ struct Config {
     peer_addresses: Vec<String>,
 
     /// Interval in seconds to retry connecting to peers
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 3)]
     peer_reconnect_interval_secs: u64,
 
     /// Delay before starting leader election (useful for testing)
@@ -356,7 +356,17 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
             }
             Ok(Message::Binary(data)) => {
                 debug!(data_length = data.len(), "Received binary data from peer");
-                // Handle binary messages - could be used for efficient data transfer
+                
+                // Try to parse as a PeerMessage (likely FullSyncResponse with binary serialization)
+                match bincode::deserialize::<PeerMessage>(&data) {
+                    Ok(peer_msg) => {
+                        debug!(message_type = ?std::mem::discriminant(&peer_msg), "Processing binary peer message");
+                        handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, app_state.clone()).await;
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "Failed to deserialize binary peer message, ignoring");
+                    }
+                }
             }
             Ok(Message::Ping(payload)) => {
                 debug!("Received ping from peer");
@@ -473,6 +483,11 @@ async fn handle_peer_message(
                 let old_state = core_state.availability_state.clone();
                 core_state.availability_state = new_state.clone();
                 
+                // Clear the unavailable timestamp when becoming available
+                if old_state != new_state {
+                    core_state.became_unavailable_at = None;
+                }
+                
                 if old_state != new_state {
                     info!(
                         old_state = ?old_state,
@@ -492,6 +507,11 @@ async fn handle_peer_message(
                     let new_state = AvailabilityState::Unavailable;
                     let old_state = core_state.availability_state.clone();
                     core_state.availability_state = new_state.clone();
+                    
+                    // Set the timestamp when we became unavailable for grace period tracking
+                    if old_state != new_state {
+                        core_state.became_unavailable_at = Some(time::OffsetDateTime::now_utc().unix_timestamp() as u64);
+                    }
                     
                     let leader = {
                         let peer_info = app_state.peer_info.read().await;
@@ -539,19 +559,43 @@ async fn handle_peer_message(
                 store_guard.inner().take_snapshot()
             };
             
+            info!(
+                requesting_machine = %machine_id, 
+                snapshot_entities = snapshot.entities.len(),
+                "Snapshot prepared, attempting to serialize and send"
+            );
+            
             let response = PeerMessage::FullSyncResponse { snapshot };
             
-            if let Ok(response_json) = serde_json::to_string(&response) {
-                if let Err(e) = ws_sender.send(Message::Text(response_json)).await {
+            // Use binary serialization for the snapshot since it contains complex key types
+            match bincode::serialize(&response) {
+                Ok(response_binary) => {
+                    info!(
+                        requesting_machine = %machine_id,
+                        response_size = response_binary.len(),
+                        "Snapshot serialized to binary, sending response directly to requesting peer"
+                    );
+                    
+                    // Send the response directly through the inbound connection
+                    let message = Message::Binary(response_binary);
+                    if let Err(e) = ws_sender.send(message).await {
+                        error!(
+                            error = %e,
+                            requesting_machine = %machine_id,
+                            "Failed to send FullSyncResponse to requesting peer"
+                        );
+                    } else {
+                        info!(
+                            requesting_machine = %machine_id,
+                            "Successfully sent FullSyncResponse to requesting peer"
+                        );
+                    }
+                }
+                Err(e) => {
                     error!(
                         error = %e,
                         requesting_machine = %machine_id,
-                        "Failed to send full sync response"
-                    );
-                } else {
-                    info!(
-                        requesting_machine = %machine_id,
-                        "Successfully sent full sync snapshot"
+                        "Failed to serialize full sync response"
                     );
                 }
             }
@@ -575,6 +619,7 @@ async fn handle_peer_message(
                 core_state.is_fully_synced = true;
                 core_state.full_sync_request_pending = false; // Reset pending flag since we got a response
                 core_state.availability_state = AvailabilityState::Available;
+                core_state.became_unavailable_at = None; // Clear timestamp when becoming available
             }
             
             // Save the snapshot to disk for persistence
@@ -729,16 +774,81 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
         }
     });
     
-    // Handle incoming messages from peer (ignore all except connection control)
+    // Handle incoming messages from peer (process FullSyncResponse, ignore others)
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(_text)) => {
                 // Ignore all text messages - message handling is done in handle_inbound_peer_connection
                 debug!("Ignoring received text message from outbound peer (handled via inbound connection)");
             }
-            Ok(Message::Binary(_data)) => {
-                // Ignore binary data - message handling is done in handle_inbound_peer_connection
-                debug!("Ignoring received binary data from outbound peer (handled via inbound connection)");
+            Ok(Message::Binary(data)) => {
+                // Try to deserialize as PeerMessage to check if it's a FullSyncResponse
+                match bincode::deserialize::<PeerMessage>(&data) {
+                    Ok(PeerMessage::FullSyncResponse { snapshot }) => {
+                        info!("Received FullSyncResponse via outbound connection, applying snapshot");
+                        
+                        // Apply the snapshot to the store
+                        {
+                            let mut store_guard = app_state.store.write().await;
+                            store_guard.inner_mut().disable_notifications();
+                            store_guard.inner_mut().restore_snapshot(snapshot.clone());
+                            store_guard.inner_mut().enable_notifications();
+                        }
+                        
+                        // Update core state
+                        {
+                            let mut core_state = app_state.core_state.write().await;
+                            core_state.is_fully_synced = true;
+                            core_state.full_sync_request_pending = false;
+                            core_state.availability_state = AvailabilityState::Available;
+                            core_state.became_unavailable_at = None;
+                        }
+                        
+                        // Save the snapshot to disk for persistence
+                        match save_snapshot(&snapshot, app_state.clone()).await {
+                            Ok(snapshot_counter) => {
+                                info!(
+                                    snapshot_counter = snapshot_counter,
+                                    "Saved snapshot to disk after full sync"
+                                );
+                                
+                                // Write a snapshot marker to the WAL
+                                let machine_id = {
+                                    let core = app_state.core_state.read().await;
+                                    core.config.machine.clone()
+                                };
+                                
+                                let snapshot_request = qlib_rs::Request::Snapshot {
+                                    snapshot_counter,
+                                    timestamp: Some(time::OffsetDateTime::now_utc()),
+                                    originator: Some(machine_id.clone()),
+                                };
+                                
+                                if let Err(e) = write_request_to_wal_direct(&snapshot_request, app_state.clone()).await {
+                                    error!(error = %e, "Failed to write snapshot marker to WAL");
+                                }
+
+                                match reinit_caches(app_state.clone()).await {
+                                    Ok(_) => info!("Caches reinitialized after full sync"),
+                                    Err(e) => error!(error = %e, "Failed to reinitialize caches after full sync"),
+                                }
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to save snapshot during full sync");
+                            }
+                        }
+                        
+                        info!("Successfully applied full sync snapshot via outbound connection");
+                    }
+                    Ok(_) => {
+                        // Other peer messages - ignore (handled via inbound connection)
+                        debug!("Ignoring received binary peer message from outbound peer (handled via inbound connection)");
+                    }
+                    Err(_) => {
+                        // Not a peer message - ignore
+                        debug!("Ignoring received binary data from outbound peer (not a peer message)");
+                    }
+                }
             }
             Ok(Message::Ping(_payload)) => {
                 // Respond to pings to keep connection alive
