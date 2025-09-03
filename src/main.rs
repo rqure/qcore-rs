@@ -4,7 +4,7 @@ use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tracing::{info, warn, error, debug, instrument};
 use clap::Parser;
 use anyhow::Result;
@@ -230,6 +230,68 @@ struct PeerInfo {
     startup_time: u64
 }
 
+/// Specifies which AppState locks to acquire
+#[derive(Default)]
+struct LockRequest {
+    pub core_state: bool,
+    pub connections: bool,
+    pub wal_state: bool,
+    pub peer_info: bool,
+    pub store: bool,
+    pub permission_cache: bool,
+    pub cel_executor: bool,
+}
+
+/// Contains the acquired locks in the proper order
+struct AppStateLocks<'a> {
+    pub core_state: Option<MutexGuard<'a, CoreState>>,
+    pub connections: Option<MutexGuard<'a, ConnectionState>>,
+    pub wal_state: Option<MutexGuard<'a, WalState>>,
+    pub peer_info: Option<MutexGuard<'a, HashMap<String, PeerInfo>>>,
+    pub store: Option<MutexGuard<'a, AsyncStore>>,
+    pub permission_cache: Option<MutexGuard<'a, Option<Cache>>>,
+    pub cel_executor: Option<MutexGuard<'a, CelExecutor>>,
+}
+
+
+
+impl<'a> AppStateLocks<'a> {
+    /// Get the core_state lock, panicking if it wasn't requested
+    pub fn core_state(&self) -> &MutexGuard<'a, CoreState> {
+        self.core_state.as_ref().expect("core_state lock was not requested")
+    }
+
+    /// Get the connections lock, panicking if it wasn't requested
+    pub fn connections(&mut self) -> &mut MutexGuard<'a, ConnectionState> {
+        self.connections.as_mut().expect("connections lock was not requested")
+    }
+
+    /// Get the wal_state lock, panicking if it wasn't requested
+    pub fn wal_state(&mut self) -> &mut MutexGuard<'a, WalState> {
+        self.wal_state.as_mut().expect("wal_state lock was not requested")
+    }
+
+    /// Get the peer_info lock, panicking if it wasn't requested
+    pub fn peer_info(&mut self) -> &mut MutexGuard<'a, HashMap<String, PeerInfo>> {
+        self.peer_info.as_mut().expect("peer_info lock was not requested")
+    }
+
+    /// Get the store lock, panicking if it wasn't requested
+    pub fn store(&mut self) -> &mut MutexGuard<'a, AsyncStore> {
+        self.store.as_mut().expect("store lock was not requested")
+    }
+
+    /// Get the permission_cache lock, panicking if it wasn't requested
+    pub fn permission_cache(&mut self) -> &mut MutexGuard<'a, Option<Cache>> {
+        self.permission_cache.as_mut().expect("permission_cache lock was not requested")
+    }
+
+    /// Get the cel_executor lock, panicking if it wasn't requested
+    pub fn cel_executor(&mut self) -> &mut MutexGuard<'a, CelExecutor> {
+        self.cel_executor.as_mut().expect("cel_executor lock was not requested")
+    }
+}
+
 impl AppState {
     async fn new(config: Config) -> Result<Self> {
         let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
@@ -430,6 +492,58 @@ impl AppState {
                 new_leader = ?new_leader,
                 "Updated leadership after current leader disconnected"
             );
+        }
+    }
+    
+    /// Acquire multiple AppState locks in a consistent order to prevent deadlocks.
+    /// 
+    /// This function ensures that locks are always acquired in the same order:
+    /// 1. core_state
+    /// 2. connections  
+    /// 3. wal_state
+    /// 4. peer_info
+    /// 5. store
+    /// 6. permission_cache
+    /// 7. cel_executor
+    /// 
+    /// Only the locks specified in the request will be acquired.
+    async fn acquire_locks(&self, request: LockRequest) -> AppStateLocks<'_> {
+        AppStateLocks {
+            core_state: if request.core_state {
+                Some(self.core_state.lock().await)
+            } else {
+                None
+            },
+            connections: if request.connections {
+                Some(self.connections.lock().await)
+            } else {
+                None
+            },
+            wal_state: if request.wal_state {
+                Some(self.wal_state.lock().await)
+            } else {
+                None
+            },
+            peer_info: if request.peer_info {
+                Some(self.peer_info.lock().await)
+            } else {
+                None
+            },
+            store: if request.store {
+                Some(self.store.lock().await)
+            } else {
+                None
+            },
+            permission_cache: if request.permission_cache {
+                Some(self.permission_cache.lock().await)
+            } else {
+                None
+            },
+            cel_executor: if request.cel_executor {
+                Some(self.cel_executor.lock().await)
+            } else {
+                None
+            },
         }
     }
 }
