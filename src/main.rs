@@ -4,14 +4,13 @@ use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn, error, debug, instrument};
 use clap::Parser;
 use anyhow::Result;
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use std::vec;
-use tokio::sync::RwLock;
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -175,25 +174,25 @@ struct Config {
 #[derive(Debug)]
 struct AppState {
     /// Core configuration and leadership state - should be accessed minimally
-    core_state: RwLock<CoreState>,
+    core_state: Mutex<CoreState>,
     
     /// Connection-related state - separate lock to reduce contention
-    connections: RwLock<ConnectionState>,
+    connections: Mutex<ConnectionState>,
     
     /// WAL file state - separate lock for file operations
-    wal_state: RwLock<WalState>,
+    wal_state: Mutex<WalState>,
     
     /// Peer information tracking
-    peer_info: RwLock<HashMap<String, PeerInfo>>,
+    peer_info: Mutex<HashMap<String, PeerInfo>>,
     
     /// Data store - kept separate as it has its own locking
-    store: Arc<RwLock<AsyncStore>>,
+    store: Arc<Mutex<AsyncStore>>,
     
     /// Permission Cache - separate as it's accessed frequently
-    permission_cache: RwLock<Option<Cache<AsyncStore>>>,
+    permission_cache: Mutex<Option<Cache>>,
     
     /// CEL Executor for evaluating authorization conditions
-    cel_executor: RwLock<CelExecutor>,
+    cel_executor: Mutex<CelExecutor>,
 }
 
 /// Core application state
@@ -234,10 +233,10 @@ struct PeerInfo {
 impl AppState {
     async fn new(config: Config) -> Result<Self> {
         let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
-        let store = Arc::new(RwLock::new(AsyncStore::new(Arc::new(Snowflake::new()))));
+        let store = Arc::new(Mutex::new(AsyncStore::new(Arc::new(Snowflake::new()))));
         
         Ok(Self {
-            core_state: RwLock::new(CoreState {
+            core_state: Mutex::new(CoreState {
                 config,
                 startup_time,
                 availability_state: AvailabilityState::Available,
@@ -247,18 +246,18 @@ impl AppState {
                 became_unavailable_at: None,
                 full_sync_request_pending: false,
             }),
-            connections: RwLock::new(ConnectionState::new()),
-            wal_state: RwLock::new(WalState::new()),
-            peer_info: RwLock::new(HashMap::new()),
+            connections: Mutex::new(ConnectionState::new()),
+            wal_state: Mutex::new(WalState::new()),
+            peer_info: Mutex::new(HashMap::new()),
             store,
-            permission_cache: RwLock::new(None),
-            cel_executor: RwLock::new(CelExecutor::new()),
+            permission_cache: Mutex::new(None),
+            cel_executor: Mutex::new(CelExecutor::new()),
         })
     }
     
     /// Get a snapshot of the core state without holding locks
     async fn get_state_snapshot(&self) -> StateSnapshot {
-        let core = self.core_state.read().await;
+        let core = self.core_state.lock().await;
         StateSnapshot {
             config: core.config.clone(),
             startup_time: core.startup_time,
@@ -268,7 +267,7 @@ impl AppState {
     
     /// Get the machine-specific data directory
     async fn get_machine_data_dir(&self) -> PathBuf {
-        let core = self.core_state.read().await;
+        let core = self.core_state.lock().await;
         PathBuf::from(&core.config.data_dir).join(&core.config.machine)
     }
 
@@ -286,7 +285,7 @@ impl AppState {
 
     /// Force disconnect all connected clients (used when transitioning to unavailable)
     async fn force_disconnect_all_clients(&self) {
-        let mut connections = self.connections.write().await;
+        let mut connections = self.connections.lock().await;
         
         if !connections.connected_clients.is_empty() {
             let client_count = connections.connected_clients.len();
@@ -333,14 +332,14 @@ impl AppState {
         
         // Get our basic info
         {
-            let core = self.core_state.read().await;
+            let core = self.core_state.lock().await;
             our_startup_time = core.startup_time;
             our_machine_id = core.config.machine.clone();
         }
         
         // Find the earliest startup time among all known peers including ourselves
         let (should_be_leader, earliest_startup) = {
-            let peer_info = self.peer_info.read().await;
+            let peer_info = self.peer_info.lock().await;
             let earliest_startup = peer_info.values()
                 .map(|p| p.startup_time)
                 .min()
@@ -378,7 +377,7 @@ impl AppState {
         
         // Update leadership status
         if should_be_leader {
-            let mut core_state = self.core_state.write().await;
+            let mut core_state = self.core_state.lock().await;
             let was_leader = core_state.is_leader;
             core_state.is_leader = true;
             core_state.current_leader = Some(our_machine_id.clone());
@@ -402,7 +401,7 @@ impl AppState {
         } else {
             // Find who should be the leader
             let new_leader = {
-                let peer_info = self.peer_info.read().await;
+                let peer_info = self.peer_info.lock().await;
                 peer_info.values()
                     .filter(|p| p.startup_time <= earliest_startup)
                     .min_by(|a, b| {
@@ -412,7 +411,7 @@ impl AppState {
                     .map(|p| p.machine_id.clone())
             };
             
-            let mut core_state = self.core_state.write().await;
+            let mut core_state = self.core_state.lock().await;
             core_state.is_leader = false;
             core_state.current_leader = new_leader.clone();
             let new_state = AvailabilityState::Unavailable;
@@ -503,7 +502,7 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     
     // Remove peer from connected inbound peers when connection ends
     let disconnected_machine_id = {
-        let mut peer_info = app_state.peer_info.write().await;
+        let mut peer_info = app_state.peer_info.lock().await;
         let disconnected_machine_id = peer_info.iter()
             .find(|(addr, _)| addr == &&peer_addr.to_string())
             .map(|(_, info)| info.machine_id.clone());
@@ -518,7 +517,7 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     // Check if the disconnected peer was the current leader and retrigger election
     if let Some(disconnected_machine_id) = disconnected_machine_id {
         let current_leader = {
-            let core = app_state.core_state.read().await;
+            let core = app_state.core_state.lock().await;
             core.current_leader.clone()
         };
         
@@ -555,7 +554,7 @@ async fn handle_peer_message(
             
             // Update peer information
             {
-                let mut peer_info = app_state.peer_info.write().await;
+                let mut peer_info = app_state.peer_info.lock().await;
                 peer_info.insert(peer_addr.to_string(), PeerInfo {
                     machine_id: machine_id.clone(),
                     startup_time,
@@ -569,7 +568,7 @@ async fn handle_peer_message(
             
             // Find the earliest (largest) startup time among all known peers including ourselves
             let (should_be_leader, earliest_startup) = {
-                let peer_info = app_state.peer_info.read().await;
+                let peer_info = app_state.peer_info.lock().await;
                 let earliest_startup = peer_info.values()
                     .map(|p| p.startup_time)
                     .min()
@@ -607,7 +606,7 @@ async fn handle_peer_message(
             
             // Update leadership status
             if should_be_leader {
-                let mut core_state = app_state.core_state.write().await;
+                let mut core_state = app_state.core_state.lock().await;
                 core_state.is_leader = true;
                 core_state.current_leader = Some(our_machine_id.clone());
                 core_state.is_fully_synced = true;
@@ -634,7 +633,7 @@ async fn handle_peer_message(
                 );
             } else {
                 let leader = {
-                    let mut core_state = app_state.core_state.write().await;
+                    let mut core_state = app_state.core_state.lock().await;
                     core_state.is_leader = false;
                     let new_state = AvailabilityState::Unavailable;
                     let old_state = core_state.availability_state.clone();
@@ -650,7 +649,7 @@ async fn handle_peer_message(
                     }
                     
                     let leader = {
-                        let peer_info = app_state.peer_info.read().await;
+                        let peer_info = app_state.peer_info.lock().await;
                         peer_info.values()
                             .filter(|p| p.startup_time <= earliest_startup)
                             .min_by_key(|p| (&p.startup_time, &p.machine_id))
@@ -691,7 +690,7 @@ async fn handle_peer_message(
             
             // Take a snapshot and send it
             let snapshot = {
-                let store_guard = app_state.store.read().await;
+                let store_guard = app_state.store.lock().await;
                 store_guard.inner().take_snapshot()
             };
             
@@ -743,7 +742,7 @@ async fn handle_peer_message(
             
             // Apply the snapshot to the store
             {
-                let mut store_guard = app_state.store.write().await;
+                let mut store_guard = app_state.store.lock().await;
                 store_guard.inner_mut().disable_notifications();
                 store_guard.inner_mut().restore_snapshot(snapshot.clone());
                 store_guard.inner_mut().enable_notifications();
@@ -751,7 +750,7 @@ async fn handle_peer_message(
             
             // Update core state
             {
-                let mut core_state = app_state.core_state.write().await;
+                let mut core_state = app_state.core_state.lock().await;
                 core_state.is_fully_synced = true;
                 core_state.full_sync_request_pending = false; // Reset pending flag since we got a response
                 core_state.availability_state = AvailabilityState::Available;
@@ -769,7 +768,7 @@ async fn handle_peer_message(
                     // Write a snapshot marker to the WAL to indicate the sync point
                     // This helps during replay to know that the state was synced at this point
                     let machine_id = {
-                        let core = app_state.core_state.read().await;
+                        let core = app_state.core_state.lock().await;
                         core.config.machine.clone()
                     };
                     
@@ -807,7 +806,7 @@ async fn handle_peer_message(
         PeerMessage::SyncRequest { requests } => {
             // Handle data synchronization (existing functionality)
             let our_machine_id = {
-                let core = app_state.core_state.read().await;
+                let core = app_state.core_state.lock().await;
                 core.config.machine.clone()
             };
             
@@ -829,7 +828,7 @@ async fn handle_peer_message(
                 .collect();
             
             if !requests_to_apply.is_empty() {
-                let mut store_guard = app_state.store.write().await;
+                let mut store_guard = app_state.store.lock().await;
                 if let Err(e) = store_guard.perform_mut(&mut requests_to_apply).await {
                     error!(
                         error = %e,
@@ -865,13 +864,13 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
     
     // Store the sender in the connected_outbound_peers HashMap
     {
-        let mut connections = app_state.connections.write().await;
+        let mut connections = app_state.connections.lock().await;
         connections.connected_outbound_peers.insert(peer_addr.to_string(), tx);
     }
     
     // Send initial startup message to announce ourselves
     let (machine, startup_time) = {
-        let core = app_state.core_state.read().await;
+        let core = app_state.core_state.lock().await;
         (core.config.machine.clone(), core.startup_time)
     };
     let startup = PeerMessage::Startup {
@@ -925,7 +924,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
                         
                         // Apply the snapshot to the store
                         {
-                            let mut store_guard = app_state.store.write().await;
+                            let mut store_guard = app_state.store.lock().await;
                             store_guard.inner_mut().disable_notifications();
                             store_guard.inner_mut().restore_snapshot(snapshot.clone());
                             store_guard.inner_mut().enable_notifications();
@@ -933,7 +932,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
                         
                         // Update core state
                         {
-                            let mut core_state = app_state.core_state.write().await;
+                            let mut core_state = app_state.core_state.lock().await;
                             core_state.is_fully_synced = true;
                             core_state.full_sync_request_pending = false;
                             core_state.availability_state = AvailabilityState::Available;
@@ -950,7 +949,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
                                 
                                 // Write a snapshot marker to the WAL
                                 let machine_id = {
-                                    let core = app_state.core_state.read().await;
+                                    let core = app_state.core_state.lock().await;
                                     core.config.machine.clone()
                                 };
                                 
@@ -1097,7 +1096,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     
     // Check if authentication was successful
     let is_authenticated = {
-        let connections = app_state.connections.read().await;
+        let connections = app_state.connections.lock().await;
         connections.authenticated_clients.contains_key(&client_addr.to_string())
     };
     
@@ -1118,7 +1117,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     
     // Store the sender and notification sender in the connected_clients HashMap
     {
-        let mut connections = app_state.connections.write().await;
+        let mut connections = app_state.connections.lock().await;
         connections.connected_clients.insert(client_addr.to_string(), tx.clone());
         connections.client_notification_senders.insert(client_addr.to_string(), notification_sender);
     }
@@ -1171,7 +1170,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
         }
         
         // Remove client from connected_clients when outgoing task ends
-        let mut connections = app_state_clone.connections.write().await;
+        let mut connections = app_state_clone.connections.lock().await;
         connections.connected_clients.remove(&client_addr_clone);
         connections.authenticated_clients.remove(&client_addr_clone);
         connections.client_notification_senders.remove(&client_addr_clone);
@@ -1253,7 +1252,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     
     // Remove client from connected_clients and cleanup notifications when connection ends
     {
-        let mut connections = app_state.connections.write().await;
+        let mut connections = app_state.connections.lock().await;
         let client_addr_string = client_addr.to_string();
         connections.connected_clients.remove(&client_addr_string);
         
@@ -1268,7 +1267,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
         if let Some(configs) = client_configs {
             if let Some(sender) = notification_sender {
                 {
-                    let mut store_guard = app_state.store.write().await;
+                    let mut store_guard = app_state.store.lock().await;
                     
                     for config in configs {
                         let removed = store_guard.unregister_notification(&config, &sender).await;
@@ -1309,7 +1308,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
 async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>, client_addr: Option<String>) -> StoreMessage {
     // Extract client notification sender if needed (before accessing store)
     let client_notification_sender = if let Some(ref addr) = client_addr {
-        let connections = app_state.connections.read().await;
+        let connections = app_state.connections.lock().await;
         connections.client_notification_senders.get(addr).cloned()
     } else {
         None
@@ -1320,13 +1319,13 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
             // Perform authentication
             let auth_config = AuthConfig::default();
             let store = app_state.store.clone();
-            let mut store_guard = store.write().await;
+            let mut store_guard = store.lock().await;
             
             match authenticate_subject(&mut store_guard, &subject_name, &credential, &auth_config).await {
                 Ok(subject_id) => {
                     // Store authentication state
                     if let Some(ref addr) = client_addr {
-                        let mut connections = app_state.connections.write().await;
+                        let mut connections = app_state.connections.lock().await;
                         connections.authenticated_clients.insert(addr.clone(), subject_id.clone());
                     }
                     
@@ -1360,7 +1359,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
         _ => {
             // Check if client is authenticated
             let client_id = if let Some(ref addr) = client_addr {
-                let connections = app_state.connections.read().await;
+                let connections = app_state.connections.lock().await;
                 connections.authenticated_clients.get(addr).cloned()
             } else {
                 None // No client address means not authenticated
@@ -1385,7 +1384,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 }
         
                 StoreMessage::GetEntitySchema { id, entity_type } => {
-                    match app_state.store.read().await.get_entity_schema(&entity_type).await {
+                    match app_state.store.lock().await.get_entity_schema(&entity_type).await {
                         Ok(schema) => StoreMessage::GetEntitySchemaResponse {
                             id,
                             response: Ok(Some(schema)),
@@ -1398,7 +1397,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 }
                 
                 StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
-                    match app_state.store.read().await.get_complete_entity_schema(&entity_type).await {
+                    match app_state.store.lock().await.get_complete_entity_schema(&entity_type).await {
                         Ok(schema) => StoreMessage::GetCompleteEntitySchemaResponse {
                             id,
                             response: Ok(schema),
@@ -1411,7 +1410,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 }
                 
                 StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
-                    match app_state.store.read().await.get_field_schema(&entity_type, &field_type).await {
+                    match app_state.store.lock().await.get_field_schema(&entity_type, &field_type).await {
                         Ok(schema) => StoreMessage::GetFieldSchemaResponse {
                             id,
                             response: Ok(Some(schema)),
@@ -1424,7 +1423,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 }
                 
                 StoreMessage::EntityExists { id, entity_id } => {
-                    let exists = app_state.store.read().await.entity_exists(&entity_id).await;
+                    let exists = app_state.store.lock().await.entity_exists(&entity_id).await;
                     StoreMessage::EntityExistsResponse {
                         id,
                         response: exists,
@@ -1432,7 +1431,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 }
                 
                 StoreMessage::FieldExists { id, entity_type, field_type } => {
-                    let exists = app_state.store.read().await.field_exists(&entity_type, &field_type).await;
+                    let exists = app_state.store.lock().await.field_exists(&entity_type, &field_type).await;
                     StoreMessage::FieldExistsResponse {
                         id,
                         response: exists,
@@ -1440,7 +1439,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 }
                 
                 StoreMessage::Perform { id, mut requests } => {
-                    let permission_cache_guard = app_state.permission_cache.read().await;
+                    let permission_cache_guard = app_state.permission_cache.lock().await;
                     let permission_cache = permission_cache_guard.as_ref();
 
                     if let Some(permission_cache) = permission_cache {
@@ -1448,9 +1447,10 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                         for request in &requests {
                                 if let Some(entity_id) = request.entity_id() {
                                     if let Some(field_type) = request.field_type() {
-                                        let mut cel_executor = app_state.cel_executor.write().await;
+                                        let mut cel_executor = app_state.cel_executor.lock().await;
+                                        let mut store = &mut *app_state.store.lock().await;
                                         match get_scope(
-                                            app_state.store.clone(),
+                                            &mut store,
                                             &mut cel_executor,
                                             permission_cache,
                                             &client_id,
@@ -1502,7 +1502,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                     }
 
                     let machine = {
-                        let core = app_state.core_state.read().await;
+                        let core = app_state.core_state.lock().await;
                         core.config.machine.clone()
                     };
 
@@ -1511,7 +1511,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                         req.try_set_writer_id(client_id.clone());
                     });
 
-                    match app_state.store.write().await.perform_mut(&mut requests).await {
+                    match app_state.store.lock().await.perform_mut(&mut requests).await {
                         Ok(()) => StoreMessage::PerformResponse {
                             id,
                             response: Ok(requests),
@@ -1526,7 +1526,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
                     match app_state
                         .store
-                        .read().await
+                        .lock().await
                         .find_entities_paginated(&entity_type, page_opts, filter).await {
                         Ok(result) => StoreMessage::FindEntitiesResponse {
                             id,
@@ -1542,7 +1542,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
                     match app_state
                         .store
-                        .read().await
+                        .lock().await
                         .find_entities_exact(&entity_type, page_opts, filter).await {
                         Ok(result) => StoreMessage::FindEntitiesExactResponse {
                             id,
@@ -1558,7 +1558,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                 StoreMessage::GetEntityTypes { id, page_opts } => {
                     match app_state
                         .store
-                        .read().await
+                        .lock().await
                         .get_entity_types_paginated(page_opts).await {
                         Ok(result) => StoreMessage::GetEntityTypesResponse {
                             id,
@@ -1577,12 +1577,12 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                         if let Some(ref notification_sender) = client_notification_sender {
                             match app_state
                                 .store
-                                .write().await
+                                .lock().await
                                 .register_notification(config.clone(), notification_sender.clone()).await {
                                 Ok(()) => {
                                     let mut connections = app_state
                                         .connections
-                                        .write().await;
+                                        .lock().await;
                                     connections
                                         .client_notification_configs
                                         .entry(client_addr.clone())
@@ -1635,14 +1635,14 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
                         if let Some(ref notification_sender) = client_notification_sender {
                             let removed = app_state
                                 .store
-                                .write().await
+                                .lock().await
                                 .unregister_notification(&config, notification_sender).await;
                             
                             // Remove from client's tracked configs if successfully unregistered
                             if removed {
                                 let mut connections = app_state
                                     .connections
-                                    .write().await;
+                                    .lock().await;
                                 if let Some(client_configs) = connections
                                     .client_notification_configs
                                     .get_mut(client_addr) {
@@ -1723,7 +1723,7 @@ async fn process_store_message(message: StoreMessage, app_state: &Arc<AppState>,
 #[instrument(skip(app_state))]
 async fn start_client_server(app_state: Arc<AppState>) -> Result<()> {
     let addr = {
-        let core_state = app_state.core_state.read().await;
+        let core_state = app_state.core_state.lock().await;
         format!("0.0.0.0:{}", core_state.config.client_port)
     };
     
@@ -1758,7 +1758,7 @@ async fn start_client_server(app_state: Arc<AppState>) -> Result<()> {
 #[instrument(skip(app_state))]
 async fn start_inbound_peer_server(app_state: Arc<AppState>) -> Result<()> {
     let addr = {
-        let core_state = app_state.core_state.read().await;
+        let core_state = app_state.core_state.lock().await;
         format!("0.0.0.0:{}", core_state.config.peer_port)
     };
     
@@ -1794,7 +1794,7 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
     info!("Starting outbound peer connection manager");
     
     let reconnect_interval = {
-        let core_state = app_state.core_state.read().await;
+        let core_state = app_state.core_state.lock().await;
         Duration::from_secs(core_state.config.peer_reconnect_interval_secs)
     };
     
@@ -1804,8 +1804,8 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
         interval.tick().await;
         
         let peers_to_connect = {
-            let connections = app_state.connections.read().await;
-            let core_state = app_state.core_state.read().await;
+            let connections = app_state.connections.lock().await;
+            let core_state = app_state.core_state.lock().await;
             let connected = &connections.connected_outbound_peers;
             core_state.config.peer_addresses.iter()
                 .filter(|addr| !connected.contains_key(*addr))
@@ -1832,7 +1832,7 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
                     );
                     
                     // Remove from connected set on failure
-                    let mut connections = app_state_clone.connections.write().await;
+                    let mut connections = app_state_clone.connections.lock().await;
                     connections.connected_outbound_peers.remove(&peer_addr_clone);
                 } else {
                     info!(
@@ -1841,7 +1841,7 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
                     );
                     
                     // Remove from connected set when connection ends
-                    let mut connections = app_state_clone.connections.write().await;
+                    let mut connections = app_state_clone.connections.lock().await;
                     connections.connected_outbound_peers.remove(&peer_addr_clone);
                 }
             });
@@ -1856,7 +1856,7 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
     // Get a clone of the write channel receiver
     let receiver = {
         let store = &app_state.store;
-        let store_guard = store.read().await;
+        let store_guard = store.lock().await;
         store_guard.inner().get_write_channel_receiver()
     };
     
@@ -1871,7 +1871,7 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
             Some(mut requests) => {                
                 // Collect all requests that originated from this machine for batch synchronization
                 let current_machine = {
-                    let core = app_state.core_state.read().await;
+                    let core = app_state.core_state.lock().await;
                     core.config.machine.clone()
                 };
 
@@ -1902,7 +1902,7 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                 if !requests_to_sync.is_empty() {                    
                     // Send to all connected outbound peers using PeerMessage
                     let peers_to_notify = {
-                        let connections = app_state.connections.read().await;
+                        let connections = app_state.connections.lock().await;
                         connections.connected_outbound_peers.clone()
                     };
                     
@@ -1992,7 +1992,7 @@ async fn cleanup_old_wal_files(wal_dir: &PathBuf, max_files: usize) -> Result<()
 
 /// Write a request directly to the WAL file without snapshot logic (to avoid recursion)
 async fn write_request_to_wal_direct(request: &qlib_rs::Request, app_state: Arc<AppState>) -> Result<()> {
-    let mut wal_state = app_state.wal_state.write().await;
+    let mut wal_state = app_state.wal_state.lock().await;
     
     // Serialize the request to JSON
     let serialized = serde_json::to_vec(request)?;
@@ -2050,8 +2050,8 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
     let serialized = serde_json::to_vec(request)?;
     let serialized_len = serialized.len();
     
-    let mut wal_state = app_state.wal_state.write().await;
-    let core_state = app_state.core_state.read().await;
+    let mut wal_state = app_state.wal_state.lock().await;
+    let core_state = app_state.core_state.lock().await;
     
     // Check if we need to create a new WAL file
     let should_create_new_file = wal_state.current_wal_file.is_none() || 
@@ -2096,7 +2096,7 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
             
             // Take a snapshot
             let snapshot = {
-                let store_guard = app_state.store.read().await;
+                let store_guard = app_state.store.lock().await;
                 store_guard.inner().take_snapshot()
             };
             
@@ -2105,14 +2105,14 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
                 Ok(snapshot_counter) => {
                     // Reset the WAL files counter
                     {
-                        let mut wal_state = app_state.wal_state.write().await;
+                        let mut wal_state = app_state.wal_state.lock().await;
                         wal_state.wal_files_since_snapshot = 0;
                         info!("Snapshot saved successfully after WAL rollover");
                     }
 
                     // Write a snapshot marker to the WAL to indicate the snapshot point
                     let machine_id = {
-                        let core = app_state.core_state.read().await;
+                        let core = app_state.core_state.lock().await;
                         core.config.machine.clone()
                     };
                     
@@ -2138,8 +2138,8 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
             }
             
             // Re-acquire the state locks for cleanup
-            let _wal_state = app_state.wal_state.read().await;
-            let _core_state = app_state.core_state.read().await;
+            let _wal_state = app_state.wal_state.lock().await;
+            let _core_state = app_state.core_state.lock().await;
         }
         
         // Clean up old WAL files if we exceed the maximum
@@ -2175,7 +2175,7 @@ async fn write_request_to_wal(request: &qlib_rs::Request, app_state: Arc<AppStat
 /// Save a snapshot to disk and return the snapshot counter that was used
 #[instrument(skip(snapshot, app_state))]
 async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<AppState>) -> Result<u64> {
-    let mut wal_state = app_state.wal_state.write().await;
+    let mut wal_state = app_state.wal_state.lock().await;
     
     // Create snapshots directory if it doesn't exist
     let snapshot_dir = app_state.get_snapshots_dir().await;
@@ -2217,7 +2217,7 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, app_state: Arc<AppState>) -
     
     // Clean up old snapshots using the configured limit
     let max_files = {
-        let core = app_state.core_state.read().await;
+        let core = app_state.core_state.lock().await;
         core.config.snapshot_max_files
     };
     if let Err(e) = cleanup_old_snapshots(&snapshot_dir, max_files).await {
@@ -2395,7 +2395,7 @@ async fn replay_wal_files(app_state: Arc<AppState>) -> Result<()> {
     
     // Disable notifications during WAL replay
     {
-        let mut store = app_state.store.write().await;
+        let mut store = app_state.store.lock().await;
         store.inner_mut().disable_notifications();
         info!("Notifications disabled for WAL replay");
     }
@@ -2460,7 +2460,7 @@ async fn replay_wal_files(app_state: Arc<AppState>) -> Result<()> {
     
     // Re-enable notifications after WAL replay
     {
-        let mut store = app_state.store.write().await;
+        let mut store = app_state.store.lock().await;
         store.inner_mut().enable_notifications();
         info!("Notifications re-enabled after WAL replay");
     }
@@ -2479,7 +2479,7 @@ async fn apply_wal_request(request_data: &[u8], app_state: &Arc<AppState>, reque
                 return Ok(());
             }
             
-            let mut store = app_state.store.write().await;
+            let mut store = app_state.store.lock().await;
             
             let mut requests = vec![request];
             if let Err(e) = store.perform_mut(&mut requests).await {
@@ -2752,8 +2752,8 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
         
         // Check if we should self-promote to leader when no peers are connected
         {
-            let connections = app_state.connections.read().await;
-            let core = app_state.core_state.read().await;
+            let connections = app_state.connections.lock().await;
+            let core = app_state.core_state.lock().await;
             
             // Self-promote to leader if:
             // 1. We're not already the leader
@@ -2771,7 +2771,7 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                 // Wait for the configured delay since startup before self-promoting
                 let self_promotion_delay = core.config.self_promotion_delay_secs;
                 if time_since_startup >= self_promotion_delay {
-                    let peer_info = app_state.peer_info.read().await;
+                    let peer_info = app_state.peer_info.lock().await;
                     if peer_info.is_empty() {
                         drop(peer_info);
                         drop(connections);
@@ -2783,7 +2783,7 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                             "No peers connected after self-promotion delay, promoting to leader"
                         );
                         
-                        let mut core_state = app_state.core_state.write().await;
+                        let mut core_state = app_state.core_state.lock().await;
                         let our_machine_id = core_state.config.machine.clone();
                         core_state.is_leader = true;
                         core_state.current_leader = Some(our_machine_id.clone());
@@ -2801,7 +2801,7 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
 
         // Check if we need to send a full sync request after grace period
         let (should_send_full_sync, is_leader) = {
-            let core = app_state.core_state.read().await;
+            let core = app_state.core_state.lock().await;
             
             // Only check if we're unavailable, not the leader, not fully synced, and haven't sent a request yet
             if matches!(core.availability_state, AvailabilityState::Unavailable) &&
@@ -2837,13 +2837,13 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
             
             // Mark that we're sending a request to avoid duplicates
             {
-                let mut core = app_state.core_state.write().await;
+                let mut core = app_state.core_state.lock().await;
                 core.full_sync_request_pending = true;
             }
             
             // Send FullSyncRequest to the leader through any connected outbound peer
             let machine_id = {
-                let core = app_state.core_state.read().await;
+                let core = app_state.core_state.lock().await;
                 core.config.machine.clone()
             };
             
@@ -2856,7 +2856,7 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                 
                 // Try to send to any connected outbound peer
                 let sent = {
-                    let connections = app_state.connections.read().await;
+                    let connections = app_state.connections.lock().await;
                     let mut sent = false;
                     
                     for (peer_addr, sender) in &connections.connected_outbound_peers {
@@ -2884,31 +2884,31 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                         "No connected outbound peers available to send FullSyncRequest to leader"
                     );
                     // Reset the pending flag so we can try again later
-                    let mut core = app_state.core_state.write().await;
+                    let mut core = app_state.core_state.lock().await;
                     core.full_sync_request_pending = false;
                 }
             } else {
                 error!("Failed to serialize FullSyncRequest");
-                let mut core = app_state.core_state.write().await;
+                let mut core = app_state.core_state.lock().await;
                 core.full_sync_request_pending = false;
             }
         }
 
         // Process cache notifications
         {
-            let mut permission_cache = app_state.permission_cache.write().await;
+            let mut permission_cache = app_state.permission_cache.lock().await;
             if let Some(cache) = permission_cache.as_mut() {
                 cache.process_notifications();
             }
         }
 
         if is_leader {
-            let mut store = app_state.store.write().await;
+            let mut store = app_state.store.lock().await;
 
             // Find us as a candidate
             let me_as_candidate = {
                 let machine = {
-                    let core = app_state.core_state.read().await;
+                    let core = app_state.core_state.lock().await;
                     core.config.machine.clone()
                 };
 
@@ -3067,9 +3067,9 @@ async fn handle_heartbeat_writing(app_state: Arc<AppState>) -> Result<()> {
         interval.tick().await;
         
         {
-            let mut store = app_state.store.write().await;
+            let mut store = app_state.store.lock().await;
             let machine = {
-                let core = app_state.core_state.read().await;
+                let core = app_state.core_state.lock().await;
                 core.config.machine.clone()
             };
 
@@ -3091,10 +3091,15 @@ async fn handle_heartbeat_writing(app_state: Arc<AppState>) -> Result<()> {
 
 async fn reinit_caches(app_state: Arc<AppState>) -> Result<()> {
     {
-        let mut permission_cache = app_state.permission_cache.write().await;
+        let mut permission_cache = app_state.permission_cache.lock().await;
+        let store = &mut *app_state.store.lock().await;
+
+        if let Some(cache) = permission_cache.as_mut() {
+            cache.close(store).await;
+        }
 
         *permission_cache = Some(Cache::new(
-            app_state.store.clone(),
+            store,
             et::permission(),
             vec![ft::resource_type(), ft::resource_field()],
             vec![ft::scope(), ft::condition()]
@@ -3102,11 +3107,11 @@ async fn reinit_caches(app_state: Arc<AppState>) -> Result<()> {
     }
 
     {
-        let mut store = app_state.store.write().await;
+        let mut store = app_state.store.lock().await;
         
         let me_as_candidate = {
             let machine = {
-                let core = app_state.core_state.read().await;
+                let core = app_state.core_state.lock().await;
                 core.config.machine.clone()
             };
 
@@ -3161,7 +3166,7 @@ async fn main() -> Result<()> {
     // Initialize the WAL file counter based on existing files
     {
         let next_wal_counter = get_next_wal_counter(app_state.clone()).await?;
-        let mut wal_state = app_state.wal_state.write().await;
+        let mut wal_state = app_state.wal_state.lock().await;
         wal_state.wal_file_counter = next_wal_counter;
         info!(
             wal_counter = next_wal_counter,
@@ -3180,20 +3185,20 @@ async fn main() -> Result<()> {
         let next_snapshot_counter = get_next_snapshot_counter(app_state.clone()).await?;
         
         {
-            let mut store_guard = app_state.store.write().await;
+            let mut store_guard = app_state.store.lock().await;
             store_guard.inner_mut().disable_notifications();
             store_guard.inner_mut().restore_snapshot(snapshot);
             store_guard.inner_mut().enable_notifications();
         }
         
-        let mut wal_state = app_state.wal_state.write().await;
+        let mut wal_state = app_state.wal_state.lock().await;
         wal_state.snapshot_file_counter = next_snapshot_counter;
     } else {
         info!("No snapshot found, starting with empty store");
         
         // Initialize the snapshot file counter
         let next_snapshot_counter = get_next_snapshot_counter(app_state.clone()).await?;
-        let mut wal_state = app_state.wal_state.write().await;
+        let mut wal_state = app_state.wal_state.lock().await;
         wal_state.snapshot_file_counter = next_snapshot_counter;
     }
 
@@ -3330,7 +3335,7 @@ async fn main() -> Result<()> {
     // Take a final snapshot before shutting down
     info!("Taking final snapshot before shutdown");
     let snapshot = {
-        let store_guard = app_state.store.read().await;
+        let store_guard = app_state.store.lock().await;
         store_guard.inner().take_snapshot()
     };
     
@@ -3347,7 +3352,7 @@ async fn main() -> Result<()> {
                 snapshot_counter,
                 timestamp: Some(now()),
                 originator: Some({
-                    let core = app_state.core_state.read().await;
+                    let core = app_state.core_state.lock().await;
                     core.config.machine.clone()
                 }),
             };
