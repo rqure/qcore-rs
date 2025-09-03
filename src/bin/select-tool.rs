@@ -17,11 +17,11 @@ struct Config {
     core_url: String,
 
     /// Username for authentication (can be set via QCORE_USERNAME env var)
-    #[arg(long, default_value = "qei")]
+    #[arg(long, default_value = "qselect")]
     username: String,
 
     /// Password for authentication (can be set via QCORE_PASSWORD env var)
-    #[arg(long, default_value = "qei")]
+    #[arg(long, default_value = "qselect")]
     password: String,
 
     /// Entity type to search for (e.g., "User", "Project")

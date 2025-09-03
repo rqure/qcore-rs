@@ -21,11 +21,11 @@ struct Config {
     core_url: String,
 
     /// Username for authentication (can be set via QCORE_USERNAME env var)
-    #[arg(long, default_value = "qei")]
+    #[arg(long, default_value = "qsnapshot")]
     username: String,
 
     /// Password for authentication (can be set via QCORE_PASSWORD env var)
-    #[arg(long, default_value = "qei")]
+    #[arg(long, default_value = "qsnapshot")]
     password: String,
 
     /// Subcommand to execute

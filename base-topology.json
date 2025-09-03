@@ -226,6 +226,27 @@
         ]
       },
       {
+        "entityType": "Folder",
+        "Name": "Tools",
+        "Children": [
+          {
+            "entityType": "Tool",
+            "Name": "qselect",
+            "Secret": "qselect"
+          },
+          {
+            "entityType": "Tool",
+            "Name": "qsnapshot",
+            "Secret": "qsnapshot"
+          },
+          {
+            "entityType": "Tool",
+            "Name": "qtree",
+            "Secret": "qtree"
+          }
+        ]
+      },
+      {
         "entityType": "FaultTolerance",
         "Name": "qcore",
         "CandidateList": ["QOS/qos-a/qcore", "QOS/qos-b/qcore"]

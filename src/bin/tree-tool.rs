@@ -15,11 +15,11 @@ struct Config {
     core_url: String,
 
     /// Username for authentication (can be set via QCORE_USERNAME env var)
-    #[arg(long, default_value = "qei")]
+    #[arg(long, default_value = "qtree")]
     username: String,
 
     /// Password for authentication (can be set via QCORE_PASSWORD env var)
-    #[arg(long, default_value = "qei")]
+    #[arg(long, default_value = "qtree")]
     password: String,
 
     /// Maximum depth to traverse (0 = unlimited)
