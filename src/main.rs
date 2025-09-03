@@ -162,13 +162,13 @@ struct Config {
     #[arg(long, default_value_t = 3)]
     peer_reconnect_interval_secs: u64,
 
-    /// Delay before starting leader election (useful for testing)
-    #[arg(long, default_value_t = 2)]
-    leader_election_delay_secs: u64,
-
     /// Grace period in seconds to wait after becoming unavailable before requesting full sync
     #[arg(long, default_value_t = 5)]
     full_sync_grace_period_secs: u64,
+
+    /// Delay in seconds after startup before self-promoting to leader when no peers are available
+    #[arg(long, default_value_t = 5)]
+    self_promotion_delay_secs: u64,
 }
 
 /// Application state that is shared across all tasks
@@ -507,6 +507,10 @@ async fn handle_peer_message(
                     let new_state = AvailabilityState::Unavailable;
                     let old_state = core_state.availability_state.clone();
                     core_state.availability_state = new_state.clone();
+                    
+                    // Reset sync status when stepping down from leader to ensure we request full sync
+                    core_state.is_fully_synced = false;
+                    core_state.full_sync_request_pending = false;
                     
                     // Set the timestamp when we became unavailable for grace period tracking
                     if old_state != new_state {
@@ -2623,29 +2627,42 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
             // 1. We're not already the leader
             // 2. No peer addresses are configured OR no outbound peers are connected
             // 3. No peer info is tracked (no inbound peers)
+            // 4. We've waited at least 5 seconds since startup to give other nodes time to connect
             let should_self_promote = !core.is_leader && 
                 (core.config.peer_addresses.is_empty() || connections.connected_outbound_peers.is_empty());
             
             if should_self_promote {
-                let peer_info = app_state.peer_info.read().await;
-                if peer_info.is_empty() {
-                    drop(peer_info);
-                    drop(connections);
-                    drop(core);
-                    
-                    info!("No peers connected and no peer info available, self-promoting to leader");
-                    
-                    let mut core_state = app_state.core_state.write().await;
-                    let our_machine_id = core_state.config.machine.clone();
-                    core_state.is_leader = true;
-                    core_state.current_leader = Some(our_machine_id.clone());
-                    core_state.availability_state = AvailabilityState::Available;
-                    core_state.is_fully_synced = true;
-                    
-                    info!(
-                        machine_id = %our_machine_id,
-                        "Self-promoted to leader due to no peer connections"
-                    );
+                let current_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+                let startup_time = core.startup_time;
+                let time_since_startup = current_time.saturating_sub(startup_time);
+                
+                // Wait for the configured delay since startup before self-promoting
+                let self_promotion_delay = core.config.self_promotion_delay_secs;
+                if time_since_startup >= self_promotion_delay {
+                    let peer_info = app_state.peer_info.read().await;
+                    if peer_info.is_empty() {
+                        drop(peer_info);
+                        drop(connections);
+                        drop(core);
+                        
+                        info!(
+                            delay_secs = self_promotion_delay,
+                            time_since_startup = time_since_startup,
+                            "No peers connected after self-promotion delay, promoting to leader"
+                        );
+                        
+                        let mut core_state = app_state.core_state.write().await;
+                        let our_machine_id = core_state.config.machine.clone();
+                        core_state.is_leader = true;
+                        core_state.current_leader = Some(our_machine_id.clone());
+                        core_state.availability_state = AvailabilityState::Available;
+                        core_state.is_fully_synced = true;
+                        
+                        info!(
+                            machine_id = %our_machine_id,
+                            "Self-promoted to leader due to no peer connections"
+                        );
+                    }
                 }
             }
         }
