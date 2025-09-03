@@ -2625,6 +2625,42 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
     loop {
         interval.tick().await;
         
+        // Check if we should self-promote to leader when no peers are connected
+        {
+            let connections = app_state.connections.read().await;
+            let core = app_state.core_state.read().await;
+            
+            // Self-promote to leader if:
+            // 1. We're not already the leader
+            // 2. No peer addresses are configured OR no outbound peers are connected
+            // 3. No peer info is tracked (no inbound peers)
+            let should_self_promote = !core.is_leader && 
+                (core.config.peer_addresses.is_empty() || connections.connected_outbound_peers.is_empty());
+            
+            if should_self_promote {
+                let peer_info = app_state.peer_info.read().await;
+                if peer_info.is_empty() {
+                    drop(peer_info);
+                    drop(connections);
+                    drop(core);
+                    
+                    info!("No peers connected and no peer info available, self-promoting to leader");
+                    
+                    let mut core_state = app_state.core_state.write().await;
+                    let our_machine_id = core_state.config.machine.clone();
+                    core_state.is_leader = true;
+                    core_state.current_leader = Some(our_machine_id.clone());
+                    core_state.availability_state = AvailabilityState::Available;
+                    core_state.is_fully_synced = true;
+                    
+                    info!(
+                        machine_id = %our_machine_id,
+                        "Self-promoted to leader due to no peer connections"
+                    );
+                }
+            }
+        }
+
         // Check if we need to send a full sync request after grace period
         let (should_send_full_sync, is_leader) = {
             let core = app_state.core_state.read().await;
