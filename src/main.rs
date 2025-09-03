@@ -1,4 +1,4 @@
-use qlib_rs::{epoch, et, ft, notification_channel, now, schoice, sread, sref, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, PushCondition, Snowflake, StoreMessage, StoreTrait};
+use qlib_rs::{et, ft, notification_channel, now, schoice, sread, sref, swrite, AsyncStore, AuthConfig, AuthenticationResult, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, PushCondition, Snowflake, StoreMessage, StoreTrait};
 use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
@@ -2783,14 +2783,14 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                             .unwrap()
                             .expect_choice()?;
 
-                        let death_detection_timeout_timestamp = candidate_fields
+                        let death_detection_timeout_millis = candidate_fields
                             .get(&ft::death_detection_timeout())
                             .unwrap()
                             .value()
                             .unwrap()
-                            .expect_timestamp()?;
+                            .expect_int()?;
                         
-                        let death_detection_timeout_duration = death_detection_timeout_timestamp - epoch();
+                        let death_detection_timeout_duration = time::Duration::milliseconds(death_detection_timeout_millis);
 
                         let desired_availability = match make_me {
                             1 => AvailabilityState::Available,
