@@ -226,6 +226,16 @@
         ]
       },
       {
+        "entityType": "Machine",
+        "Name": "qos-c",
+        "Children": [
+          {
+            "entityType": "Service",
+            "Name": "qcore"
+          }
+        ]
+      },
+      {
         "entityType": "Folder",
         "Name": "Tools",
         "Children": [
@@ -249,7 +259,7 @@
       {
         "entityType": "FaultTolerance",
         "Name": "qcore",
-        "CandidateList": ["QOS/qos-a/qcore", "QOS/qos-b/qcore"]
+        "CandidateList": ["QOS/qos-a/qcore", "QOS/qos-b/qcore", "QOS/qos-c/qcore"]
       },
       {
         "entityType": "Folder",

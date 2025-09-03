@@ -325,6 +325,114 @@ impl AppState {
             }
         }
     }
+    
+    /// Retrigger leader election when the current leader has disconnected
+    async fn retrigger_leader_election(&self) {
+        let our_startup_time;
+        let our_machine_id;
+        
+        // Get our basic info
+        {
+            let core = self.core_state.read().await;
+            our_startup_time = core.startup_time;
+            our_machine_id = core.config.machine.clone();
+        }
+        
+        // Find the earliest startup time among all known peers including ourselves
+        let (should_be_leader, earliest_startup) = {
+            let peer_info = self.peer_info.read().await;
+            let earliest_startup = peer_info.values()
+                .map(|p| p.startup_time)
+                .min()
+                .unwrap_or(our_startup_time)
+                .min(our_startup_time);
+            
+            let mut should_be_leader = our_startup_time <= earliest_startup;
+            
+            // Handle startup time ties
+            if our_startup_time == earliest_startup {
+                let peers_with_same_time: Vec<_> = peer_info.values()
+                    .filter(|p| p.startup_time == our_startup_time)
+                    .collect();
+                
+                if !peers_with_same_time.is_empty() {
+                    // We have a tie, use machine_id as tiebreaker
+                    info!(
+                        peer_count = peers_with_same_time.len(),
+                        startup_time = our_startup_time,
+                        "Startup time tie detected during leader re-election, using machine_id as tiebreaker"
+                    );
+                    
+                    let mut all_machine_ids = peers_with_same_time.iter()
+                        .map(|p| p.machine_id.as_str())
+                        .collect::<Vec<_>>();
+                    all_machine_ids.push(our_machine_id.as_str());
+                    
+                    let min_machine_id = all_machine_ids.iter().min().unwrap();
+                    should_be_leader = **min_machine_id == our_machine_id;
+                }
+            }
+            
+            (should_be_leader, earliest_startup)
+        };
+        
+        // Update leadership status
+        if should_be_leader {
+            let mut core_state = self.core_state.write().await;
+            let was_leader = core_state.is_leader;
+            core_state.is_leader = true;
+            core_state.current_leader = Some(our_machine_id.clone());
+            core_state.is_fully_synced = true;
+            let new_state = AvailabilityState::Available;
+            let old_state = core_state.availability_state.clone();
+            core_state.availability_state = new_state.clone();
+            
+            // Clear the unavailable timestamp when becoming available
+            if old_state != new_state {
+                core_state.became_unavailable_at = None;
+            }
+            
+            if !was_leader {
+                info!(
+                    our_startup_time = our_startup_time,
+                    earliest_startup = earliest_startup,
+                    "Re-elected as leader after current leader disconnected"
+                );
+            }
+        } else {
+            // Find who should be the leader
+            let new_leader = {
+                let peer_info = self.peer_info.read().await;
+                peer_info.values()
+                    .filter(|p| p.startup_time <= earliest_startup)
+                    .min_by(|a, b| {
+                        a.startup_time.cmp(&b.startup_time)
+                            .then_with(|| a.machine_id.cmp(&b.machine_id))
+                    })
+                    .map(|p| p.machine_id.clone())
+            };
+            
+            let mut core_state = self.core_state.write().await;
+            core_state.is_leader = false;
+            core_state.current_leader = new_leader.clone();
+            let new_state = AvailabilityState::Unavailable;
+            let old_state = core_state.availability_state.clone();
+            core_state.availability_state = new_state.clone();
+            
+            // Set unavailable timestamp if transitioning to unavailable
+            if old_state != new_state {
+                core_state.became_unavailable_at = Some(time::OffsetDateTime::now_utc().unix_timestamp() as u64);
+                self.force_disconnect_all_clients().await;
+            }
+            
+            info!(
+                our_startup_time = our_startup_time,
+                earliest_startup = earliest_startup,
+                new_leader = ?new_leader,
+                "Updated leadership after current leader disconnected"
+            );
+        }
+    }
 }
 
 /// Handle a single peer WebSocket connection
@@ -394,11 +502,35 @@ async fn handle_inbound_peer_connection(stream: TcpStream, peer_addr: std::net::
     }
     
     // Remove peer from connected inbound peers when connection ends
-    {
+    let disconnected_machine_id = {
         let mut peer_info = app_state.peer_info.write().await;
+        let disconnected_machine_id = peer_info.iter()
+            .find(|(addr, _)| addr == &&peer_addr.to_string())
+            .map(|(_, info)| info.machine_id.clone());
+        
         peer_info.retain(|addr, _| {
             addr != &peer_addr.to_string()
         });
+        
+        disconnected_machine_id
+    };
+    
+    // Check if the disconnected peer was the current leader and retrigger election
+    if let Some(disconnected_machine_id) = disconnected_machine_id {
+        let current_leader = {
+            let core = app_state.core_state.read().await;
+            core.current_leader.clone()
+        };
+        
+        if let Some(leader_id) = current_leader {
+            if leader_id == disconnected_machine_id {
+                info!(
+                    disconnected_machine = %disconnected_machine_id,
+                    "Current leader disconnected, retriggering leader election"
+                );
+                app_state.retrigger_leader_election().await;
+            }
+        }
     }
     
     info!("Peer connection terminated");
