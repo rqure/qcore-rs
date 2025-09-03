@@ -1732,13 +1732,7 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
         };
         
         match requests {
-            Some(mut requests) => {
-                debug!(
-                    count = requests.len(),
-                    requests = ?requests,
-                    "Writing requests to WAL"
-                );
-                
+            Some(mut requests) => {                
                 // Collect all requests that originated from this machine for batch synchronization
                 let current_machine = {
                     let core = app_state.core_state.read().await;
@@ -1769,12 +1763,7 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                     .collect();
                 
                 // Send batch of requests to peers for synchronization if we have any
-                if !requests_to_sync.is_empty() {
-                    debug!(
-                        count = requests_to_sync.len(),
-                        "Sending requests to peers for synchronization"
-                    );
-                    
+                if !requests_to_sync.is_empty() {                    
                     // Send to all connected outbound peers using PeerMessage
                     let peers_to_notify = {
                         let connections = app_state.connections.read().await;
