@@ -228,7 +228,7 @@
       {
         "entityType": "FaultTolerance",
         "Name": "qcore",
-        "CandidateList": ["Root/qos-a/qcore", "Root/qos-b/qcore"]
+        "CandidateList": ["QOS/qos-a/qcore", "QOS/qos-b/qcore"]
       },
       {
         "entityType": "Folder",

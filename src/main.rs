@@ -3040,7 +3040,7 @@ async fn main() -> Result<()> {
 
     // Start the write channel consumer task
     let app_state_clone = Arc::clone(&app_state);
-    let write_channel_task = tokio::spawn(async move {
+    let mut write_channel_task = tokio::spawn(async move {
         if let Err(e) = consume_write_channel(app_state_clone).await {
             error!(
                 error = %e,
@@ -3051,7 +3051,7 @@ async fn main() -> Result<()> {
 
     // Start the peer WebSocket server task
     let app_state_clone = Arc::clone(&app_state);
-    let peer_server_task = tokio::spawn(async move {
+    let mut peer_server_task = tokio::spawn(async move {
         if let Err(e) = start_inbound_peer_server(app_state_clone).await {
             error!(
                 error = %e,
@@ -3062,7 +3062,7 @@ async fn main() -> Result<()> {
 
     // Start the client WebSocket server task
     let app_state_clone = Arc::clone(&app_state);
-    let client_server_task = tokio::spawn(async move {
+    let mut client_server_task = tokio::spawn(async move {
         if let Err(e) = start_client_server(app_state_clone).await {
             error!(
                 error = %e,
@@ -3073,7 +3073,7 @@ async fn main() -> Result<()> {
 
     // Start the outbound peer connection manager task
     let app_state_clone = Arc::clone(&app_state);
-    let outbound_peer_task = tokio::spawn(async move {
+    let mut outbound_peer_task = tokio::spawn(async move {
         if let Err(e) = manage_outbound_peer_connections(app_state_clone).await {
             error!(
                 error = %e,
@@ -3084,7 +3084,7 @@ async fn main() -> Result<()> {
 
     // Start the misc tasks handler
     let app_state_clone = Arc::clone(&app_state);
-    let misc_task = tokio::spawn(async move {
+    let mut misc_task = tokio::spawn(async move {
         if let Err(e) = handle_misc_tasks(app_state_clone).await {
             error!(
                 error = %e,
@@ -3095,7 +3095,7 @@ async fn main() -> Result<()> {
 
     // Start the heartbeat writer
     let app_state_clone = Arc::clone(&app_state);
-    let heartbeat_task = tokio::spawn(async move {
+    let mut heartbeat_task = tokio::spawn(async move {
         if let Err(e) = handle_heartbeat_writing(app_state_clone).await {
             error!(
                 error = %e,
@@ -3104,9 +3104,54 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for shutdown signal
-    signal::ctrl_c().await?;
-    warn!("Received shutdown signal, initiating graceful shutdown");
+    // Wait for either shutdown signal or any critical task to complete/fail
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            warn!("Received shutdown signal, initiating graceful shutdown");
+        }
+        result = &mut write_channel_task => {
+            match result {
+                Ok(_) => error!("Write channel task exited unexpectedly"),
+                Err(e) => error!(error = %e, "Write channel task failed"),
+            }
+            warn!("Critical task failure detected, initiating shutdown");
+        }
+        result = &mut peer_server_task => {
+            match result {
+                Ok(_) => error!("Peer server task exited unexpectedly"),
+                Err(e) => error!(error = %e, "Peer server task failed"),
+            }
+            warn!("Critical task failure detected, initiating shutdown");
+        }
+        result = &mut client_server_task => {
+            match result {
+                Ok(_) => error!("Client server task exited unexpectedly"),
+                Err(e) => error!(error = %e, "Client server task failed"),
+            }
+            warn!("Critical task failure detected, initiating shutdown");
+        }
+        result = &mut outbound_peer_task => {
+            match result {
+                Ok(_) => error!("Outbound peer task exited unexpectedly"),
+                Err(e) => error!(error = %e, "Outbound peer task failed"),
+            }
+            warn!("Critical task failure detected, initiating shutdown");
+        }
+        result = &mut misc_task => {
+            match result {
+                Ok(_) => error!("Misc task exited unexpectedly"),
+                Err(e) => error!(error = %e, "Misc task failed"),
+            }
+            warn!("Critical task failure detected, initiating shutdown");
+        }
+        result = &mut heartbeat_task => {
+            match result {
+                Ok(_) => error!("Heartbeat task exited unexpectedly"),
+                Err(e) => error!(error = %e, "Heartbeat task failed"),
+            }
+            warn!("Critical task failure detected, initiating shutdown");
+        }
+    }
 
     // Take a final snapshot before shutting down
     info!("Taking final snapshot before shutdown");
