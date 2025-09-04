@@ -1591,13 +1591,14 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::Perform { id, mut requests } => {
-                    if let Some(permission_cache) = locks.permission_cache().as_ref() {
+                    let ((mut cel_executor, mut store), permission_cache) = locks
+                        .cel_executor.as_mut().zip(locks.store.as_mut()).zip(locks.permission_cache.as_ref()).unwrap();
+
+                    if let Some(permission_cache) = &**permission_cache {
                         // Check authorization for each request
                         for request in &requests {
                                 if let Some(entity_id) = request.entity_id() {
                                     if let Some(field_type) = request.field_type() {
-                                        let mut cel_executor = & *locks.cel_executor();
-                                        let mut store = &mut *locks.store();
                                         match get_scope(
                                             &mut store,
                                             &mut cel_executor,
@@ -1765,19 +1766,11 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                     // Unregister notification for this client
                     if let Some(client_addr) = &client_addr {
                         if let Some(ref notification_sender) = client_notification_sender {
-                            let removed = app_state
-                                .store
-                                .lock().await
-                                .unregister_notification(&config, notification_sender).await;
+                            let removed = locks.store().unregister_notification(&config, notification_sender).await;
                             
                             // Remove from client's tracked configs if successfully unregistered
                             if removed {
-                                let mut connections = app_state
-                                    .connections
-                                    .lock().await;
-                                if let Some(client_configs) = connections
-                                    .client_notification_configs
-                                    .get_mut(client_addr) {
+                                if let Some(client_configs) = locks.connections().client_notification_configs.get_mut(client_addr) {
                                     client_configs.remove(&config);
                                 }
                             }
@@ -1855,8 +1848,11 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
 #[instrument(skip(app_state))]
 async fn start_client_server(app_state: Arc<AppState>) -> Result<()> {
     let addr = {
-        let core_state = app_state.core_state.lock().await;
-        format!("0.0.0.0:{}", core_state.config.client_port)
+        let mut locks = app_state.acquire_locks(LockRequest {
+            core_state: true,
+            ..Default::default()
+        }).await;
+        format!("0.0.0.0:{}", locks.core_state().config.client_port)
     };
     
     let listener = TcpListener::bind(&addr).await?;
@@ -1890,8 +1886,12 @@ async fn start_client_server(app_state: Arc<AppState>) -> Result<()> {
 #[instrument(skip(app_state))]
 async fn start_inbound_peer_server(app_state: Arc<AppState>) -> Result<()> {
     let addr = {
-        let core_state = app_state.core_state.lock().await;
-        format!("0.0.0.0:{}", core_state.config.peer_port)
+        let mut locks = app_state.acquire_locks(LockRequest {
+            core_state: true,
+            ..Default::default()
+        }).await;
+
+        format!("0.0.0.0:{}", locks.core_state().config.peer_port)
     };
     
     let listener = TcpListener::bind(&addr).await?;
@@ -1926,8 +1926,11 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
     info!("Starting outbound peer connection manager");
     
     let reconnect_interval = {
-        let core_state = app_state.core_state.lock().await;
-        Duration::from_secs(core_state.config.peer_reconnect_interval_secs)
+        let mut locks = app_state.acquire_locks(LockRequest {
+            core_state: true,
+            ..Default::default()
+        }).await;
+        Duration::from_secs(locks.core_state().config.peer_reconnect_interval_secs)
     };
     
     let mut interval = tokio::time::interval(reconnect_interval);
@@ -1936,8 +1939,13 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
         interval.tick().await;
         
         let peers_to_connect = {
-            let connections = app_state.connections.lock().await;
-            let core_state = app_state.core_state.lock().await;
+            let locks = app_state.acquire_locks(LockRequest {
+                connections: true,
+                core_state: true,
+                ..Default::default()
+            }).await;
+
+            let (connections, core_state) = locks.connections.as_ref().zip(locks.core_state.as_ref()).unwrap();
             let connected = &connections.connected_outbound_peers;
             core_state.config.peer_addresses.iter()
                 .filter(|addr| !connected.contains_key(*addr))
@@ -3302,8 +3310,11 @@ async fn main() -> Result<()> {
     {
         let mut locks = app_state.acquire_locks(LockRequest {
             core_state: true,
+            store: true,
+            wal_state: true,
             ..Default::default()
         }).await;
+
         if let Some((snapshot, snapshot_counter)) = load_latest_snapshot(&mut locks).await? {
             info!(
                 snapshot_counter = snapshot_counter,
@@ -3320,15 +3331,13 @@ async fn main() -> Result<()> {
                 store_guard.inner_mut().enable_notifications();
             }
             
-            let mut wal_state = app_state.wal_state.lock().await;
-            wal_state.snapshot_file_counter = next_snapshot_counter;
+            locks.wal_state().snapshot_file_counter = next_snapshot_counter;
         } else {
             info!("No snapshot found, starting with empty store");
             
             // Initialize the snapshot file counter
             let next_snapshot_counter = get_next_snapshot_counter(&mut locks).await?;
-            let mut wal_state = app_state.wal_state.lock().await;
-            wal_state.snapshot_file_counter = next_snapshot_counter;
+            locks.wal_state().snapshot_file_counter = next_snapshot_counter;
         }
     }
 
