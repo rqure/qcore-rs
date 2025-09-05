@@ -2008,6 +2008,7 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                     wal_state: true,
                     core_state: true,
                     store: true,
+                    connections: true,
                     ..Default::default()
                 }).await;
 
