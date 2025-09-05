@@ -8,8 +8,6 @@ use tokio::sync::{mpsc, oneshot};
 use std::path::PathBuf;
 use async_trait::async_trait;
 
-use crate::states::AppStateLocks;
-
 /// Configuration for WAL manager operations
 #[derive(Debug, Clone)]
 pub struct WalConfig {
@@ -39,7 +37,6 @@ pub struct SnapshotConfig {
 pub enum WalRequest {
     WriteRequest {
         request: qlib_rs::Request,
-        direct_mode: bool,
         response: oneshot::Sender<Result<()>>,
     },
     Replay {
@@ -103,13 +100,47 @@ pub type WalService = WalManagerTrait<FileManager>;
 pub type SnapshotService = SnapshotManagerTrait<FileManager>;
 
 impl WalService {
-    pub fn spawn() {
+    pub fn spawn(config: WalConfig, snapshot_handle: SnapshotHandle) -> WalHandle {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut service = WalService::new(FileManager, config, Some(snapshot_handle));
 
+            while let Some(request) = receiver.recv().await {
+                match request {
+                    WalRequest::WriteRequest { request, response } => {
+                        let result = service.write_request(&request).await;
+                        let _ = response.send(result);
+                    }
+                    WalRequest::Replay { response } => {
+                        let result = service.replay().await;
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        });
+
+        WalHandle { sender }
     }
 }
 
 impl SnapshotService {
-    pub fn spawn() {
+    pub fn spawn(config: SnapshotConfig) -> SnapshotHandle {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            let mut service = SnapshotService::new(FileManager, config);
+
+            while let Some(request) = receiver.recv().await {
+                match request {
+                    SnapshotRequest::Save { snapshot, response } => {
+                        let result = service.save(&snapshot).await;
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        });
+
+        SnapshotHandle { sender }
     }
 }
 
@@ -876,3 +907,4 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
         }
     }
 }
+
