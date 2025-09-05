@@ -2876,6 +2876,7 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
             store: true,
             permission_cache: true,
             connections: true,
+            peer_info: true,
             ..Default::default()
         }).await;
 
