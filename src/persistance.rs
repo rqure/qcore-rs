@@ -5,15 +5,109 @@ use std::vec;
 use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::path::PathBuf;
+use async_trait::async_trait;
 
 use crate::states::AppStateLocks;
 
-/// Helper struct for managing numbered files (WAL files, snapshots, etc.)
+/// Type aliases for convenience
+pub type DefaultWalManager = WalManager<FileManager>;
+pub type DefaultSnapshotManager = SnapshotManager<FileManager>;
+
+/// Convenience constructor functions
+impl DefaultWalManager {
+    /// Create a new WAL manager with default file manager
+    pub fn new_default() -> Self {
+        Self::new(FileManager)
+    }
+    
+    /// Create a new WAL manager with custom max files configuration
+    pub fn new_with_config(max_files: usize) -> Self {
+        Self::with_config(FileManager, max_files)
+    }
+}
+
+impl DefaultSnapshotManager {
+    /// Create a new snapshot manager with default file manager
+    pub fn new_default() -> Self {
+        Self::new(FileManager)
+    }
+    
+    /// Create a new snapshot manager with custom max files configuration
+    pub fn new_with_config(max_files: usize) -> Self {
+        Self::with_config(FileManager, max_files)
+    }
+}
+
+/// Configuration for numbered file management
+#[derive(Debug, Clone)]
+pub struct FileConfig {
+    pub prefix: String,
+    pub suffix: String,
+    pub max_files: usize,
+}
+
+/// Information about a numbered file
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    pub path: PathBuf,
+    pub counter: u64,
+}
+
+/// Trait for managing numbered files (WAL files, snapshots, etc.)
+#[async_trait]
+pub trait FileManagerTrait: Send + Sync {
+    /// Scan directory for files matching the configuration
+    async fn scan_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<Vec<FileInfo>>;
+    
+    /// Get the next counter value for numbered files
+    async fn get_next_counter(&self, dir: &PathBuf, config: &FileConfig) -> Result<u64>;
+    
+    /// Clean up old files, keeping only the most recent max_files
+    async fn cleanup_old_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<()>;
+}
+
+/// Entry reader for parsing serialized data
+pub trait EntryReader<T> {
+    type Error;
+    
+    /// Read the next entry from the data source
+    fn next_entry(&mut self) -> Option<Result<(T, usize), Self::Error>>;
+}
+
+/// Trait for WAL operations
+#[async_trait]
+pub trait WalTrait {
+    /// Write a request to WAL
+    async fn write_request(&self, request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()>;
+    
+    /// Replay WAL files to restore store state
+    async fn replay(&self, locks: &mut AppStateLocks<'_>) -> Result<()>;
+    
+    /// Initialize WAL counter from existing files
+    async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()>;
+}
+
+/// Trait for snapshot operations
+#[async_trait]
+pub trait SnapshotTrait {
+    /// Save a snapshot to disk and return the snapshot counter
+    async fn save(&self, snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64>;
+    
+    /// Load the latest snapshot from disk
+    async fn load_latest(&self, locks: &mut AppStateLocks<'_>) -> Result<Option<(qlib_rs::Snapshot, u64)>>;
+    
+    /// Initialize snapshot counter from existing files
+    async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()>;
+}
+
+/// Standard implementation of file management operations
+#[derive(Debug, Clone)]
 pub struct FileManager;
 
-impl FileManager {
-    /// Scan directory for files matching prefix and suffix, returning sorted paths with counters
-    pub async fn scan_files(&self, dir: &PathBuf, prefix: &str, suffix: &str) -> Result<Vec<(PathBuf, u64)>> {
+#[async_trait]
+impl FileManagerTrait for FileManager {
+    /// Scan directory for files matching the configuration
+    async fn scan_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<Vec<FileInfo>> {
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -25,42 +119,42 @@ impl FileManager {
             let path = entry.path();
             if let Some(filename) = path.file_name() {
                 if let Some(filename_str) = filename.to_str() {
-                    if filename_str.starts_with(prefix) && filename_str.ends_with(suffix) {
+                    if filename_str.starts_with(&config.prefix) && filename_str.ends_with(&config.suffix) {
                         // Extract counter from filename
-                        if let Some(counter_str) = filename_str.strip_prefix(prefix).and_then(|s| s.strip_suffix(suffix)) {
+                        if let Some(counter_str) = filename_str.strip_prefix(&config.prefix).and_then(|s| s.strip_suffix(&config.suffix)) {
                             if let Ok(counter) = counter_str.parse::<u64>() {
-                                files.push((path, counter));
+                                files.push(FileInfo { path, counter });
                             }
                         } else {
                             // Files without counter (for compatibility)
-                            files.push((path, 0));
+                            files.push(FileInfo { path, counter: 0 });
                         }
                     }
                 }
             }
         }
         
-        files.sort_by_key(|(_, counter)| *counter);
+        files.sort_by_key(|f| f.counter);
         Ok(files)
     }
 
     /// Get the next counter value for numbered files
-    pub async fn get_next_counter(&self, dir: &PathBuf, prefix: &str, suffix: &str) -> Result<u64> {
-        let files = self.scan_files(dir, prefix, suffix).await?;
-        let max_counter = files.iter().map(|(_, counter)| *counter).max().unwrap_or(0);
+    async fn get_next_counter(&self, dir: &PathBuf, config: &FileConfig) -> Result<u64> {
+        let files = self.scan_files(dir, config).await?;
+        let max_counter = files.iter().map(|f| f.counter).max().unwrap_or(0);
         Ok(if max_counter == 0 && files.is_empty() { 0 } else { max_counter + 1 })
     }
 
     /// Clean up old files, keeping only the most recent max_files
-    pub async fn cleanup_old_files(&self, dir: &PathBuf, prefix: &str, suffix: &str, max_files: usize) -> Result<()> {
-        let files = self.scan_files(dir, prefix, suffix).await?;
+    async fn cleanup_old_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<()> {
+        let files = self.scan_files(dir, config).await?;
         
-        if files.len() > max_files {
-            let files_to_remove = files.len() - max_files;
-            for (file_path, _) in &files[0..files_to_remove] {
-                info!(file = %file_path.display(), "Removing old file");
-                if let Err(e) = remove_file(file_path).await {
-                    error!(file = %file_path.display(), error = %e, "Failed to remove old file");
+        if files.len() > config.max_files {
+            let files_to_remove = files.len() - config.max_files;
+            for file_info in &files[0..files_to_remove] {
+                info!(file = %file_info.path.display(), "Removing old file");
+                if let Err(e) = remove_file(&file_info.path).await {
+                    error!(file = %file_info.path.display(), error = %e, "Failed to remove old file");
                 }
             }
         }
@@ -76,19 +170,19 @@ pub struct WalEntryReader {
 }
 
 impl WalEntryReader {
-    fn new(buffer: Vec<u8>) -> Self {
+    pub fn new(buffer: Vec<u8>) -> Self {
         Self { buffer, offset: 0 }
     }
     
-    fn from_offset(buffer: Vec<u8>, start_offset: usize) -> Self {
+    pub fn from_offset(buffer: Vec<u8>, start_offset: usize) -> Self {
         Self { buffer, offset: start_offset }
     }
 }
 
-impl Iterator for WalEntryReader {
-    type Item = Result<(Vec<u8>, usize)>; // (entry_data, next_offset)
+impl EntryReader<Vec<u8>> for WalEntryReader {
+    type Error = anyhow::Error;
     
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_entry(&mut self) -> Option<Result<(Vec<u8>, usize), Self::Error>> {
         if self.offset >= self.buffer.len() {
             return None;
         }
@@ -127,20 +221,48 @@ impl Iterator for WalEntryReader {
     }
 }
 
-/// WAL manager handles WAL file operations
-pub struct WalManager {
-    file_manager: FileManager,
+impl Iterator for WalEntryReader {
+    type Item = Result<(Vec<u8>, usize)>; // (entry_data, next_offset)
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_entry()
+    }
 }
 
-impl WalManager {
-    pub fn new() -> Self {
+/// WAL manager handles WAL file operations
+pub struct WalManager<F: FileManagerTrait> {
+    file_manager: F,
+    wal_config: FileConfig,
+}
+
+impl<F: FileManagerTrait> WalManager<F> {
+    pub fn new(file_manager: F) -> Self {
         Self {
-            file_manager: FileManager,
+            file_manager,
+            wal_config: FileConfig {
+                prefix: "wal_".to_string(),
+                suffix: ".log".to_string(),
+                max_files: 30, // Will be overridden by config
+            },
         }
     }
     
+    pub fn with_config(file_manager: F, max_files: usize) -> Self {
+        Self {
+            file_manager,
+            wal_config: FileConfig {
+                prefix: "wal_".to_string(),
+                suffix: ".log".to_string(),
+                max_files,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl<F: FileManagerTrait> WalTrait for WalManager<F> {
     /// Write a request to WAL with file rotation and snapshot handling
-    pub async fn write_request(&self, request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
+    async fn write_request(&self, request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
         let serialized = serde_json::to_vec(request)?;
         let serialized_len = serialized.len();
         
@@ -158,7 +280,61 @@ impl WalManager {
         Ok(())
     }
     
-    /// Rotate the WAL file and handle snapshots if needed
+    /// Replay WAL files to restore store state
+    async fn replay(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
+        let wal_dir = locks.core_state().get_wal_dir();
+        let wal_files = self.file_manager.scan_files(&wal_dir, &self.wal_config).await?;
+        
+        if wal_files.is_empty() {
+            info!("No WAL files found, no replay needed");
+            return Ok(());
+        }
+        
+        let most_recent_snapshot = self.find_latest_snapshot_marker(&wal_files).await?;
+        
+        locks.store().inner_mut().disable_notifications();
+        info!("Notifications disabled for WAL replay");
+        
+        // Defensive: Comprehensive error handling for WAL replay with proper cleanup
+        let replay_result = self.perform_replay(locks, &wal_files, most_recent_snapshot).await;
+        
+        // Defensive: Always re-enable notifications regardless of replay outcome
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            locks.store().inner_mut().enable_notifications();
+        })) {
+            error!(panic_info = ?e, "Failed to re-enable notifications after WAL replay");
+            return Err(anyhow::anyhow!("Critical failure: cannot re-enable notifications"));
+        }
+        
+        info!("Notifications re-enabled after WAL replay");
+        
+        match replay_result {
+            Ok(_) => {
+                info!("WAL replay completed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                error!(error = %e, "WAL replay failed but continuing with startup");
+                Ok(()) // Defensive: Don't fail startup for replay issues
+            }
+        }
+    }
+    
+    /// Initialize WAL counter from existing files
+    async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
+        let wal_dir = locks.core_state().get_wal_dir();
+        let next_wal_counter = self.file_manager.get_next_counter(&wal_dir, &self.wal_config).await?;
+        locks.wal_state().wal_file_counter = next_wal_counter;
+        info!(
+            wal_dir = %wal_dir.display(),
+            next_counter = next_wal_counter,
+            "Initialized WAL file counter"
+        );
+        Ok(())
+    }
+}
+
+impl<F: FileManagerTrait> WalManager<F> {
     async fn rotate_file(&self, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
         let wal_dir = locks.core_state().get_wal_dir();
         create_dir_all(&wal_dir).await?;
@@ -209,7 +385,7 @@ impl WalManager {
             
             match snapshot_result {
                 Ok(snapshot) => {
-                    let snapshot_manager = SnapshotManager::new();
+                    let snapshot_manager = SnapshotManager::new(FileManager);
                     match snapshot_manager.save(&snapshot, locks).await {
                         Ok(snapshot_counter) => {
                             locks.wal_state().wal_files_since_snapshot = 0;
@@ -248,7 +424,9 @@ impl WalManager {
     /// Clean up old WAL files
     async fn cleanup_old_wal_files(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
         let wal_dir = locks.core_state().get_wal_dir();
-        if let Err(e) = self.file_manager.cleanup_old_files(&wal_dir, "wal_", ".log", locks.core_state().config.wal_max_files).await {
+        let mut config = self.wal_config.clone();
+        config.max_files = locks.core_state().config.wal_max_files;
+        if let Err(e) = self.file_manager.cleanup_old_files(&wal_dir, &config).await {
             error!(error = %e, "Failed to clean up old WAL files");
         }
         Ok(())
@@ -266,57 +444,17 @@ impl WalManager {
         Ok(())
     }
     
-    /// Replay WAL files to restore store state
-    pub async fn replay(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
-        let wal_dir = locks.core_state().get_wal_dir();
-        let wal_files = self.file_manager.scan_files(&wal_dir, "wal_", ".log").await?;
-        
-        if wal_files.is_empty() {
-            info!("No WAL files found, no replay needed");
-            return Ok(());
-        }
-        
-        let most_recent_snapshot = self.find_latest_snapshot_marker(&wal_files).await?;
-        
-        locks.store().inner_mut().disable_notifications();
-        info!("Notifications disabled for WAL replay");
-        
-        // Defensive: Comprehensive error handling for WAL replay with proper cleanup
-        let replay_result = self.perform_replay(locks, &wal_files, most_recent_snapshot).await;
-        
-        // Defensive: Always re-enable notifications regardless of replay outcome
-        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            locks.store().inner_mut().enable_notifications();
-        })) {
-            error!(panic_info = ?e, "Failed to re-enable notifications after WAL replay");
-            return Err(anyhow::anyhow!("Critical failure: cannot re-enable notifications"));
-        }
-        
-        info!("Notifications re-enabled after WAL replay");
-        
-        match replay_result {
-            Ok(_) => {
-                info!("WAL replay completed successfully");
-                Ok(())
-            }
-            Err(e) => {
-                error!(error = %e, "WAL replay failed but continuing with startup");
-                Ok(()) // Defensive: Don't fail startup for replay issues
-            }
-        }
-    }
-    
     /// Find the most recent snapshot marker across all WAL files
-    async fn find_latest_snapshot_marker(&self, wal_files: &[(PathBuf, u64)]) -> Result<Option<(PathBuf, u64, usize)>> {
+    async fn find_latest_snapshot_marker(&self, wal_files: &[FileInfo]) -> Result<Option<(PathBuf, u64, usize)>> {
         let mut most_recent_snapshot: Option<(PathBuf, u64, usize)> = None;
         
         info!(wal_files_count = wal_files.len(), "Scanning WAL files to find the most recent snapshot marker");
         
-        for (wal_file, counter) in wal_files {
-            if let Ok(snapshot_info) = self.find_snapshot_marker_in_file(wal_file).await {
+        for file_info in wal_files {
+            if let Ok(snapshot_info) = self.find_snapshot_marker_in_file(&file_info.path).await {
                 if let Some((offset_after_snapshot, _)) = snapshot_info {
-                    if most_recent_snapshot.is_none() || counter > &most_recent_snapshot.as_ref().unwrap().1 {
-                        most_recent_snapshot = Some((wal_file.clone(), *counter, offset_after_snapshot));
+                    if most_recent_snapshot.is_none() || file_info.counter > most_recent_snapshot.as_ref().unwrap().1 {
+                        most_recent_snapshot = Some((file_info.path.clone(), file_info.counter, offset_after_snapshot));
                     }
                 }
             }
@@ -362,7 +500,7 @@ impl WalManager {
     }
     
     /// Perform the actual replay operation
-    async fn perform_replay(&self, locks: &mut AppStateLocks<'_>, wal_files: &[(PathBuf, u64)], most_recent_snapshot: Option<(PathBuf, u64, usize)>) -> Result<()> {
+    async fn perform_replay(&self, locks: &mut AppStateLocks<'_>, wal_files: &[FileInfo], most_recent_snapshot: Option<(PathBuf, u64, usize)>) -> Result<()> {
         match most_recent_snapshot {
             Some((snapshot_wal_file, snapshot_counter, snapshot_offset)) => {
                 info!(
@@ -376,11 +514,11 @@ impl WalManager {
                 self.replay_file_from_offset(locks, &snapshot_wal_file, snapshot_offset).await?;
                 
                 // Replay all subsequent WAL files completely
-                for (wal_file, counter) in wal_files {
-                    if counter > &snapshot_counter {
-                        info!(wal_file = %wal_file.display(), wal_counter = counter, "Replaying complete WAL file");
-                        if let Err(e) = self.replay_file_from_offset(locks, wal_file, 0).await {
-                            error!(wal_file = %wal_file.display(), error = %e, "Failed to replay WAL file");
+                for file_info in wal_files {
+                    if file_info.counter > snapshot_counter {
+                        info!(wal_file = %file_info.path.display(), wal_counter = file_info.counter, "Replaying complete WAL file");
+                        if let Err(e) = self.replay_file_from_offset(locks, &file_info.path, 0).await {
+                            error!(wal_file = %file_info.path.display(), error = %e, "Failed to replay WAL file");
                         }
                     }
                 }
@@ -388,10 +526,10 @@ impl WalManager {
             None => {
                 info!(wal_files_count = wal_files.len(), "No snapshot markers found, replaying all files completely");
                 
-                for (wal_file, counter) in wal_files {
-                    info!(wal_file = %wal_file.display(), wal_counter = counter, "Replaying WAL file");
-                    if let Err(e) = self.replay_file_from_offset(locks, wal_file, 0).await {
-                        error!(wal_file = %wal_file.display(), error = %e, "Failed to replay WAL file");
+                for file_info in wal_files {
+                    info!(wal_file = %file_info.path.display(), wal_counter = file_info.counter, "Replaying WAL file");
+                    if let Err(e) = self.replay_file_from_offset(locks, &file_info.path, 0).await {
+                        error!(wal_file = %file_info.path.display(), error = %e, "Failed to replay WAL file");
                     }
                 }
             }
@@ -526,36 +664,43 @@ impl WalManager {
             }
         }
     }
-    
-    /// Initialize WAL counter from existing files
-    pub async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
-        let wal_dir = locks.core_state().get_wal_dir();
-        let next_wal_counter = self.file_manager.get_next_counter(&wal_dir, "wal_", ".log").await?;
-        locks.wal_state().wal_file_counter = next_wal_counter;
-        info!(
-            wal_dir = %wal_dir.display(),
-            next_counter = next_wal_counter,
-            "Initialized WAL file counter"
-        );
-        Ok(())
-    }
 }
 
 /// Snapshot manager handles snapshot operations
-pub struct SnapshotManager {
-    file_manager: FileManager,
+pub struct SnapshotManager<F: FileManagerTrait> {
+    file_manager: F,
+    snapshot_config: FileConfig,
 }
 
-impl SnapshotManager {
-    pub fn new() -> Self {
+impl<F: FileManagerTrait> SnapshotManager<F> {
+    pub fn new(file_manager: F) -> Self {
         Self {
-            file_manager: FileManager,
+            file_manager,
+            snapshot_config: FileConfig {
+                prefix: "snapshot_".to_string(),
+                suffix: ".bin".to_string(),
+                max_files: 5, // Will be overridden by config
+            },
         }
     }
     
+    pub fn with_config(file_manager: F, max_files: usize) -> Self {
+        Self {
+            file_manager,
+            snapshot_config: FileConfig {
+                prefix: "snapshot_".to_string(),
+                suffix: ".bin".to_string(),
+                max_files,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl<F: FileManagerTrait> SnapshotTrait for SnapshotManager<F> {
     /// Save a snapshot to disk and return the snapshot counter
     #[instrument(skip(self, snapshot, locks))]
-    pub async fn save(&self, snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64> {
+    async fn save(&self, snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64> {
         let snapshot_dir = locks.core_state().get_snapshots_dir();
         create_dir_all(&snapshot_dir).await?;
         
@@ -596,9 +741,9 @@ impl SnapshotManager {
     }
     
     /// Load the latest snapshot from disk
-    pub async fn load_latest(&self, locks: &mut AppStateLocks<'_>) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
+    async fn load_latest(&self, locks: &mut AppStateLocks<'_>) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
         let snapshot_dir = locks.core_state().get_snapshots_dir();
-        let snapshot_files = self.file_manager.scan_files(&snapshot_dir, "snapshot_", ".bin").await?;
+        let snapshot_files = self.file_manager.scan_files(&snapshot_dir, &self.snapshot_config).await?;
         
         if snapshot_files.is_empty() {
             info!("No snapshot files found, starting with empty store");
@@ -606,21 +751,21 @@ impl SnapshotManager {
         }
         
         // Try loading snapshots from latest to oldest
-        for (snapshot_path, counter) in snapshot_files.iter().rev() {
+        for file_info in snapshot_files.iter().rev() {
             info!(
-                snapshot_file = %snapshot_path.display(),
-                snapshot_counter = counter,
+                snapshot_file = %file_info.path.display(),
+                snapshot_counter = file_info.counter,
                 "Attempting to load snapshot"
             );
             
-            match self.try_load_snapshot(snapshot_path).await {
+            match self.try_load_snapshot(&file_info.path).await {
                 Ok(Some(snapshot)) => {
                     info!(
-                        snapshot_file = %snapshot_path.display(),
-                        snapshot_counter = counter,
+                        snapshot_file = %file_info.path.display(),
+                        snapshot_counter = file_info.counter,
                         "Snapshot loaded successfully"
                     );
-                    return Ok(Some((snapshot, *counter)));
+                    return Ok(Some((snapshot, file_info.counter)));
                 }
                 Ok(None) => {
                     // File was corrupted and cleaned up, try next
@@ -629,7 +774,7 @@ impl SnapshotManager {
                 Err(e) => {
                     error!(
                         error = %e,
-                        snapshot_file = %snapshot_path.display(),
+                        snapshot_file = %file_info.path.display(),
                         "Failed to load snapshot, trying previous snapshot"
                     );
                     continue;
@@ -641,6 +786,22 @@ impl SnapshotManager {
         warn!("All snapshot files failed to load or were corrupted, starting with empty store");
         Ok(None)
     }
+    
+    /// Initialize snapshot counter from existing files
+    async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
+        let snapshot_dir = locks.core_state().get_snapshots_dir();
+        let next_snapshot_counter = self.file_manager.get_next_counter(&snapshot_dir, &self.snapshot_config).await?;
+        locks.wal_state().snapshot_file_counter = next_snapshot_counter;
+        info!(
+            snapshot_dir = %snapshot_dir.display(),
+            next_counter = next_snapshot_counter,
+            "Initialized snapshot file counter"
+        );
+        Ok(())
+    }
+}
+
+impl<F: FileManagerTrait> SnapshotManager<F> {
     
     /// Try to load a single snapshot file
     async fn try_load_snapshot(&self, snapshot_path: &PathBuf) -> Result<Option<qlib_rs::Snapshot>> {
@@ -679,23 +840,11 @@ impl SnapshotManager {
     /// Clean up old snapshot files
     async fn cleanup_old_snapshots(&self, locks: &AppStateLocks<'_>) -> Result<()> {
         let snapshot_dir = locks.core_state.as_ref().unwrap().get_snapshots_dir();
-        let max_files = locks.core_state.as_ref().unwrap().config.snapshot_max_files;
-        if let Err(e) = self.file_manager.cleanup_old_files(&snapshot_dir, "snapshot_", ".bin", max_files).await {
+        let mut config = self.snapshot_config.clone();
+        config.max_files = locks.core_state.as_ref().unwrap().config.snapshot_max_files;
+        if let Err(e) = self.file_manager.cleanup_old_files(&snapshot_dir, &config).await {
             error!(error = %e, "Failed to clean up old snapshots");
         }
-        Ok(())
-    }
-    
-    /// Initialize snapshot counter from existing files
-    pub async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
-        let snapshot_dir = locks.core_state().get_snapshots_dir();
-        let next_snapshot_counter = self.file_manager.get_next_counter(&snapshot_dir, "snapshot_", ".bin").await?;
-        locks.wal_state().snapshot_file_counter = next_snapshot_counter;
-        info!(
-            snapshot_dir = %snapshot_dir.display(),
-            next_counter = next_snapshot_counter,
-            "Initialized snapshot file counter"
-        );
         Ok(())
     }
 }
