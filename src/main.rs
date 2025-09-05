@@ -341,11 +341,6 @@ impl<'a> AppStateLocks<'a> {
     pub fn permission_cache(&mut self) -> &mut MutexGuard<'a, Option<Cache>> {
         self.permission_cache.as_mut().expect("permission_cache lock was not requested")
     }
-
-    /// Get the cel_executor lock, panicking if it wasn't requested
-    pub fn cel_executor(&mut self) -> &mut MutexGuard<'a, CelExecutor> {
-        self.cel_executor.as_mut().expect("cel_executor lock was not requested")
-    }
 }
 
 impl AppState {
@@ -1970,20 +1965,18 @@ async fn manage_outbound_peer_connections(app_state: Arc<AppState>) -> Result<()
                         error = %e,
                         "Failed to connect to peer"
                     );
-                    
-                    // Remove from connected set on failure
-                    let mut connections = app_state_clone.connections.lock().await;
-                    connections.connected_outbound_peers.remove(&peer_addr_clone);
                 } else {
                     info!(
                         peer_addr = %peer_addr_clone,
                         "Connection to peer ended"
                     );
-                    
-                    // Remove from connected set when connection ends
-                    let mut connections = app_state_clone.connections.lock().await;
-                    connections.connected_outbound_peers.remove(&peer_addr_clone);
                 }
+
+                let mut locks = app_state_clone.acquire_locks(LockRequest {
+                    connections: true,
+                    ..Default::default()
+                }).await;
+                locks.connections().connected_outbound_peers.remove(&peer_addr_clone);
             });
         }
     }
@@ -1995,9 +1988,11 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
     
     // Get a clone of the write channel receiver
     let receiver = {
-        let store = &app_state.store;
-        let store_guard = store.lock().await;
-        store_guard.inner().get_write_channel_receiver()
+        let mut locks = app_state.acquire_locks(LockRequest {
+            store: true,
+            ..Default::default()
+        }).await;
+        locks.store().inner().get_write_channel_receiver()
     };
     
     loop {
@@ -2008,23 +2003,20 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
         };
         
         match requests {
-            Some(mut requests) => {                
-                // Collect all requests that originated from this machine for batch synchronization
-                let current_machine = {
-                    let core = app_state.core_state.lock().await;
-                    core.config.machine.clone()
-                };
+            Some(mut requests) => {     
+                let mut locks = app_state.acquire_locks(LockRequest {
+                    wal_state: true,
+                    core_state: true,
+                    store: true,
+                    ..Default::default()
+                }).await;
 
+                // Ensure the originator is set for all requests
+                let current_machine = locks.core_state().config.machine.clone();
                 requests.iter_mut().for_each(|req| req.try_set_originator(current_machine.clone()));
                 
-                // Write all requests to WAL file - the requests have already been applied to the store
+                // Write all requests to the WAL file - these requests have already been applied to the store
                 for request in &requests {
-                    let mut locks = app_state.acquire_locks(LockRequest {
-                        wal_state: true,
-                        core_state: true,
-                        store: true,
-                        ..Default::default()
-                    }).await;
                     if let Err(e) = write_request_to_wal(request, &mut locks).await {
                         error!(
                             error = %e,
@@ -2033,6 +2025,7 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                     }
                 }
                 
+                // Send batch of requests to peers for synchronization if we have any
                 let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
                     .filter(|request| {
                         if let Some(originator) = request.originator() {
@@ -2044,14 +2037,10 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
                     .cloned()
                     .collect();
                 
-                // Send batch of requests to peers for synchronization if we have any
                 if !requests_to_sync.is_empty() {                    
                     // Send to all connected outbound peers using PeerMessage
-                    let peers_to_notify = {
-                        let connections = app_state.connections.lock().await;
-                        connections.connected_outbound_peers.clone()
-                    };
-                    
+                    let peers_to_notify = locks.connections().connected_outbound_peers.clone();
+
                     // Create a batch sync message
                     let sync_message = PeerMessage::SyncRequest {
                         requests: requests_to_sync.clone(),
@@ -2880,12 +2869,24 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
     
     loop {
         interval.tick().await;
-        
+
+        let mut locks = app_state.acquire_locks(LockRequest {
+            wal_state: true,
+            core_state: true,
+            store: true,
+            permission_cache: true,
+            connections: true,
+            ..Default::default()
+        }).await;
+
         // Check if we should self-promote to leader when no peers are connected
         {
-            let connections = app_state.connections.lock().await;
-            let core = app_state.core_state.lock().await;
-            
+            let ((connections, core), peer_info) = locks
+                .connections.as_ref()
+                .zip(locks.core_state.as_mut())
+                .zip(locks.peer_info.as_ref())
+                .unwrap();
+
             // Self-promote to leader if:
             // 1. We're not already the leader
             // 2. No peer addresses are configured OR no outbound peers are connected
@@ -2902,11 +2903,7 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                 // Wait for the configured delay since startup before self-promoting
                 let self_promotion_delay = core.config.self_promotion_delay_secs;
                 if time_since_startup >= self_promotion_delay {
-                    let peer_info = app_state.peer_info.lock().await;
                     if peer_info.is_empty() {
-                        drop(peer_info);
-                        drop(connections);
-                        drop(core);
                         
                         info!(
                             delay_secs = self_promotion_delay,
@@ -2914,13 +2911,12 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                             "No peers connected after self-promotion delay, promoting to leader"
                         );
                         
-                        let mut core_state = app_state.core_state.lock().await;
-                        let our_machine_id = core_state.config.machine.clone();
-                        core_state.is_leader = true;
-                        core_state.current_leader = Some(our_machine_id.clone());
-                        core_state.availability_state = AvailabilityState::Available;
-                        core_state.is_fully_synced = true;
-                        
+                        let our_machine_id = core.config.machine.clone();
+                        core.is_leader = true;
+                        core.current_leader = Some(our_machine_id.clone());
+                        core.availability_state = AvailabilityState::Available;
+                        core.is_fully_synced = true;
+
                         info!(
                             machine_id = %our_machine_id,
                             "Self-promoted to leader due to no peer connections"
@@ -2932,8 +2928,8 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
 
         // Check if we need to send a full sync request after grace period
         let (should_send_full_sync, is_leader) = {
-            let core = app_state.core_state.lock().await;
-            
+            let core = locks.core_state();
+
             // Only check if we're unavailable, not the leader, not fully synced, and haven't sent a request yet
             if matches!(core.availability_state, AvailabilityState::Unavailable) &&
                !core.is_leader &&
@@ -2961,25 +2957,19 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
         };
         
         if let Some(leader_machine_id) = should_send_full_sync {
+            let (core, connections) = locks.core_state.as_mut().zip(locks.connections.as_ref()).unwrap();
+
             info!(
                 leader_machine_id = %leader_machine_id,
                 "Grace period expired, sending FullSyncRequest to leader"
             );
             
             // Mark that we're sending a request to avoid duplicates
-            {
-                let mut core = app_state.core_state.lock().await;
-                core.full_sync_request_pending = true;
-            }
+            core.full_sync_request_pending = true;
             
             // Send FullSyncRequest to the leader through any connected outbound peer
-            let machine_id = {
-                let core = app_state.core_state.lock().await;
-                core.config.machine.clone()
-            };
-            
             let full_sync_request = PeerMessage::FullSyncRequest {
-                machine_id: machine_id.clone(),
+                machine_id: core.config.machine.clone(),
             };
             
             if let Ok(request_json) = serde_json::to_string(&full_sync_request) {
@@ -2987,7 +2977,6 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                 
                 // Try to send to any connected outbound peer
                 let sent = {
-                    let connections = app_state.connections.lock().await;
                     let mut sent = false;
                     
                     for (peer_addr, sender) in &connections.connected_outbound_peers {
@@ -3014,34 +3003,31 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
                         leader_machine_id = %leader_machine_id,
                         "No connected outbound peers available to send FullSyncRequest to leader"
                     );
+
                     // Reset the pending flag so we can try again later
-                    let mut core = app_state.core_state.lock().await;
                     core.full_sync_request_pending = false;
                 }
             } else {
                 error!("Failed to serialize FullSyncRequest");
-                let mut core = app_state.core_state.lock().await;
+                
                 core.full_sync_request_pending = false;
             }
         }
 
         // Process cache notifications
         {
-            let mut permission_cache = app_state.permission_cache.lock().await;
+            let permission_cache = locks.permission_cache();
             if let Some(cache) = permission_cache.as_mut() {
                 cache.process_notifications();
             }
         }
 
         if is_leader {
-            let mut store = locks.store();
+            let (store, core) = locks.store.as_mut().zip(locks.core_state.as_ref()).unwrap();
 
             // Find us as a candidate
             let me_as_candidate = {
-                let machine = {
-                    let core = app_state.core_state.lock().await;
-                    core.config.machine.clone()
-                };
+                let machine = &core.config.machine;
 
                 let mut candidates = store.find_entities(
                     &et::candidate(), 
@@ -3196,24 +3182,25 @@ async fn handle_heartbeat_writing(app_state: Arc<AppState>) -> Result<()> {
     
     loop {
         interval.tick().await;
-        
-        {
-            let mut store = locks.store();
-            let machine = {
-                let core = app_state.core_state.lock().await;
-                core.config.machine.clone()
-            };
 
-            let candidates = store.find_entities(
-                &et::candidate(), 
-                Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))).await?;
+        let mut locks = app_state.acquire_locks(LockRequest {
+            store: true,
+            core_state: true,
+            ..Default::default()
+        }).await;
 
-            if let Some(candidate) = candidates.first() {
-                store.perform_mut(&mut vec![
-                    swrite!(candidate.clone(), ft::heartbeat(), schoice!(0)),
-                    swrite!(candidate.clone(), ft::make_me(), schoice!(1), PushCondition::Changes)
-                ]).await?;
-            }
+        let (store, core) = locks.store.as_mut().zip(locks.core_state.as_ref()).unwrap();
+        let machine = &core.config.machine;
+
+        let candidates = store.find_entities(
+            &et::candidate(), 
+            Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))).await?;
+
+        if let Some(candidate) = candidates.first() {
+            store.perform_mut(&mut vec![
+                swrite!(candidate.clone(), ft::heartbeat(), schoice!(0)),
+                swrite!(candidate.clone(), ft::make_me(), schoice!(1), PushCondition::Changes)
+            ]).await?;
         }
 
         tokio::task::yield_now().await;
@@ -3325,7 +3312,7 @@ async fn main() -> Result<()> {
             let next_snapshot_counter = get_next_snapshot_counter(&mut locks).await?;
             
             {
-                let mut store_guard = locks.store();
+                let store_guard = locks.store();
                 store_guard.inner_mut().disable_notifications();
                 store_guard.inner_mut().restore_snapshot(snapshot);
                 store_guard.inner_mut().enable_notifications();
@@ -3486,38 +3473,36 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut locks = app_state.acquire_locks(LockRequest {
+        wal_state: true,
+        core_state: true,
+        store: true,
+        ..Default::default()
+    }).await;
+
     // Take a final snapshot before shutting down
     info!("Taking final snapshot before shutdown");
-    let snapshot = {
-        let store_guard = locks.store();
-        store_guard.inner().take_snapshot()
-    };
+    let snapshot = locks.store().inner().take_snapshot();
     
-    {
-        let mut locks = app_state.acquire_locks(LockRequest {
-            wal_state: true,
-            core_state: true,
-            ..Default::default()
-        }).await;
-        match save_snapshot(&snapshot, &mut locks).await {
-            Ok(snapshot_counter) => {
-                info!(
-                    snapshot_counter = snapshot_counter,
-                    "Final snapshot saved successfully"
-                );
-                
-                // Write a snapshot marker to the WAL to indicate the final snapshot point
-                // This helps during replay to know that the state was snapshotted at shutdown
-                let snapshot_request = qlib_rs::Request::Snapshot {
-                    snapshot_counter,
-                    timestamp: Some(now()),
-                    originator: Some({
-                        let core = locks.core_state();
-                        core.config.machine.clone()
-                    }),
-                };
-                
-                if let Err(e) = write_request_to_wal_direct(&snapshot_request, &mut locks).await {
+    match save_snapshot(&snapshot, &mut locks).await {
+        Ok(snapshot_counter) => {
+            info!(
+                snapshot_counter = snapshot_counter,
+                "Final snapshot saved successfully"
+            );
+            
+            // Write a snapshot marker to the WAL to indicate the final snapshot point
+            // This helps during replay to know that the state was snapshotted at shutdown
+            let snapshot_request = qlib_rs::Request::Snapshot {
+                snapshot_counter,
+                timestamp: Some(now()),
+                originator: Some({
+                    let core = locks.core_state();
+                    core.config.machine.clone()
+                }),
+            };
+            
+            if let Err(e) = write_request_to_wal_direct(&snapshot_request, &mut locks).await {
                 error!(error = %e, "Failed to write final snapshot marker to WAL");
             } else {
                 info!("Final snapshot marker written to WAL");
@@ -3526,7 +3511,6 @@ async fn main() -> Result<()> {
         Err(e) => {
             error!(error = %e, "Failed to save final snapshot");
         }
-    }
     }
 
     // Abort all tasks
