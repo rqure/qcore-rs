@@ -269,8 +269,6 @@ pub struct AppStateLocks<'a> {
     pub cel_executor: Option<MutexGuard<'a, CelExecutor>>,
 }
 
-
-
 impl<'a> AppStateLocks<'a> {
     /// Get the core_state lock, panicking if it wasn't requested
     pub fn core_state(&mut self) -> &mut MutexGuard<'a, CoreState> {

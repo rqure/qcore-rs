@@ -390,47 +390,32 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             
             // Store current state for potential rollback
             let original_wal_files_since_snapshot = self.wal_files_since_snapshot;
-            
-            // Defensive: Wrap snapshot creation in error handling
-            let snapshot_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                locks.store().inner().take_snapshot()
-            }));
-            
-            match snapshot_result {
-                Ok(snapshot) => {
-                    // Create snapshot config from WAL config
-                    let snapshot_config = SnapshotConfig {
-                        snapshots_dir: self.config.snapshots_dir.clone(),
-                        max_files: self.config.snapshot_max_files,
-                    };
-                    let mut snapshot_manager = SnapshotManagerTrait::new(FileManager, snapshot_config);
-                    match snapshot_manager.save(&snapshot, locks).await {
-                        Ok(snapshot_counter) => {
-                            self.wal_files_since_snapshot = 0;
-                            info!("Snapshot saved successfully after WAL rollover");
+            let snapshot = locks.store().inner().take_snapshot();
 
-                            let snapshot_request = qlib_rs::Request::Snapshot {
-                                snapshot_counter,
-                                timestamp: Some(now()),
-                                originator: Some(self.config.machine_id.clone()),
-                            };
-                            
-                            if let Err(e) = self.write_request(&snapshot_request, locks, true).await {
-                                error!(error = %e, "Failed to write snapshot marker to WAL");
-                            }
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to save snapshot after WAL rollover");
-                            self.wal_files_since_snapshot = original_wal_files_since_snapshot;
-                        }
+            // Create snapshot config from WAL config
+            let snapshot_config = SnapshotConfig {
+                snapshots_dir: self.config.snapshots_dir.clone(),
+                max_files: self.config.snapshot_max_files,
+            };
+            let mut snapshot_manager = SnapshotManagerTrait::new(FileManager, snapshot_config);
+            match snapshot_manager.save(&snapshot, locks).await {
+                Ok(snapshot_counter) => {
+                    self.wal_files_since_snapshot = 0;
+                    info!("Snapshot saved successfully after WAL rollover");
+
+                    let snapshot_request = qlib_rs::Request::Snapshot {
+                        snapshot_counter,
+                        timestamp: Some(now()),
+                        originator: Some(self.config.machine_id.clone()),
+                    };
+                    
+                    if let Err(e) = self.write_request(&snapshot_request, locks, true).await {
+                        error!(error = %e, "Failed to write snapshot marker to WAL");
                     }
                 }
-                Err(panic_info) => {
-                    error!(
-                        panic_info = ?panic_info,
-                        "Snapshot creation panicked - continuing with WAL operations"
-                    );
-                    self.wal_files_since_snapshot = original_wal_files_since_snapshot.saturating_sub(1);
+                Err(e) => {
+                    error!(error = %e, "Failed to save snapshot after WAL rollover");
+                    self.wal_files_since_snapshot = original_wal_files_since_snapshot;
                 }
             }
         }
