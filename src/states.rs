@@ -6,7 +6,6 @@ use clap::Parser;
 use anyhow::Result;
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
-use tokio::fs::{File};
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
 use time;
@@ -86,33 +85,6 @@ impl ConnectionState {
         
         // Clear all client-related data structures
         self.connected_clients.clear();
-    }
-}
-
-/// WAL state separated to avoid lock contention
-#[derive(Debug)]
-pub struct WalState {
-    /// Current WAL file handle
-    pub current_wal_file: Option<File>,
-    /// Current WAL file size in bytes
-    pub current_wal_size: usize,
-    /// WAL file counter for generating unique filenames
-    pub wal_file_counter: u64,
-    /// Snapshot file counter for generating unique filenames
-    pub snapshot_file_counter: u64,
-    /// Number of WAL files created since last snapshot
-    pub wal_files_since_snapshot: u64,
-}
-
-impl WalState {
-    pub fn new() -> Self {
-        Self {
-            current_wal_file: None,
-            current_wal_size: 0,
-            wal_file_counter: 0,
-            snapshot_file_counter: 0,
-            wal_files_since_snapshot: 0,
-        }
     }
 }
 
@@ -200,9 +172,6 @@ pub struct AppState {
     /// Connection-related state - separate lock to reduce contention
     pub connections: Mutex<ConnectionState>,
     
-    /// WAL file state - separate lock for file operations
-    pub wal_state: Mutex<WalState>,
-    
     /// Peer information tracking
     pub peer_info: Mutex<HashMap<String, PeerInfo>>,
     
@@ -284,7 +253,6 @@ pub struct PeerInfo {
 pub struct LockRequest {
     pub core_state: bool,
     pub connections: bool,
-    pub wal_state: bool,
     pub peer_info: bool,
     pub store: bool,
     pub permission_cache: bool,
@@ -295,7 +263,6 @@ pub struct LockRequest {
 pub struct AppStateLocks<'a> {
     pub core_state: Option<MutexGuard<'a, CoreState>>,
     pub connections: Option<MutexGuard<'a, ConnectionState>>,
-    pub wal_state: Option<MutexGuard<'a, WalState>>,
     pub peer_info: Option<MutexGuard<'a, HashMap<String, PeerInfo>>>,
     pub store: Option<MutexGuard<'a, AsyncStore>>,
     pub permission_cache: Option<MutexGuard<'a, Option<Cache>>>,
@@ -313,11 +280,6 @@ impl<'a> AppStateLocks<'a> {
     /// Get the connections lock, panicking if it wasn't requested
     pub fn connections(&mut self) -> &mut MutexGuard<'a, ConnectionState> {
         self.connections.as_mut().expect("connections lock was not requested")
-    }
-
-    /// Get the wal_state lock, panicking if it wasn't requested
-    pub fn wal_state(&mut self) -> &mut MutexGuard<'a, WalState> {
-        self.wal_state.as_mut().expect("wal_state lock was not requested")
     }
 
     /// Get the peer_info lock, panicking if it wasn't requested
@@ -353,7 +315,6 @@ impl AppState {
                 full_sync_request_pending: false,
             }),
             connections: Mutex::new(ConnectionState::new()),
-            wal_state: Mutex::new(WalState::new()),
             peer_info: Mutex::new(HashMap::new()),
             store,
             permission_cache: Mutex::new(None),
@@ -463,11 +424,10 @@ impl AppState {
     /// This function ensures that locks are always acquired in the same order:
     /// 1. core_state
     /// 2. connections  
-    /// 3. wal_state
-    /// 4. peer_info
-    /// 5. store
-    /// 6. permission_cache
-    /// 7. cel_executor
+    /// 3. peer_info
+    /// 4. store
+    /// 5. permission_cache
+    /// 6. cel_executor
     /// 
     /// Only the locks specified in the request will be acquired.
     pub async fn acquire_locks(&self, request: LockRequest) -> AppStateLocks<'_> {
@@ -479,11 +439,6 @@ impl AppState {
             },
             connections: if request.connections {
                 Some(self.connections.lock().await)
-            } else {
-                None
-            },
-            wal_state: if request.wal_state {
-                Some(self.wal_state.lock().await)
             } else {
                 None
             },

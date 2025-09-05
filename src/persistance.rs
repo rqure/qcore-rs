@@ -19,22 +19,12 @@ impl WalManager {
     pub fn new_default() -> Self {
         Self::new(FileManager)
     }
-    
-    /// Create a new WAL manager with custom max files configuration
-    pub fn new_with_config(max_files: usize) -> Self {
-        Self::with_config(FileManager, max_files)
-    }
 }
 
 impl SnapshotManager {
     /// Create a new snapshot manager with default file manager
     pub fn new_default() -> Self {
         Self::new(FileManager)
-    }
-    
-    /// Create a new snapshot manager with custom max files configuration
-    pub fn new_with_config(max_files: usize) -> Self {
-        Self::with_config(FileManager, max_files)
     }
 }
 
@@ -78,26 +68,26 @@ pub trait EntryReaderTrait<T> {
 #[async_trait]
 pub trait WalTrait {
     /// Write a request to WAL
-    async fn write_request(&self, request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()>;
+    async fn write_request(&mut self, request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()>;
     
     /// Replay WAL files to restore store state
     async fn replay(&self, locks: &mut AppStateLocks<'_>) -> Result<()>;
     
     /// Initialize WAL counter from existing files
-    async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()>;
+    async fn initialize_counter(&mut self, locks: &mut AppStateLocks<'_>) -> Result<()>;
 }
 
 /// Trait for snapshot operations
 #[async_trait]
 pub trait SnapshotTrait {
     /// Save a snapshot to disk and return the snapshot counter
-    async fn save(&self, snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64>;
+    async fn save(&mut self, snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64>;
     
     /// Load the latest snapshot from disk
     async fn load_latest(&self, locks: &mut AppStateLocks<'_>) -> Result<Option<(qlib_rs::Snapshot, u64)>>;
     
     /// Initialize snapshot counter from existing files
-    async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()>;
+    async fn initialize_counter(&mut self, locks: &mut AppStateLocks<'_>) -> Result<()>;
 }
 
 /// Standard implementation of file management operations
@@ -233,6 +223,11 @@ impl Iterator for WalEntryReader {
 pub struct WalManagerTrait<F: FileManagerTrait> {
     file_manager: F,
     wal_config: FileConfig,
+    /// Current WAL file handle and size
+    current_wal_file: Option<File>,
+    current_wal_size: usize,
+    /// Number of WAL files created since last snapshot
+    wal_files_since_snapshot: u64,
 }
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {
@@ -244,17 +239,9 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 suffix: ".log".to_string(),
                 max_files: 30, // Will be overridden by config
             },
-        }
-    }
-    
-    pub fn with_config(file_manager: F, max_files: usize) -> Self {
-        Self {
-            file_manager,
-            wal_config: FileConfig {
-                prefix: "wal_".to_string(),
-                suffix: ".log".to_string(),
-                max_files,
-            },
+            current_wal_file: None,
+            current_wal_size: 0,
+            wal_files_since_snapshot: 0,
         }
     }
 }
@@ -262,20 +249,20 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
 #[async_trait]
 impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     /// Write a request to WAL with file rotation and snapshot handling
-    async fn write_request(&self, request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
+    async fn write_request(&mut self, request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
         let serialized = serde_json::to_vec(request)?;
         let serialized_len = serialized.len();
         
         // Check if we need to create a new WAL file
-        let should_create_new_file = locks.wal_state().current_wal_file.is_none() || 
-           (!direct_mode && locks.wal_state().current_wal_size + serialized_len > locks.core_state().config.wal_max_file_size * 1024 * 1024);
+        let should_create_new_file = self.current_wal_file.is_none() || 
+           (!direct_mode && self.current_wal_size + serialized_len > locks.core_state().config.wal_max_file_size * 1024 * 1024);
 
         if should_create_new_file {
             self.rotate_file(locks, direct_mode).await?;
         }
         
         // Write the actual data
-        self.write_entry(&serialized, locks).await?;
+        self.write_entry(&serialized).await?;
         
         Ok(())
     }
@@ -321,10 +308,10 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     }
     
     /// Initialize WAL counter from existing files
-    async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
+    async fn initialize_counter(&mut self, locks: &mut AppStateLocks<'_>) -> Result<()> {
         let wal_dir = locks.core_state().get_wal_dir();
         let next_wal_counter = self.file_manager.get_next_counter(&wal_dir, &self.wal_config).await?;
-        locks.wal_state().wal_file_counter = next_wal_counter;
+        // The counter is now managed internally by tracking through the file manager
         info!(
             wal_dir = %wal_dir.display(),
             next_counter = next_wal_counter,
@@ -335,20 +322,20 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
 }
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {
-    async fn rotate_file(&self, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
+    async fn rotate_file(&mut self, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
         let wal_dir = locks.core_state().get_wal_dir();
         create_dir_all(&wal_dir).await?;
         
-        let wal_filename = format!("wal_{:010}.log", locks.wal_state().wal_file_counter);
+        let wal_file_counter = self.file_manager.get_next_counter(&wal_dir, &self.wal_config).await?;
+        let wal_filename = format!("wal_{:010}.log", wal_file_counter);
         let wal_path = wal_dir.join(&wal_filename);
 
-        let wal_counter = locks.wal_state().wal_file_counter;
-        let current_size = locks.wal_state().current_wal_size;
+        let current_size = self.current_wal_size;
         let max_size = locks.core_state().config.wal_max_file_size * 1024 * 1024;
 
         info!(
             wal_file = %wal_path.display(),
-            wal_counter = wal_counter,
+            wal_counter = wal_file_counter,
             current_size = current_size,
             max_size = max_size,
             direct_mode = direct_mode,
@@ -356,12 +343,11 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
         );
         
         let file = OpenOptions::new().create(true).append(true).open(&wal_path).await?;
-        locks.wal_state().current_wal_file = Some(file);
-        locks.wal_state().current_wal_size = 0;
-        locks.wal_state().wal_file_counter += 1;
+        self.current_wal_file = Some(file);
+        self.current_wal_size = 0;
         
         if !direct_mode {
-            locks.wal_state().wal_files_since_snapshot += 1;
+            self.wal_files_since_snapshot += 1;
             self.handle_snapshot_if_needed(locks).await?;
             self.cleanup_old_wal_files(locks).await?;
         }
@@ -370,13 +356,12 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
     
     /// Handle snapshot creation if the interval is reached
-    async fn handle_snapshot_if_needed(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
-        if locks.wal_state().wal_files_since_snapshot >= locks.core_state().config.snapshot_wal_interval {
-            info!(wal_files_count = locks.wal_state().wal_files_since_snapshot, "Taking snapshot after WAL file rollovers");
+    async fn handle_snapshot_if_needed(&mut self, locks: &mut AppStateLocks<'_>) -> Result<()> {
+        if self.wal_files_since_snapshot >= locks.core_state().config.snapshot_wal_interval {
+            info!(wal_files_count = self.wal_files_since_snapshot, "Taking snapshot after WAL file rollovers");
             
             // Store current state for potential rollback
-            let original_wal_files_since_snapshot = locks.wal_state().wal_files_since_snapshot;
-            let original_snapshot_counter = locks.wal_state().snapshot_file_counter;
+            let original_wal_files_since_snapshot = self.wal_files_since_snapshot;
             
             // Defensive: Wrap snapshot creation in error handling
             let snapshot_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -385,10 +370,10 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             
             match snapshot_result {
                 Ok(snapshot) => {
-                    let snapshot_manager = SnapshotManagerTrait::new(FileManager);
+                    let mut snapshot_manager = SnapshotManagerTrait::new(FileManager);
                     match snapshot_manager.save(&snapshot, locks).await {
                         Ok(snapshot_counter) => {
-                            locks.wal_state().wal_files_since_snapshot = 0;
+                            self.wal_files_since_snapshot = 0;
                             info!("Snapshot saved successfully after WAL rollover");
 
                             let snapshot_request = qlib_rs::Request::Snapshot {
@@ -397,14 +382,13 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                                 originator: Some(locks.core_state().config.machine.clone()),
                             };
                             
-                            if let Err(e) = Box::pin(self.write_request(&snapshot_request, locks, true)).await {
+                            if let Err(e) = self.write_request(&snapshot_request, locks, true).await {
                                 error!(error = %e, "Failed to write snapshot marker to WAL");
                             }
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to save snapshot after WAL rollover");
-                            locks.wal_state().snapshot_file_counter = original_snapshot_counter;
-                            locks.wal_state().wal_files_since_snapshot = original_wal_files_since_snapshot;
+                            self.wal_files_since_snapshot = original_wal_files_since_snapshot;
                         }
                     }
                 }
@@ -413,7 +397,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                         panic_info = ?panic_info,
                         "Snapshot creation panicked - continuing with WAL operations"
                     );
-                    locks.wal_state().wal_files_since_snapshot = original_wal_files_since_snapshot.saturating_sub(1);
+                    self.wal_files_since_snapshot = original_wal_files_since_snapshot.saturating_sub(1);
                 }
             }
         }
@@ -433,13 +417,13 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
     
     /// Write an entry to the current WAL file
-    async fn write_entry(&self, serialized: &[u8], locks: &mut AppStateLocks<'_>) -> Result<()> {
-        if let Some(ref mut wal_file) = locks.wal_state().current_wal_file {
+    async fn write_entry(&mut self, serialized: &[u8]) -> Result<()> {
+        if let Some(ref mut wal_file) = self.current_wal_file {
             let len_bytes = (serialized.len() as u32).to_le_bytes();
             wal_file.write_all(&len_bytes).await?;
             wal_file.write_all(serialized).await?;
             wal_file.flush().await?;
-            locks.wal_state().current_wal_size += 4 + serialized.len();
+            self.current_wal_size += 4 + serialized.len();
         }
         Ok(())
     }
@@ -683,29 +667,17 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
             },
         }
     }
-    
-    pub fn with_config(file_manager: F, max_files: usize) -> Self {
-        Self {
-            file_manager,
-            snapshot_config: FileConfig {
-                prefix: "snapshot_".to_string(),
-                suffix: ".bin".to_string(),
-                max_files,
-            },
-        }
-    }
 }
 
 #[async_trait]
 impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
     /// Save a snapshot to disk and return the snapshot counter
     #[instrument(skip(self, snapshot, locks))]
-    async fn save(&self, snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64> {
+    async fn save(&mut self, snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64> {
         let snapshot_dir = locks.core_state().get_snapshots_dir();
         create_dir_all(&snapshot_dir).await?;
         
-        let current_snapshot_counter = locks.wal_state().snapshot_file_counter;
-        locks.wal_state().snapshot_file_counter += 1;
+        let current_snapshot_counter = self.file_manager.get_next_counter(&snapshot_dir, &self.snapshot_config).await?;
 
         let snapshot_filename = format!("snapshot_{:010}.bin", current_snapshot_counter);
         let snapshot_path = snapshot_dir.join(&snapshot_filename);
@@ -788,10 +760,10 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
     }
     
     /// Initialize snapshot counter from existing files
-    async fn initialize_counter(&self, locks: &mut AppStateLocks<'_>) -> Result<()> {
+    async fn initialize_counter(&mut self, locks: &mut AppStateLocks<'_>) -> Result<()> {
         let snapshot_dir = locks.core_state().get_snapshots_dir();
         let next_snapshot_counter = self.file_manager.get_next_counter(&snapshot_dir, &self.snapshot_config).await?;
-        locks.wal_state().snapshot_file_counter = next_snapshot_counter;
+        // The counter is now managed by the file manager when needed
         info!(
             snapshot_dir = %snapshot_dir.display(),
             next_counter = next_snapshot_counter,

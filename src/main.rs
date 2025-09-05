@@ -543,7 +543,6 @@ async fn handle_outbound_peer_connection(peer_addr: &str, app_state: Arc<AppStat
                     Ok(PeerMessage::FullSyncResponse { snapshot }) => {
                         info!("Received FullSyncResponse via outbound connection, applying snapshot");
                         let mut locks = app_state.acquire_locks(LockRequest {
-                            wal_state: true,
                             core_state: true,
                             permission_cache: true,
                             store: true,
@@ -1514,7 +1513,6 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
         match requests {
             Some(mut requests) => {     
                 let mut locks = app_state.acquire_locks(LockRequest {
-                    wal_state: true,
                     core_state: true,
                     store: true,
                     connections: true,
@@ -1596,14 +1594,14 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
 
 /// Write data to WAL with length prefix and handle file creation/rotation
 async fn write_request_to_wal(request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
-    let wal_manager = WalManager::new_default();
+    let mut wal_manager = WalManager::new_default();
     wal_manager.write_request(request, locks, direct_mode).await
 }
 
 /// Save a snapshot to disk and return the snapshot counter that was used
 #[instrument(skip(snapshot, locks))]
 async fn save_snapshot(snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64> {
-    let snapshot_manager = SnapshotManager::new_default();
+    let mut snapshot_manager = SnapshotManager::new_default();
     snapshot_manager.save(snapshot, locks).await
 }
 
@@ -1623,7 +1621,6 @@ async fn handle_misc_tasks(app_state: Arc<AppState>) -> Result<()> {
         interval.tick().await;
 
         let mut locks = app_state.acquire_locks(LockRequest {
-            wal_state: true,
             core_state: true,
             store: true,
             permission_cache: true,
@@ -2034,10 +2031,9 @@ async fn main() -> Result<()> {
     {
         let mut locks = app_state.acquire_locks(LockRequest {
             core_state: true,
-            wal_state: true,
             ..Default::default()
         }).await;
-        let wal_manager = WalManager::new_default();
+        let mut wal_manager = WalManager::new_default();
         wal_manager.initialize_counter(&mut locks).await?;
     }
 
@@ -2046,11 +2042,10 @@ async fn main() -> Result<()> {
         let mut locks = app_state.acquire_locks(LockRequest {
             core_state: true,
             store: true,
-            wal_state: true,
             ..Default::default()
         }).await;
 
-        let snapshot_manager = SnapshotManager::new_default();
+        let mut snapshot_manager = SnapshotManager::new_default();
         if let Some((snapshot, snapshot_counter)) = snapshot_manager.load_latest(&mut locks).await? {
             info!(
                 snapshot_counter = snapshot_counter,
@@ -2220,7 +2215,6 @@ async fn main() -> Result<()> {
     }
 
     let mut locks = app_state.acquire_locks(LockRequest {
-        wal_state: true,
         core_state: true,
         store: true,
         ..Default::default()
