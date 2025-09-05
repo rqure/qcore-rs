@@ -1200,6 +1200,9 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
         let mut locks = app_state.acquire_locks(LockRequest {
             store: true,
             connections: true,
+            permission_cache: true,
+            core_state: true,
+            cel_executor: true,
             ..Default::default()
         }).await;
         process_store_message(auth_message, Some(client_addr.to_string()), &mut locks).await
@@ -1332,6 +1335,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                                 store: true,
                                 connections: true,
                                 permission_cache: true,
+                                core_state: true,
                                 cel_executor: true,
                                 ..Default::default()
                             }).await;
