@@ -20,7 +20,7 @@ use std::time::Duration;
 use time;
 use clap::Parser;
 
-use crate::persistance::{SnapshotManager, WalManager, SnapshotTrait, WalTrait, WalConfig, SnapshotConfig};
+use crate::persistance::{SnapshotService, WalService, SnapshotTrait, WalTrait, WalConfig, SnapshotConfig};
 use crate::states::{AppState, AppStateLocks, AvailabilityState, Config, LockRequest, PeerInfo, PeerMessage};
 
 /// Handle a single peer WebSocket connection
@@ -1603,7 +1603,7 @@ async fn write_request_to_wal(request: &qlib_rs::Request, locks: &mut AppStateLo
         snapshots_dir: locks.core_state().get_snapshots_dir(),
         snapshot_max_files: locks.core_state().config.snapshot_max_files,
     };
-    let mut wal_manager = WalManager::new_default(wal_config);
+    let mut wal_manager = WalService::new_default(wal_config);
     wal_manager.write_request(request, locks, direct_mode).await
 }
 
@@ -1614,7 +1614,7 @@ async fn save_snapshot(snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'
         snapshots_dir: locks.core_state().get_snapshots_dir(),
         max_files: locks.core_state().config.snapshot_max_files,
     };
-    let mut snapshot_manager = SnapshotManager::new_default(snapshot_config);
+    let mut snapshot_manager = SnapshotService::new_default(snapshot_config);
     snapshot_manager.save(snapshot, locks).await
 }
 
@@ -1629,7 +1629,7 @@ async fn replay_wal_files(locks: &mut AppStateLocks<'_>) -> Result<()> {
         snapshots_dir: locks.core_state().get_snapshots_dir(),
         snapshot_max_files: locks.core_state().config.snapshot_max_files,
     };
-    let wal_manager = WalManager::new_default(wal_config);
+    let wal_manager = WalService::new_default(wal_config);
     wal_manager.replay(locks).await
 }
 
@@ -2064,7 +2064,7 @@ async fn main() -> Result<()> {
             snapshots_dir: locks.core_state().get_snapshots_dir(),
             snapshot_max_files: locks.core_state().config.snapshot_max_files,
         };
-        let mut wal_manager = WalManager::new_default(wal_config);
+        let mut wal_manager = WalService::new_default(wal_config);
         wal_manager.initialize_counter(&mut locks).await?;
     }
 
@@ -2080,7 +2080,7 @@ async fn main() -> Result<()> {
             snapshots_dir: locks.core_state().get_snapshots_dir(),
             max_files: locks.core_state().config.snapshot_max_files,
         };
-        let mut snapshot_manager = SnapshotManager::new_default(snapshot_config);
+        let mut snapshot_manager = SnapshotService::new_default(snapshot_config);
         if let Some((snapshot, snapshot_counter)) = snapshot_manager.load_latest(&mut locks).await? {
             info!(
                 snapshot_counter = snapshot_counter,
