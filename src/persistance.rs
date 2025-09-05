@@ -10,11 +10,11 @@ use async_trait::async_trait;
 use crate::states::AppStateLocks;
 
 /// Type aliases for convenience
-pub type DefaultWalManager = WalManager<FileManager>;
-pub type DefaultSnapshotManager = SnapshotManager<FileManager>;
+pub type WalManager = WalManagerTrait<FileManager>;
+pub type SnapshotManager = SnapshotManagerTrait<FileManager>;
 
 /// Convenience constructor functions
-impl DefaultWalManager {
+impl WalManager {
     /// Create a new WAL manager with default file manager
     pub fn new_default() -> Self {
         Self::new(FileManager)
@@ -26,7 +26,7 @@ impl DefaultWalManager {
     }
 }
 
-impl DefaultSnapshotManager {
+impl SnapshotManager {
     /// Create a new snapshot manager with default file manager
     pub fn new_default() -> Self {
         Self::new(FileManager)
@@ -67,7 +67,7 @@ pub trait FileManagerTrait: Send + Sync {
 }
 
 /// Entry reader for parsing serialized data
-pub trait EntryReader<T> {
+pub trait EntryReaderTrait<T> {
     type Error;
     
     /// Read the next entry from the data source
@@ -179,7 +179,7 @@ impl WalEntryReader {
     }
 }
 
-impl EntryReader<Vec<u8>> for WalEntryReader {
+impl EntryReaderTrait<Vec<u8>> for WalEntryReader {
     type Error = anyhow::Error;
     
     fn next_entry(&mut self) -> Option<Result<(Vec<u8>, usize), Self::Error>> {
@@ -230,12 +230,12 @@ impl Iterator for WalEntryReader {
 }
 
 /// WAL manager handles WAL file operations
-pub struct WalManager<F: FileManagerTrait> {
+pub struct WalManagerTrait<F: FileManagerTrait> {
     file_manager: F,
     wal_config: FileConfig,
 }
 
-impl<F: FileManagerTrait> WalManager<F> {
+impl<F: FileManagerTrait> WalManagerTrait<F> {
     pub fn new(file_manager: F) -> Self {
         Self {
             file_manager,
@@ -260,7 +260,7 @@ impl<F: FileManagerTrait> WalManager<F> {
 }
 
 #[async_trait]
-impl<F: FileManagerTrait> WalTrait for WalManager<F> {
+impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     /// Write a request to WAL with file rotation and snapshot handling
     async fn write_request(&self, request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
         let serialized = serde_json::to_vec(request)?;
@@ -334,7 +334,7 @@ impl<F: FileManagerTrait> WalTrait for WalManager<F> {
     }
 }
 
-impl<F: FileManagerTrait> WalManager<F> {
+impl<F: FileManagerTrait> WalManagerTrait<F> {
     async fn rotate_file(&self, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
         let wal_dir = locks.core_state().get_wal_dir();
         create_dir_all(&wal_dir).await?;
@@ -385,7 +385,7 @@ impl<F: FileManagerTrait> WalManager<F> {
             
             match snapshot_result {
                 Ok(snapshot) => {
-                    let snapshot_manager = SnapshotManager::new(FileManager);
+                    let snapshot_manager = SnapshotManagerTrait::new(FileManager);
                     match snapshot_manager.save(&snapshot, locks).await {
                         Ok(snapshot_counter) => {
                             locks.wal_state().wal_files_since_snapshot = 0;
@@ -667,12 +667,12 @@ impl<F: FileManagerTrait> WalManager<F> {
 }
 
 /// Snapshot manager handles snapshot operations
-pub struct SnapshotManager<F: FileManagerTrait> {
+pub struct SnapshotManagerTrait<F: FileManagerTrait> {
     file_manager: F,
     snapshot_config: FileConfig,
 }
 
-impl<F: FileManagerTrait> SnapshotManager<F> {
+impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
     pub fn new(file_manager: F) -> Self {
         Self {
             file_manager,
@@ -697,7 +697,7 @@ impl<F: FileManagerTrait> SnapshotManager<F> {
 }
 
 #[async_trait]
-impl<F: FileManagerTrait> SnapshotTrait for SnapshotManager<F> {
+impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
     /// Save a snapshot to disk and return the snapshot counter
     #[instrument(skip(self, snapshot, locks))]
     async fn save(&self, snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64> {
@@ -801,7 +801,7 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManager<F> {
     }
 }
 
-impl<F: FileManagerTrait> SnapshotManager<F> {
+impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
     
     /// Try to load a single snapshot file
     async fn try_load_snapshot(&self, snapshot_path: &PathBuf) -> Result<Option<qlib_rs::Snapshot>> {

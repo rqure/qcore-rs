@@ -1,3 +1,9 @@
+mod persistance;
+mod states;
+mod clients;
+mod peers;
+mod misc;
+
 use qlib_rs::{et, ft, notification_channel, now, schoice, sread, sref, swrite, AuthConfig, AuthenticationResult, Cache, PushCondition, StoreMessage, StoreTrait};
 use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
 use tokio::signal;
@@ -14,11 +20,8 @@ use std::time::Duration;
 use time;
 use clap::Parser;
 
-use crate::persistance::{DefaultSnapshotManager, DefaultWalManager, SnapshotTrait, WalTrait};
+use crate::persistance::{SnapshotManager, WalManager, SnapshotTrait, WalTrait};
 use crate::states::{AppState, AppStateLocks, AvailabilityState, Config, LockRequest, PeerInfo, PeerMessage};
-
-mod persistance;
-mod states;
 
 /// Handle a single peer WebSocket connection
 #[instrument(skip(stream, app_state), fields(peer_addr = %peer_addr))]
@@ -1591,24 +1594,22 @@ async fn consume_write_channel(app_state: Arc<AppState>) -> Result<()> {
     }
 }
 
-/// Legacy wrapper functions to maintain compatibility during transition
-
 /// Write data to WAL with length prefix and handle file creation/rotation
 async fn write_request_to_wal(request: &qlib_rs::Request, locks: &mut AppStateLocks<'_>, direct_mode: bool) -> Result<()> {
-    let wal_manager = DefaultWalManager::new_default();
+    let wal_manager = WalManager::new_default();
     wal_manager.write_request(request, locks, direct_mode).await
 }
 
 /// Save a snapshot to disk and return the snapshot counter that was used
 #[instrument(skip(snapshot, locks))]
 async fn save_snapshot(snapshot: &qlib_rs::Snapshot, locks: &mut AppStateLocks<'_>) -> Result<u64> {
-    let snapshot_manager = DefaultSnapshotManager::new_default();
+    let snapshot_manager = SnapshotManager::new_default();
     snapshot_manager.save(snapshot, locks).await
 }
 
 /// Replay WAL files to restore store state
 async fn replay_wal_files(locks: &mut AppStateLocks<'_>) -> Result<()> {
-    let wal_manager = DefaultWalManager::new_default();
+    let wal_manager = WalManager::new_default();
     wal_manager.replay(locks).await
 }
 
@@ -2036,7 +2037,7 @@ async fn main() -> Result<()> {
             wal_state: true,
             ..Default::default()
         }).await;
-        let wal_manager = DefaultWalManager::new_default();
+        let wal_manager = WalManager::new_default();
         wal_manager.initialize_counter(&mut locks).await?;
     }
 
@@ -2049,7 +2050,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         }).await;
 
-        let snapshot_manager = DefaultSnapshotManager::new_default();
+        let snapshot_manager = SnapshotManager::new_default();
         if let Some((snapshot, snapshot_counter)) = snapshot_manager.load_latest(&mut locks).await? {
             info!(
                 snapshot_counter = snapshot_counter,
