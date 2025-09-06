@@ -167,32 +167,66 @@ impl StoreHandle {
         response_rx.await.unwrap_or(false)
     }
 
-    pub async fn perform(&self, requests: Vec<Request>) -> Result<Vec<Request>> {
+    pub async fn perform(&self, requests: &mut Vec<Request>) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender.send(StoreRequest::Perform {
-            requests,
+            requests: requests.clone(),
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        match response_rx.await {
+            Ok(result) => {
+                match result {
+                    Ok(response) => {
+                        *requests = response;
+                        Ok(())
+                    },
+                    Err(e) => Err(anyhow::anyhow!("Store service error: {}", e)),
+                }
+            },
+            Err(_) => Err(anyhow::anyhow!("Store service response channel closed")),
+        }
     }
 
-    pub async fn perform_mut(&self, requests: Vec<Request>) -> Result<Vec<Request>> {
+    pub async fn perform_mut(&self, requests: &mut Vec<Request>) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender.send(StoreRequest::PerformMut {
-            requests,
+            requests: requests.clone(),
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        match response_rx.await {
+            Ok(result) => {
+                match result {
+                    Ok(response) => {
+                        *requests = response;
+                        Ok(())
+                    },
+                    Err(e) => Err(anyhow::anyhow!("Store service error: {}", e)),
+                }
+            },
+            Err(_) => Err(anyhow::anyhow!("Store service response channel closed")),
+        }
     }
 
-    pub async fn perform_mut_with_auth(&self, requests: Vec<Request>, client_id: Option<EntityId>) -> Result<Vec<Request>> {
+    pub async fn perform_mut_with_auth(&self, requests: &mut Vec<Request>, client_id: Option<EntityId>) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender.send(StoreRequest::PerformMutWithAuth {
-            requests,
+            requests: requests.clone(),
             client_id,
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+
+        match response_rx.await {
+            Ok(result) => {
+                match result {
+                    Ok(response) => {
+                        *requests = response;
+                        Ok(())
+                    },
+                    Err(e) => Err(anyhow::anyhow!("Store service error: {}", e)),
+                }
+            },
+            Err(_) => Err(anyhow::anyhow!("Store service response channel closed")),
+        }
     }
 
     pub async fn perform_map(&self, requests: Vec<Request>) -> Result<HashMap<FieldType, Request>> {
@@ -258,7 +292,7 @@ impl StoreHandle {
     }
 
     // Inner store access methods
-    pub async fn inner_disable_notifications(&self) {
+    pub async fn disable_notifications(&self) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(StoreRequest::InnerDisableNotifications {
             response: response_tx,
@@ -267,7 +301,7 @@ impl StoreHandle {
         }
     }
 
-    pub async fn inner_enable_notifications(&self) {
+    pub async fn enable_notifications(&self) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(StoreRequest::InnerEnableNotifications {
             response: response_tx,
@@ -286,7 +320,7 @@ impl StoreHandle {
         }
     }
 
-    pub async fn inner_take_snapshot(&self) -> Option<Snapshot> {
+    pub async fn take_snapshot(&self) -> Option<Snapshot> {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(StoreRequest::InnerTakeSnapshot {
             response: response_tx,

@@ -1916,45 +1916,6 @@ async fn handle_heartbeat_writing(app_state: Arc<AppState>) -> Result<()> {
     }
 }
 
-async fn reinit_caches(locks: &mut AppStateLocks<'_>) -> Result<()> {
-    let (configs, sender) = locks.permission_cache().as_ref().map(|cache| cache.get_config_sender()).unwrap_or_default();
-    if let Some(sender) = sender {
-        for config in configs {
-            locks.store().unregister_notification(&config, &sender).await;
-        }
-    }
-
-    **locks.permission_cache() = Some(Cache::new(
-        &mut **locks.store(),
-        et::permission(),
-        vec![ft::resource_type(), ft::resource_field()],
-        vec![ft::scope(), ft::condition()]
-    ).await?);
-    
-    let machine = locks.core_state().config.machine.clone();
-
-    {
-        let store = locks.store();
-
-        let me_as_candidate = {
-
-            let mut candidates = store.find_entities(
-                &et::candidate(), 
-                Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))).await?;
-
-            candidates.pop()
-        };
-
-        if let Some(candidate_id) = &me_as_candidate {
-            store.inner_mut().default_writer_id = Some(candidate_id.clone());
-        } else {
-            store.inner_mut().default_writer_id = None;
-        }
-    }
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
@@ -1984,11 +1945,7 @@ async fn main() -> Result<()> {
     );
 
     // Create the store handle
-    let store_handle = StoreService::spawn(
-        Arc::new(Snowflake::new()),
-        Arc::new(Mutex::new(None)), // permission_cache will be initialized later
-        Arc::new(Mutex::new(CelExecutor::new()))
-    );
+    let store_handle = StoreService::spawn();
 
     // Create shared application state
     let app_state = Arc::new(AppState::new(config, store_handle)?);

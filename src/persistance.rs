@@ -1,4 +1,4 @@
-use qlib_rs::{now, StoreTrait};
+use qlib_rs::{now};
 use tracing::{info, warn, error, debug, instrument};
 use anyhow::Result;
 use std::vec;
@@ -7,6 +7,8 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::sync::{mpsc, oneshot};
 use std::path::PathBuf;
 use async_trait::async_trait;
+
+use crate::store::StoreHandle;
 
 /// Configuration for WAL manager operations
 #[derive(Debug, Clone)]
@@ -38,9 +40,6 @@ pub enum WalRequest {
     WriteRequest {
         request: qlib_rs::Request,
         response: oneshot::Sender<Result<()>>,
-    },
-    Replay {
-        response: oneshot::Sender<Result<()>>,
     }
 }
 
@@ -66,19 +65,10 @@ pub struct SnapshotHandle {
 }
 
 impl WalHandle {
-    pub async fn write_request(&self, request: qlib_rs::Request, direct_mode: bool) -> Result<()> {
+    pub async fn write_request(&self, request: qlib_rs::Request) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender.send(WalRequest::WriteRequest {
             request,
-            direct_mode,
-            response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("WAL manager task has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("WAL manager task response channel closed"))?
-    }
-
-    pub async fn replay(&self) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(WalRequest::Replay {
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("WAL manager task has stopped"))?;
         response_rx.await.map_err(|_| anyhow::anyhow!("WAL manager task response channel closed"))?
@@ -100,19 +90,17 @@ pub type WalService = WalManagerTrait<FileManager>;
 pub type SnapshotService = SnapshotManagerTrait<FileManager>;
 
 impl WalService {
-    pub fn spawn(config: WalConfig, snapshot_handle: SnapshotHandle) -> WalHandle {
+    pub fn spawn(config: WalConfig, snapshot_handle: SnapshotHandle, store_handle: StoreHandle) -> WalHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut service = WalService::new(FileManager, config, Some(snapshot_handle));
 
+            service.replay(&store_handle).await;
+
             while let Some(request) = receiver.recv().await {
                 match request {
                     WalRequest::WriteRequest { request, response } => {
-                        let result = service.write_request(&request).await;
-                        let _ = response.send(result);
-                    }
-                    WalRequest::Replay { response } => {
-                        let result = service.replay().await;
+                        let result = service.write_request(&request, &store_handle).await;
                         let _ = response.send(result);
                     }
                 }
@@ -184,11 +172,11 @@ pub trait EntryReaderTrait<T> {
 #[async_trait]
 pub trait WalTrait {
     /// Write a request to WAL
-    async fn write_request(&mut self, request: &qlib_rs::Request) -> Result<()>;
-    
+    async fn write_request(&mut self, request: &qlib_rs::Request, store_handle: &StoreHandle) -> Result<()>;
+
     /// Replay WAL files to restore store state
-    async fn replay(&self) -> Result<()>;
-    
+    async fn replay(&self, store_handle: &StoreHandle) -> Result<()>;
+
     /// Initialize WAL counter from existing files
     async fn initialize_counter(&mut self) -> Result<()>;
 }
@@ -371,7 +359,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
 #[async_trait]
 impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     /// Write a request to WAL with file rotation and snapshot handling
-    async fn write_request(&mut self, request: &qlib_rs::Request) -> Result<()> {
+    async fn write_request(&mut self, request: &qlib_rs::Request, store_handle: &StoreHandle) -> Result<()> {
         let serialized = serde_json::to_vec(request)?;
         let serialized_len = serialized.len();
         
@@ -380,7 +368,7 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
            (!self.current_wal_size + serialized_len > self.config.max_file_size);
 
         if should_create_new_file {
-            self.rotate_file().await?;
+            self.rotate_file(store_handle).await?;
         }
         
         // Write the actual data
@@ -390,7 +378,7 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     }
     
     /// Replay WAL files to restore store state
-    async fn replay(&self) -> Result<()> {
+    async fn replay(&self, store_handle: &StoreHandle) -> Result<()> {
         let wal_files = self.file_manager.scan_files(&self.config.wal_dir, &self.wal_config).await?;
         
         if wal_files.is_empty() {
@@ -400,20 +388,13 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
         
         let most_recent_snapshot = self.find_latest_snapshot_marker(&wal_files).await?;
         
-        locks.store().inner_mut().disable_notifications();
+        store_handle.disable_notifications().await;
         info!("Notifications disabled for WAL replay");
         
         // Defensive: Comprehensive error handling for WAL replay with proper cleanup
-        let replay_result = self.perform_replay(&wal_files, most_recent_snapshot).await;
-        
-        // Defensive: Always re-enable notifications regardless of replay outcome
-        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            locks.store().inner_mut().enable_notifications();
-        })) {
-            error!(panic_info = ?e, "Failed to re-enable notifications after WAL replay");
-            return Err(anyhow::anyhow!("Critical failure: cannot re-enable notifications"));
-        }
-        
+        let replay_result = self.perform_replay(&wal_files, most_recent_snapshot, store_handle).await;
+
+        store_handle.enable_notifications().await;
         info!("Notifications re-enabled after WAL replay");
         
         match replay_result {
@@ -442,7 +423,7 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
 }
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {
-    async fn rotate_file(&mut self) -> Result<()> {
+    async fn rotate_file(&mut self, store_handle: &StoreHandle) -> Result<()> {
         create_dir_all(&self.config.wal_dir).await?;
         
         let wal_file_counter = self.file_manager.get_next_counter(&self.config.wal_dir, &self.wal_config).await?;
@@ -465,7 +446,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
         self.current_wal_size = 0;
         
         self.wal_files_since_snapshot += 1;
-        self.handle_snapshot_if_needed().await?;
+        self.handle_snapshot_if_needed(store_handle).await?;
 
         if let Err(e) = self.file_manager.cleanup_old_files(&self.config.wal_dir, &self.wal_config).await {
             error!(error = %e, "Failed to clean up old WAL files");
@@ -475,38 +456,42 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
     
     /// Handle snapshot creation if the interval is reached
-    async fn handle_snapshot_if_needed(&mut self) -> Result<()> {
+    async fn handle_snapshot_if_needed(&mut self, store_handle: &StoreHandle) -> Result<()> {
         if self.wal_files_since_snapshot >= self.config.snapshot_wal_interval {
             info!(wal_files_count = self.wal_files_since_snapshot, "Taking snapshot after WAL file rollovers");
             
             // Store current state for potential rollback
             let original_wal_files_since_snapshot = self.wal_files_since_snapshot;
-            let snapshot = locks.store().inner().take_snapshot();
+            match store_handle.take_snapshot().await {
+                Some(snapshot) => {
+                    if let Some(snapshot_handle) = &self.snapshot_handle {
+                        match snapshot_handle.save(snapshot).await {
+                            Ok(snapshot_counter) => {
+                                self.wal_files_since_snapshot = 0;
+                                info!("Snapshot saved successfully after WAL rollover");
 
-            // Use snapshot handle to save snapshot
-            if let Some(snapshot_handle) = &self.snapshot_handle {
-                match snapshot_handle.save(snapshot).await {
-                    Ok(snapshot_counter) => {
-                        self.wal_files_since_snapshot = 0;
-                        info!("Snapshot saved successfully after WAL rollover");
+                                let snapshot_request = qlib_rs::Request::Snapshot {
+                                    snapshot_counter,
+                                    timestamp: Some(now()),
+                                    originator: Some(self.config.machine_id.clone()),
+                                };
 
-                        let snapshot_request = qlib_rs::Request::Snapshot {
-                            snapshot_counter,
-                            timestamp: Some(now()),
-                            originator: Some(self.config.machine_id.clone()),
-                        };
-                        
-                        if let Err(e) = self.write_request(&snapshot_request).await {
-                            error!(error = %e, "Failed to write snapshot marker to WAL");
+                                if let Err(e) = self.write_request(&snapshot_request, store_handle).await {
+                                    error!(error = %e, "Failed to write snapshot marker to WAL");
+                                }
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to save snapshot after WAL rollover");
+                                self.wal_files_since_snapshot = original_wal_files_since_snapshot;
+                            }
                         }
+                    } else {
+                        warn!("No snapshot handle available, skipping snapshot creation");
                     }
-                    Err(e) => {
-                        error!(error = %e, "Failed to save snapshot after WAL rollover");
-                        self.wal_files_since_snapshot = original_wal_files_since_snapshot;
-                    }
+                },
+                None => {
+                    warn!("No snapshot generated, skipping snapshot persistence");
                 }
-            } else {
-                warn!("No snapshot handle available, skipping snapshot creation");
             }
         }
         
@@ -581,7 +566,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
     
     /// Perform the actual replay operation
-    async fn perform_replay(&self, wal_files: &[FileInfo], most_recent_snapshot: Option<(PathBuf, u64, usize)>) -> Result<()> {
+    async fn perform_replay(&self, wal_files: &[FileInfo], most_recent_snapshot: Option<(PathBuf, u64, usize)>, store_handle: &StoreHandle) -> Result<()> {
         match most_recent_snapshot {
             Some((snapshot_wal_file, snapshot_counter, snapshot_offset)) => {
                 info!(
@@ -592,13 +577,13 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 );
                 
                 // Replay the partial WAL file from the snapshot offset
-                self.replay_file_from_offset(&snapshot_wal_file, snapshot_offset).await?;
-                
+                self.replay_file_from_offset(&snapshot_wal_file, snapshot_offset, store_handle).await?;
+
                 // Replay all subsequent WAL files completely
                 for file_info in wal_files {
                     if file_info.counter > snapshot_counter {
                         info!(wal_file = %file_info.path.display(), wal_counter = file_info.counter, "Replaying complete WAL file");
-                        if let Err(e) = self.replay_file_from_offset(&file_info.path, 0).await {
+                        if let Err(e) = self.replay_file_from_offset(&file_info.path, 0, store_handle).await {
                             error!(wal_file = %file_info.path.display(), error = %e, "Failed to replay WAL file");
                         }
                     }
@@ -609,7 +594,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 
                 for file_info in wal_files {
                     info!(wal_file = %file_info.path.display(), wal_counter = file_info.counter, "Replaying WAL file");
-                    if let Err(e) = self.replay_file_from_offset(&file_info.path, 0).await {
+                    if let Err(e) = self.replay_file_from_offset(&file_info.path, 0, store_handle).await {
                         error!(wal_file = %file_info.path.display(), error = %e, "Failed to replay WAL file");
                     }
                 }
@@ -620,7 +605,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
     
     /// Replay a single WAL file from a specific offset
-    async fn replay_file_from_offset(&self, wal_path: &PathBuf, start_offset: usize) -> Result<()> {
+    async fn replay_file_from_offset(&self, wal_path: &PathBuf, start_offset: usize, store_handle: &StoreHandle) -> Result<()> {
         let mut file = File::open(wal_path).await?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).await?;
@@ -649,7 +634,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
         for entry_result in entry_reader {
             match entry_result {
                 Ok((entry_data, _)) => {
-                    match self.apply_wal_entry(&entry_data).await {
+                    match self.apply_wal_entry(&entry_data, store_handle).await {
                         Ok(true) => requests_processed += 1,
                         Ok(false) => {}, // Processed but not counted (e.g., snapshot markers)
                         Err(e) => {
@@ -724,7 +709,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
     
     /// Apply a single WAL entry during replay
-    async fn apply_wal_entry(&self, entry_data: &[u8]) -> Result<bool> {
+    async fn apply_wal_entry(&self, entry_data: &[u8], store_handle: &StoreHandle) -> Result<bool> {
         match serde_json::from_slice::<qlib_rs::Request>(entry_data) {
             Ok(request) => {
                 // Skip snapshot requests during replay (they are just markers)
@@ -734,7 +719,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 }
 
                 let mut requests = vec![request];
-                if let Err(e) = locks.store().perform_mut(&mut requests).await {
+                if let Err(e) = store_handle.perform_mut(&mut requests).await {
                     return Err(anyhow::anyhow!("Failed to apply request during WAL replay: {}", e));
                 }
                 
