@@ -1962,18 +1962,14 @@ async fn main() -> Result<()> {
             max_files: locks.core_state().config.wal_max_files,
             snapshot_wal_interval: locks.core_state().config.snapshot_wal_interval,
             machine_id: locks.core_state().config.machine.clone(),
-            snapshots_dir: locks.core_state().get_snapshots_dir(),
-            snapshot_max_files: locks.core_state().config.snapshot_max_files,
         };
-        let mut wal_manager = WalService::new_default(wal_config);
-        wal_manager.initialize_counter(&mut locks).await?;
+        let wal_handle = WalService::spawn(wal_config, snapshot_handle, store_handle);
     }
 
     // Load the latest snapshot if available
     {
         let mut locks = app_state.acquire_locks(LockRequest {
             core_state: true,
-            store: true,
             ..Default::default()
         }).await;
 
@@ -2003,36 +1999,6 @@ async fn main() -> Result<()> {
             // Initialize the snapshot file counter
             snapshot_manager.initialize_counter(&mut locks).await?;
         }
-    }
-
-    // Replay WAL files to bring the store up to date
-    // The replay function will automatically find the most recent snapshot marker
-    // in the WAL files and start replaying from that point
-    info!("Replaying WAL files");
-    {
-        let mut locks = app_state.acquire_locks(LockRequest {
-            store: true,
-            core_state: true,
-            ..Default::default()
-        }).await;
-        if let Err(e) = replay_wal_files(&mut locks).await {
-            error!(
-                error = %e,
-                "Failed to replay WAL files"
-            );
-            return Err(e);
-        }
-    }
-
-    // Reinitialize caches after WAL replay
-    {
-        let mut locks = app_state.acquire_locks(LockRequest {
-            store: true,
-            core_state: true,
-            permission_cache: true,
-            ..Default::default()
-        }).await;
-        reinit_caches(&mut locks).await?;
     }
 
     // Start the write channel consumer task
