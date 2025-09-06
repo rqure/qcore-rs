@@ -1,5 +1,6 @@
 use crate::states::{AppState, AppStateLocks, AvailabilityState, LockRequest, PeerInfo, PeerMessage};
 use crate::persistance::{save_snapshot, write_request_to_wal};
+use crate::reinit_caches;
 use qlib_rs::{now, StoreTrait};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
@@ -638,16 +639,12 @@ impl PeerService {
                             );
                         }
 
-                        // Note: reinit_caches function not found, commenting out for now
-                        // TODO: Implement or find the reinit_caches function
-                        // match reinit_caches(locks).await {
-                        //     Ok(()) => {
-                        //         info!("Caches reinitialized successfully");
-                        //     }
-                        //     Err(e) => {
-                        //         error!(error = %e, "Failed to reinitialize caches");
-                        //     }
-                        // }
+                        // Reinitialize caches after full sync
+                        if let Err(e) = reinit_caches(locks).await {
+                            error!(error = %e, "Failed to reinitialize caches");
+                        } else {
+                            info!("Caches reinitialized successfully");
+                        }
                     }
                     Err(e) => {
                         error!(error = %e, "Failed to save snapshot during full sync");
