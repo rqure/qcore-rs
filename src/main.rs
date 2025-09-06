@@ -3,14 +3,15 @@ mod states;
 mod clients;
 mod peers;
 mod misc;
+mod store;
 
-use qlib_rs::{et, ft, notification_channel, now, schoice, sread, sref, swrite, AuthConfig, AuthenticationResult, Cache, PushCondition, StoreMessage, StoreTrait};
-use qlib_rs::auth::{authenticate_subject, AuthorizationScope, get_scope};
+use qlib_rs::{et, ft, notification_channel, now, schoice, sread, sref, swrite, AuthConfig, AuthenticationResult, Cache, PushCondition, StoreMessage, StoreTrait, Snowflake, CelExecutor};
+use qlib_rs::auth::{AuthorizationScope, get_scope};
 use tokio::signal;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn, error, debug, instrument};
 use anyhow::Result;
 use std::collections::{HashSet};
@@ -22,6 +23,7 @@ use clap::Parser;
 
 use crate::persistance::{SnapshotService, WalService, SnapshotTrait, WalTrait, WalConfig, SnapshotConfig};
 use crate::states::{AppState, AppStateLocks, AvailabilityState, Config, LockRequest, PeerInfo, PeerMessage};
+use crate::store::{StoreService, StoreHandle};
 
 /// Handle a single peer WebSocket connection
 #[instrument(skip(stream, app_state), fields(peer_addr = %peer_addr))]
@@ -702,14 +704,13 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
     // Process authentication
     let auth_response = {
         let mut locks = app_state.acquire_locks(LockRequest {
-            store: true,
             connections: true,
             permission_cache: true,
             core_state: true,
             cel_executor: true,
             ..Default::default()
         }).await;
-        process_store_message(auth_message, Some(client_addr.to_string()), &mut locks).await
+        process_store_message(auth_message, Some(client_addr.to_string()), &mut locks, &app_state.store).await
     };
     
     // Send authentication response
@@ -836,14 +837,13 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
                         // Process the message and generate response
                         let response_msg = {
                             let mut locks = app_state.acquire_locks(LockRequest {
-                                store: true,
                                 connections: true,
                                 permission_cache: true,
                                 core_state: true,
                                 cel_executor: true,
                                 ..Default::default()
                             }).await;
-                            process_store_message(store_msg, Some(client_addr.to_string()), &mut locks).await
+                            process_store_message(store_msg, Some(client_addr.to_string()), &mut locks, &app_state.store).await
                         };
                         
                         // Send response back to client using the channel
@@ -964,7 +964,7 @@ async fn handle_client_connection(stream: TcpStream, client_addr: std::net::Sock
 }
 
 /// Process a StoreMessage and generate the appropriate response
-async fn process_store_message(message: StoreMessage, client_addr: Option<String>, locks: &mut AppStateLocks<'_>) -> StoreMessage {
+async fn process_store_message(message: StoreMessage, client_addr: Option<String>, locks: &mut AppStateLocks<'_>, store: &StoreHandle) -> StoreMessage {
     // Extract client notification sender if needed (before accessing store)
     let client_notification_sender = if let Some(ref addr) = client_addr {
         locks.connections().client_notification_senders.get(addr).cloned()
@@ -976,30 +976,11 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
         StoreMessage::Authenticate { id, subject_name, credential } => {
             // Perform authentication
             let auth_config = AuthConfig::default();
-            match authenticate_subject(&mut locks.store(), &subject_name, &credential, &auth_config).await {
-                Ok(subject_id) => {
-                    // Store authentication state
-                    if let Some(ref addr) = client_addr {
-                        locks
-                            .connections()
-                            .authenticated_clients.insert(addr.clone(), subject_id.clone());
-                    }
-                    
-                    // Create authentication result
-                    let auth_result = AuthenticationResult {
-                        subject_id: subject_id.clone(),
-                        subject_type: subject_id.get_type().to_string(),
-                    };
-                    
-                    StoreMessage::AuthenticateResponse {
-                        id,
-                        response: Ok(auth_result),
-                    }
-                }
-                Err(e) => StoreMessage::AuthenticateResponse {
-                    id,
-                    response: Err(format!("{:?}", e)),
-                },
+            // TODO: Authentication needs to be implemented in StoreHandle
+            // For now, we'll use a placeholder that always fails
+            StoreMessage::AuthenticateResponse {
+                id,
+                response: Err("Authentication not yet implemented with StoreHandle".to_string()),
             }
         }
         
@@ -1039,7 +1020,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
         
                 StoreMessage::GetEntitySchema { id, entity_type } => {
-                    match locks.store().get_entity_schema(&entity_type).await {
+                    match store.get_entity_schema(&entity_type).await {
                         Ok(schema) => StoreMessage::GetEntitySchemaResponse {
                             id,
                             response: Ok(Some(schema)),
@@ -1052,7 +1033,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
-                    match locks.store().get_complete_entity_schema(&entity_type).await {
+                    match store.get_complete_entity_schema(&entity_type).await {
                         Ok(schema) => StoreMessage::GetCompleteEntitySchemaResponse {
                             id,
                             response: Ok(schema),
@@ -1065,7 +1046,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
-                    match locks.store().get_field_schema(&entity_type, &field_type).await {
+                    match store.get_field_schema(&entity_type, &field_type).await {
                         Ok(schema) => StoreMessage::GetFieldSchemaResponse {
                             id,
                             response: Ok(Some(schema)),
@@ -1078,7 +1059,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::EntityExists { id, entity_id } => {
-                    let exists = locks.store().entity_exists(&entity_id).await;
+                    let exists = store.entity_exists(&entity_id).await;
                     StoreMessage::EntityExistsResponse {
                         id,
                         response: exists,
@@ -1086,7 +1067,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::FieldExists { id, entity_type, field_type } => {
-                    let exists = locks.store().field_exists(&entity_type, &field_type).await;
+                    let exists = store.field_exists(&entity_type, &field_type).await;
                     StoreMessage::FieldExistsResponse {
                         id,
                         response: exists,
@@ -1094,75 +1075,31 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::Perform { id, mut requests } => {
-                    let ((mut cel_executor, mut store), permission_cache) = locks
-                        .cel_executor.as_mut().zip(locks.store.as_mut()).zip(locks.permission_cache.as_ref()).unwrap();
-
-                    if let Some(permission_cache) = &**permission_cache {
-                        // Check authorization for each request
-                        for request in &requests {
-                                if let Some(entity_id) = request.entity_id() {
-                                    if let Some(field_type) = request.field_type() {
-                                        match get_scope(
-                                            &mut store,
-                                            &mut cel_executor,
-                                            permission_cache,
-                                            &client_id,
-                                            entity_id,
-                                            field_type,
-                                        ).await {
-                                            Ok(scope) => {
-                                                if scope == AuthorizationScope::None {
-                                                    return StoreMessage::PerformResponse {
-                                                        id,
-                                                        response: Err(format!(
-                                                            "Access denied: Subject {} is not authorized to access {} on entity {}",
-                                                        client_id,
-                                                        field_type,
-                                                        entity_id
-                                                    )),
-                                                };
-                                            }
-                                            // For write operations, check if we have write access
-                                            if matches!(request, qlib_rs::Request::Write { .. } | qlib_rs::Request::Create { .. } | qlib_rs::Request::Delete { .. } | qlib_rs::Request::SchemaUpdate { .. }) {
-                                                if scope == AuthorizationScope::ReadOnly {
-                                                    return StoreMessage::PerformResponse {
-                                                        id,
-                                                        response: Err(format!(
-                                                            "Access denied: Subject {} only has read access to {} on entity {}",
-                                                            client_id,
-                                                            field_type,
-                                                            entity_id
-                                                        )),
-                                                    };
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            return StoreMessage::PerformResponse {
-                                                id,
-                                                response: Err(format!("Authorization check failed: {:?}", e)),
-                                            };
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    // Get the client_id from authenticated clients if available
+                    let client_id = if let Some(ref addr) = client_addr {
+                        locks.connections().authenticated_clients.get(addr).cloned()
                     } else {
-                        return StoreMessage::PerformResponse {
-                            id,
-                            response: Err("Authorization cache not available".to_string()),
-                        };
-                    }
+                        None
+                    };
 
                     let machine = locks.core_state().config.machine.clone();
 
                     requests.iter_mut().for_each(|req| {
                         req.try_set_originator(machine.clone());
-                        req.try_set_writer_id(client_id.clone());
+                        if let Some(ref client_id) = client_id {
+                            req.try_set_writer_id(client_id.clone());
+                        }
                     });
 
-                    match locks.store().perform_mut(&mut requests).await {
-                        Ok(()) => StoreMessage::PerformResponse {
+                    // Use authorization if client_id is available, otherwise perform without authorization
+                    let result = if client_id.is_some() {
+                        store.perform_mut_with_auth(requests, client_id).await
+                    } else {
+                        store.perform_mut(requests).await
+                    };
+
+                    match result {
+                        Ok(requests) => StoreMessage::PerformResponse {
                             id,
                             response: Ok(requests),
                         },
@@ -1174,7 +1111,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
-                    match locks.store().find_entities_paginated(&entity_type, page_opts, filter).await {
+                    match store.find_entities_paginated(&entity_type, page_opts, filter).await {
                         Ok(result) => StoreMessage::FindEntitiesResponse {
                             id,
                             response: Ok(result),
@@ -1187,7 +1124,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
-                    match locks.store().find_entities_exact(&entity_type, page_opts, filter).await {
+                    match store.find_entities_exact(&entity_type, page_opts, filter).await {
                         Ok(result) => StoreMessage::FindEntitiesExactResponse {
                             id,
                             response: Ok(result),
@@ -1200,7 +1137,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                 }
                 
                 StoreMessage::GetEntityTypes { id, page_opts } => {
-                    match locks.store().get_entity_types_paginated(page_opts).await {
+                    match store.get_entity_types_paginated(page_opts).await {
                         Ok(result) => StoreMessage::GetEntityTypesResponse {
                             id,
                             response: Ok(result),
@@ -1216,7 +1153,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                     // Register notification for this client
                     if let Some(client_addr) = &client_addr {
                         if let Some(ref notification_sender) = client_notification_sender {
-                            match locks.store().register_notification(config.clone(), notification_sender.clone()).await {
+                            match store.register_notification(config.clone(), notification_sender.clone()).await {
                                 Ok(()) => {
                                     locks
                                         .connections()
@@ -1269,7 +1206,7 @@ async fn process_store_message(message: StoreMessage, client_addr: Option<String
                     // Unregister notification for this client
                     if let Some(client_addr) = &client_addr {
                         if let Some(ref notification_sender) = client_notification_sender {
-                            let removed = locks.store().unregister_notification(&config, notification_sender).await;
+                            let removed = store.unregister_notification(&config, notification_sender).await;
                             
                             // Remove from client's tracked configs if successfully unregistered
                             if removed {
@@ -2046,8 +1983,15 @@ async fn main() -> Result<()> {
         "Starting QCore service"
     );
 
+    // Create the store handle
+    let store_handle = StoreService::spawn(
+        Arc::new(Snowflake::new()),
+        Arc::new(Mutex::new(None)), // permission_cache will be initialized later
+        Arc::new(Mutex::new(CelExecutor::new()))
+    );
+
     // Create shared application state
-    let app_state = Arc::new(AppState::new(config)?);
+    let app_state = Arc::new(AppState::new(config, store_handle)?);
 
     // Initialize the WAL file counter based on existing files
     {

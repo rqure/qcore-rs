@@ -1,14 +1,14 @@
-use qlib_rs::{AsyncStore, Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig, Snowflake};
+use qlib_rs::{Cache, CelExecutor, EntityId, NotificationSender, NotifyConfig};
 use tokio_tungstenite::{tungstenite::Message};
 use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tracing::{info, warn};
 use clap::Parser;
 use anyhow::Result;
 use std::collections::{HashSet, HashMap};
-use std::sync::Arc;
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
 use time;
+use crate::store::StoreHandle;
 
 /// Application availability state
 #[derive(Debug, Clone, PartialEq)]
@@ -175,8 +175,8 @@ pub struct AppState {
     /// Peer information tracking
     pub peer_info: Mutex<HashMap<String, PeerInfo>>,
     
-    /// Data store - kept separate as it has its own locking
-    pub store: Arc<Mutex<AsyncStore>>,
+    /// Data store handle - communicates with store task
+    pub store: StoreHandle,
     
     /// Permission Cache - separate as it's accessed frequently
     pub permission_cache: Mutex<Option<Cache>>,
@@ -254,7 +254,6 @@ pub struct LockRequest {
     pub core_state: bool,
     pub connections: bool,
     pub peer_info: bool,
-    pub store: bool,
     pub permission_cache: bool,
     pub cel_executor: bool,
 }
@@ -264,7 +263,6 @@ pub struct AppStateLocks<'a> {
     pub core_state: Option<MutexGuard<'a, CoreState>>,
     pub connections: Option<MutexGuard<'a, ConnectionState>>,
     pub peer_info: Option<MutexGuard<'a, HashMap<String, PeerInfo>>>,
-    pub store: Option<MutexGuard<'a, AsyncStore>>,
     pub permission_cache: Option<MutexGuard<'a, Option<Cache>>>,
     pub cel_executor: Option<MutexGuard<'a, CelExecutor>>,
 }
@@ -285,11 +283,6 @@ impl<'a> AppStateLocks<'a> {
         self.peer_info.as_mut().expect("peer_info lock was not requested")
     }
 
-    /// Get the store lock, panicking if it wasn't requested
-    pub fn store(&mut self) -> &mut MutexGuard<'a, AsyncStore> {
-        self.store.as_mut().expect("store lock was not requested")
-    }
-
     /// Get the permission_cache lock, panicking if it wasn't requested
     pub fn permission_cache(&mut self) -> &mut MutexGuard<'a, Option<Cache>> {
         self.permission_cache.as_mut().expect("permission_cache lock was not requested")
@@ -297,9 +290,8 @@ impl<'a> AppStateLocks<'a> {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config, store_handle: StoreHandle) -> Result<Self> {
         let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
-        let store = Arc::new(Mutex::new(AsyncStore::new(Arc::new(Snowflake::new()))));
         
         Ok(Self {
             core_state: Mutex::new(CoreState {
@@ -314,7 +306,7 @@ impl AppState {
             }),
             connections: Mutex::new(ConnectionState::new()),
             peer_info: Mutex::new(HashMap::new()),
-            store,
+            store: store_handle,
             permission_cache: Mutex::new(None),
             cel_executor: Mutex::new(CelExecutor::new()),
         })
@@ -423,9 +415,8 @@ impl AppState {
     /// 1. core_state
     /// 2. connections  
     /// 3. peer_info
-    /// 4. store
-    /// 5. permission_cache
-    /// 6. cel_executor
+    /// 4. permission_cache
+    /// 5. cel_executor
     /// 
     /// Only the locks specified in the request will be acquired.
     pub async fn acquire_locks(&self, request: LockRequest) -> AppStateLocks<'_> {
@@ -442,11 +433,6 @@ impl AppState {
             },
             peer_info: if request.peer_info {
                 Some(self.peer_info.lock().await)
-            } else {
-                None
-            },
-            store: if request.store {
-                Some(self.store.lock().await)
             } else {
                 None
             },
