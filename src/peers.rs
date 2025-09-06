@@ -1,32 +1,141 @@
-use crate::states::{AppState, AppStateLocks, AvailabilityState, LockRequest, PeerInfo, PeerMessage};
-use crate::persistance::{save_snapshot, write_request_to_wal};
-use crate::reinit_caches;
-use qlib_rs::{now, StoreTrait};
+use qlib_rs::{now, Snapshot};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn, error, debug, instrument};
 use anyhow::Result;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::Duration;
 use time;
 
+use crate::states::{Config, AvailabilityState, PeerInfo, PeerMessage, ConnectionState};
+use crate::store::StoreHandle;
+use crate::persistance::{SnapshotService, WalService, SnapshotConfig, WalConfig};
+
+use crate::states::{AppState, AppStateLocks, LockRequest};
+use crate::persistance::{save_snapshot, write_request_to_wal};
+use crate::reinit_caches;
+use qlib_rs::{StoreTrait};
+use std::sync::Arc;
+
+/// Peer service request types
+#[derive(Debug)]
+pub enum PeerRequest {
+    SendSyncMessage {
+        requests: Vec<qlib_rs::Request>,
+        response: oneshot::Sender<Result<()>>,
+    },
+    StartInboundServer {
+        response: oneshot::Sender<Result<()>>,
+    },
+    ManageOutboundConnections {
+        response: oneshot::Sender<Result<()>>,
+    },
+}
+
+/// Handle for communicating with peer service task
+#[derive(Debug, Clone)]
+pub struct PeerHandle {
+    sender: mpsc::UnboundedSender<PeerRequest>,
+}
+
+impl PeerHandle {
+    pub async fn send_sync_message(&self, requests: Vec<qlib_rs::Request>) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender.send(PeerRequest::SendSyncMessage {
+            requests,
+            response: response_tx,
+        }).map_err(|_| anyhow::anyhow!("Peer service task has stopped"))?;
+        response_rx.await.map_err(|_| anyhow::anyhow!("Peer service response channel closed"))?
+    }
+
+    pub async fn start_inbound_server(&self) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender.send(PeerRequest::StartInboundServer {
+            response: response_tx,
+        }).map_err(|_| anyhow::anyhow!("Peer service task has stopped"))?;
+        response_rx.await.map_err(|_| anyhow::anyhow!("Peer service response channel closed"))?
+    }
+
+    pub async fn manage_outbound_connections(&self) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender.send(PeerRequest::ManageOutboundConnections {
+            response: response_tx,
+        }).map_err(|_| anyhow::anyhow!("Peer service task has stopped"))?;
+        response_rx.await.map_err(|_| anyhow::anyhow!("Peer service response channel closed"))?
+    }
+}
+
 /// Service for managing peer connections, leader election, and data synchronization
-#[derive(Clone)]
 pub struct PeerService {
     app_state: Arc<AppState>,
 }
 
 impl PeerService {
-    /// Create a new PeerService instance
-    pub fn new(app_state: Arc<AppState>) -> Self {
-        Self { app_state }
+    /// Spawn the peer service and return a handle for communication
+    pub fn spawn(app_state: Arc<AppState>) -> PeerHandle {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        
+        tokio::spawn(async move {
+            let service = PeerService { app_state };
+            
+            while let Some(request) = receiver.recv().await {
+                match request {
+                    PeerRequest::SendSyncMessage { requests, response } => {
+                        let result = service.send_sync_message_impl(requests).await;
+                        let _ = response.send(result);
+                    }
+                    PeerRequest::StartInboundServer { response } => {
+                        let result = service.start_inbound_server_impl().await;
+                        let _ = response.send(result);
+                    }
+                    PeerRequest::ManageOutboundConnections { response } => {
+                        let result = service.manage_outbound_connections_impl().await;
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        });
+        
+        PeerHandle { sender }
+    }
+
+    /// Send sync message to all connected peers
+    async fn send_sync_message_impl(&self, requests: Vec<qlib_rs::Request>) -> Result<()> {
+        let peer_message = PeerMessage::SyncRequest { requests };
+        let message_json = serde_json::to_string(&peer_message)?;
+        
+        let connections = {
+            let mut locks = self.app_state.acquire_locks(LockRequest {
+                connections: true,
+                ..Default::default()
+            }).await;
+            locks.connections().connected_outbound_peers.clone()
+        };
+        
+        // Send to all connected outbound peers
+        for (peer_addr, sender) in connections {
+            if let Err(e) = sender.send(Message::Text(message_json.clone())) {
+                warn!(
+                    peer_addr = %peer_addr,
+                    error = %e,
+                    "Failed to send sync message to peer"
+                );
+            } else {
+                debug!(
+                    peer_addr = %peer_addr,
+                    "Sent sync message to peer"
+                );
+            }
+        }
+        
+        Ok(())
     }
 
     /// Start the inbound peer server
     #[instrument(skip(self))]
-    pub async fn start_inbound_server(&self) -> Result<()> {
+    async fn start_inbound_server_impl(&self) -> Result<()> {
         let addr = {
             let mut locks = self.app_state.acquire_locks(LockRequest {
                 core_state: true,
@@ -57,7 +166,7 @@ impl PeerService {
     }
 
     /// Manage outbound peer connections - connects to configured peers and maintains connections
-    pub async fn manage_outbound_connections(&self) -> Result<()> {
+    async fn manage_outbound_connections_impl(&self) -> Result<()> {
         info!("Starting outbound peer connection manager");
         
         let reconnect_interval = {

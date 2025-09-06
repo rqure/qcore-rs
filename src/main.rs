@@ -1318,13 +1318,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Create the peer service
-    let peer_service = PeerService::new(Arc::clone(&app_state));
+    // Create the peer service handle
+    let peer_handle = PeerService::spawn(Arc::clone(&app_state));
 
     // Start the peer WebSocket server task
-    let peer_service_clone = peer_service.clone();
+    let peer_handle_clone = peer_handle.clone();
     let mut peer_server_task = tokio::spawn(async move {
-        if let Err(e) = peer_service_clone.start_inbound_server().await {
+        if let Err(e) = peer_handle_clone.start_inbound_server().await {
             error!(
                 error = %e,
                 "Peer server failed"
@@ -1344,9 +1344,9 @@ async fn main() -> Result<()> {
     });
 
     // Start the outbound peer connection manager task
-    let peer_service_clone = peer_service.clone();
+    let peer_handle_clone = peer_handle.clone();
     let mut outbound_peer_task = tokio::spawn(async move {
-        if let Err(e) = peer_service_clone.manage_outbound_connections().await {
+        if let Err(e) = peer_handle_clone.manage_outbound_connections().await {
             error!(
                 error = %e,
                 "Outbound peer connection manager failed"
