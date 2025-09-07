@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use qlib_rs::{notification_channel, StoreMessage, EntityId, NotificationSender, NotifyConfig};
 
+use crate::store::StoreHandle;
+
 /// Client service request types
 #[derive(Debug)]
 pub enum ClientRequest {
@@ -131,13 +133,11 @@ pub struct ClientService {
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
     authenticated_clients: HashMap<String, EntityId>,
     store: StoreHandle,
-    event_publisher: ClientEventPublisher,
 }
 
 impl ClientService {
-    pub fn spawn(config: Config, store: StoreHandle) -> (ClientHandle, crate::events::ClientEventSubscriber) {
+    pub fn spawn(config: Config, store: StoreHandle) -> ClientHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let (event_publisher, event_subscriber) = crate::events::create_client_event_channel();
         
         let mut service = ClientService {
             config: config.clone(),
@@ -146,13 +146,9 @@ impl ClientService {
             client_notification_configs: HashMap::new(),
             authenticated_clients: HashMap::new(),
             store: store.clone(),
-            event_publisher: event_publisher.clone(),
         };
         
         let handle = ClientHandle { sender: sender.clone() };
-        
-        // Emit service started event
-        event_publisher.emit(ClientEvent::ServiceStarted);
         
         // Start client server
         {
@@ -181,38 +177,22 @@ impl ClientService {
                     }
                 }
             }
-            
-            // Emit service stopped event
-            event_publisher.emit(ClientEvent::ServiceStopped {
-                reason: "Channel closed".to_string(),
-            });
         });
 
-        (handle, event_subscriber)
+        handle
     }
     
     async fn handle_request(&mut self, request: ClientRequest) {
         match request {
             ClientRequest::ClientConnected { client_addr, sender, notification_sender } => {
                 self.connected_clients.insert(client_addr.clone(), sender);
-                self.client_notification_senders.insert(client_addr.clone(), notification_sender);
-                
-                // Emit client connected event
-                self.event_publisher.emit(ClientEvent::Connected {
-                    client_addr,
-                });
+                self.client_notification_senders.insert(client_addr, notification_sender);
             }
             ClientRequest::ClientDisconnected { client_addr } => {
                 self.handle_client_disconnected(client_addr).await;
             }
             ClientRequest::ClientAuthenticated { client_addr, client_id } => {
-                self.authenticated_clients.insert(client_addr.clone(), client_id.clone());
-                
-                // Emit client authenticated event
-                self.event_publisher.emit(ClientEvent::Authenticated {
-                    client_addr,
-                    client_id,
-                });
+                self.authenticated_clients.insert(client_addr, client_id);
             }
             ClientRequest::ProcessStoreMessage { message, client_addr, response } => {
                 let result = self.process_store_message(message, client_addr).await;
