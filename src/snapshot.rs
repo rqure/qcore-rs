@@ -7,8 +7,6 @@ use tracing::{info, instrument, warn, error};
 
 use crate::files::{FileConfig, FileManager, FileManagerTrait};
 
-
-
 /// Trait for snapshot operations
 #[async_trait]
 pub trait SnapshotTrait {

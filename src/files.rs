@@ -24,6 +24,19 @@ pub struct FileInfo {
 #[derive(Debug, Clone)]
 pub struct FileManager;
 
+/// Trait for managing numbered files (WAL files, snapshots, etc.)
+#[async_trait]
+pub trait FileManagerTrait: Send + Sync {
+    /// Scan directory for files matching the configuration
+    async fn scan_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<Vec<FileInfo>>;
+    
+    /// Get the next counter value for numbered files
+    async fn get_next_counter(&self, dir: &PathBuf, config: &FileConfig) -> Result<u64>;
+    
+    /// Clean up old files, keeping only the most recent max_files
+    async fn cleanup_old_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<()>;
+}
+
 #[async_trait]
 impl FileManagerTrait for FileManager {
     /// Scan directory for files matching the configuration
@@ -81,17 +94,4 @@ impl FileManagerTrait for FileManager {
         
         Ok(())
     }
-}
-
-/// Trait for managing numbered files (WAL files, snapshots, etc.)
-#[async_trait]
-pub trait FileManagerTrait: Send + Sync {
-    /// Scan directory for files matching the configuration
-    async fn scan_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<Vec<FileInfo>>;
-    
-    /// Get the next counter value for numbered files
-    async fn get_next_counter(&self, dir: &PathBuf, config: &FileConfig) -> Result<u64>;
-    
-    /// Clean up old files, keeping only the most recent max_files
-    async fn cleanup_old_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<()>;
 }
