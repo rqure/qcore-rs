@@ -7,6 +7,21 @@ use tracing::{info, instrument, warn, error};
 
 use crate::files::{FileConfig, FileManager, FileManagerTrait};
 
+/// Events emitted by the snapshot service
+#[derive(Debug)]
+pub enum SnapshotEvent {
+    /// Emitted when snapshot save starts
+    SaveStarted {
+        snapshot_counter: u64,
+    },
+    /// Emitted when snapshot save is completed
+    SaveCompleted {
+        snapshot_counter: u64,
+        snapshot_size_bytes: usize,
+        snapshot_file: PathBuf,
+    },
+}
+
 /// Trait for snapshot operations
 #[async_trait]
 pub trait SnapshotTrait {
@@ -59,12 +74,14 @@ impl SnapshotHandle {
 pub type SnapshotService = SnapshotManagerTrait<FileManager>;
 
 impl SnapshotService {
-    pub fn spawn(config: SnapshotConfig) -> SnapshotHandle {
+    pub fn spawn(config: SnapshotConfig, event_sender: mpsc::UnboundedSender<SnapshotEvent>) -> SnapshotHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
-            let mut service = SnapshotService::new(FileManager, config);
-            service.initialize_counter().await;
+            let mut service = SnapshotService::new(FileManager, config, event_sender);
+            if let Err(e) = service.initialize_counter().await {
+                error!(error = %e, "Failed to initialize snapshot counter");
+            }
 
             while let Some(request) = receiver.recv().await {
                 match request {
@@ -86,10 +103,12 @@ pub struct SnapshotManagerTrait<F: FileManagerTrait> {
     snapshot_config: FileConfig,
     /// Configuration for snapshot operations
     config: SnapshotConfig,
+    /// Event sender for emitting snapshot events
+    event_sender: mpsc::UnboundedSender<SnapshotEvent>,
 }
 
 impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
-    pub fn new(file_manager: F, config: SnapshotConfig) -> Self {
+    pub fn new(file_manager: F, config: SnapshotConfig, event_sender: mpsc::UnboundedSender<SnapshotEvent>) -> Self {
         Self {
             file_manager,
             snapshot_config: FileConfig {
@@ -98,6 +117,7 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
                 max_files: config.max_files,
             },
             config,
+            event_sender,
         }
     }
 }
@@ -113,6 +133,11 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
 
         let snapshot_filename = format!("snapshot_{:010}.bin", current_snapshot_counter);
         let snapshot_path = self.config.snapshots_dir.join(&snapshot_filename);
+        
+        // Emit save started event
+        let _ = self.event_sender.send(SnapshotEvent::SaveStarted {
+            snapshot_counter: current_snapshot_counter,
+        });
         
         info!(
             snapshot_file = %snapshot_path.display(),
@@ -137,6 +162,13 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
             snapshot_counter = current_snapshot_counter,
             "Snapshot saved successfully"
         );
+        
+        // Emit save completed event
+        let _ = self.event_sender.send(SnapshotEvent::SaveCompleted {
+            snapshot_counter: current_snapshot_counter,
+            snapshot_size_bytes: serialized.len(),
+            snapshot_file: snapshot_path,
+        });
         
         // Clean up old snapshots
         if let Err(e) = self.file_manager.cleanup_old_files(&self.config.snapshots_dir, &self.snapshot_config).await {
