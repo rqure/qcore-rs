@@ -58,7 +58,6 @@ pub enum WalEvent {
         wal_counter: u64,
         current_size: usize,
         max_size: usize,
-        wal_files_since_snapshot: u64,
     },
 }
 
@@ -71,9 +70,6 @@ pub enum WalRequest {
     },
     Replay {
         response: oneshot::Sender<Result<()>>,
-    },
-    ResetSnapshotCounter {
-        response: oneshot::Sender<()>,
     },
 }
 
@@ -100,15 +96,6 @@ impl WalHandle {
         }).map_err(|_| anyhow::anyhow!("WAL manager task has stopped"))?;
         response_rx.await.map_err(|_| anyhow::anyhow!("WAL manager task response channel closed"))?
     }
-
-    pub async fn reset_snapshot_counter(&self) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(WalRequest::ResetSnapshotCounter {
-            response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
-        }
-    }
 }
 
 pub type WalService = WalManagerTrait<FileManager>;
@@ -129,10 +116,6 @@ impl WalService {
                     WalRequest::Replay { response } => {
                         let result = service.replay().await;
                         let _ = response.send(result);
-                    }
-                    WalRequest::ResetSnapshotCounter { response } => {
-                        service.reset_snapshot_counter();
-                        let _ = response.send(());
                     }
                 }
             }
@@ -238,8 +221,6 @@ pub struct WalManagerTrait<F: FileManagerTrait> {
     /// Current WAL file handle and size
     current_wal_file: Option<File>,
     current_wal_size: usize,
-    /// Number of WAL files created since last snapshot
-    wal_files_since_snapshot: u64,
     /// Event sender for emitting WAL events
     event_sender: mpsc::UnboundedSender<WalEvent>,
 }
@@ -256,14 +237,8 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             wal_config: config,
             current_wal_file: None,
             current_wal_size: 0,
-            wal_files_since_snapshot: 0,
             event_sender,
         }
-    }
-
-    /// Reset the snapshot counter (called externally when a snapshot is taken)
-    pub fn reset_snapshot_counter(&mut self) {
-        self.wal_files_since_snapshot = 0;
     }
 }
 
@@ -358,8 +333,6 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
         let file = OpenOptions::new().create(true).append(true).open(&wal_path).await?;
         self.current_wal_file = Some(file);
         self.current_wal_size = 0;
-        
-        self.wal_files_since_snapshot += 1;
 
         // Emit file rollover event
         let _ = self.event_sender.send(WalEvent::FileRollover {
@@ -367,7 +340,6 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             wal_counter: wal_file_counter,
             current_size,
             max_size,
-            wal_files_since_snapshot: self.wal_files_since_snapshot,
         });
 
         if let Err(e) = self.file_manager.cleanup_old_files(&self.wal_config.wal_dir, &self.file_config).await {
