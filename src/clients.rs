@@ -17,6 +17,14 @@ pub struct ClientConfig {
     pub client_port: u16,
 }
 
+impl From<&crate::Config> for ClientConfig {
+    fn from(config: &crate::Config) -> Self {
+        Self {
+            client_port: config.client_port,
+        }
+    }
+}
+
 /// Client service request types
 #[derive(Debug)]
 pub enum ClientRequest {

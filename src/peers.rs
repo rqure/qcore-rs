@@ -10,8 +10,40 @@ use std::time::Duration;
 use time;
 use serde::{Serialize, Deserialize};
 
-use crate::Config;
 use crate::store::StoreHandle;
+
+/// Configuration for the peer service
+#[derive(Debug, Clone)]
+pub struct PeerConfig {
+    /// Machine ID (unique identifier for this instance)
+    pub machine: String,
+    /// Data directory for storing WAL files and other persistent data
+    pub data_dir: String,
+    /// Port for peer-to-peer communication
+    pub peer_port: u16,
+    /// List of peer addresses to connect to (format: host:port)
+    pub peer_addresses: Vec<String>,
+    /// Interval in seconds to retry connecting to peers
+    pub peer_reconnect_interval_secs: u64,
+    /// Grace period in seconds to wait after becoming unavailable before requesting full sync
+    pub full_sync_grace_period_secs: u64,
+    /// Delay in seconds after startup before self-promoting to leader when no peers are available
+    pub self_promotion_delay_secs: u64,
+}
+
+impl From<&crate::Config> for PeerConfig {
+    fn from(config: &crate::Config) -> Self {
+        Self {
+            machine: config.machine.clone(),
+            data_dir: config.data_dir.clone(),
+            peer_port: config.peer_port,
+            peer_addresses: config.peer_addresses.clone(),
+            peer_reconnect_interval_secs: config.peer_reconnect_interval_secs,
+            full_sync_grace_period_secs: config.full_sync_grace_period_secs,
+            self_promotion_delay_secs: config.self_promotion_delay_secs,
+        }
+    }
+}
 
 /// Application availability state
 #[derive(Debug, Clone, PartialEq)]
@@ -161,7 +193,7 @@ impl PeerHandle {
 }
 
 pub struct PeerService {
-    config: Config,
+    config: PeerConfig,
     startup_time: u64,
     availability_state: AvailabilityState,
     is_leader: bool,
@@ -177,7 +209,7 @@ pub struct PeerService {
 
 impl PeerService {
     pub fn spawn(
-        config: Config,
+        config: PeerConfig,
         store: StoreHandle,
         connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     ) -> PeerHandle {
@@ -653,7 +685,7 @@ async fn handle_peer_message(
 }
 
 async fn start_inbound_peer_server(
-    config: Config,
+    config: PeerConfig,
     handle: PeerHandle,
     store: StoreHandle,
 ) -> Result<()> {
@@ -680,7 +712,7 @@ async fn start_inbound_peer_server(
     }
 }
 
-async fn manage_outbound_peer_connections(config: Config, handle: PeerHandle) -> Result<()> {
+async fn manage_outbound_peer_connections(config: PeerConfig, handle: PeerHandle) -> Result<()> {
     info!("Starting outbound peer connection manager");
     
     let reconnect_interval = Duration::from_secs(config.peer_reconnect_interval_secs);
