@@ -8,9 +8,6 @@ use tokio::sync::{mpsc, oneshot};
 use std::path::PathBuf;
 use async_trait::async_trait;
 
-use crate::store::StoreHandle;
-use crate::events::{WalEventPublisher, SnapshotEventPublisher, WalEvent, SnapshotEvent, SnapshotReason};
-
 /// Configuration for WAL manager operations
 #[derive(Debug, Clone)]
 pub struct WalConfig {
@@ -20,19 +17,8 @@ pub struct WalConfig {
     pub max_file_size: usize,
     /// Maximum number of WAL files to keep
     pub max_files: usize,
-    /// Number of WAL file rollovers before taking a snapshot
-    pub snapshot_wal_interval: u64,
     /// Unique machine identifier for snapshot originator
     pub machine_id: String,
-}
-
-/// Configuration for snapshot manager operations
-#[derive(Debug, Clone)]
-pub struct SnapshotConfig {
-    /// Snapshots directory path
-    pub snapshots_dir: PathBuf,
-    /// Maximum number of snapshot files to keep
-    pub max_files: usize,
 }
 
 /// WAL manager request types
@@ -44,25 +30,10 @@ pub enum WalRequest {
     }
 }
 
-/// Snapshot manager request types
-#[derive(Debug)]
-pub enum SnapshotRequest {
-    Save {
-        snapshot: qlib_rs::Snapshot,
-        response: oneshot::Sender<Result<u64>>,
-    }
-}
-
 /// Handle for communicating with WAL manager task
 #[derive(Debug, Clone)]
 pub struct WalHandle {
     sender: mpsc::UnboundedSender<WalRequest>,
-}
-
-/// Handle for communicating with snapshot manager task
-#[derive(Debug, Clone)]
-pub struct SnapshotHandle {
-    sender: mpsc::UnboundedSender<SnapshotRequest>,
 }
 
 impl WalHandle {
@@ -73,17 +44,6 @@ impl WalHandle {
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("WAL manager task has stopped"))?;
         response_rx.await.map_err(|_| anyhow::anyhow!("WAL manager task response channel closed"))?
-    }
-}
-
-impl SnapshotHandle {
-    pub async fn save(&self, snapshot: qlib_rs::Snapshot) -> Result<u64> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(SnapshotRequest::Save {
-            snapshot,
-            response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Snapshot manager task has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Snapshot manager task response channel closed"))?
     }
 }
 
@@ -143,60 +103,7 @@ impl<F: FileManagerTrait> WalServiceWrapper<F> {
     }
 }
 
-/// Snapshot service wrapper with event publishing
-pub struct SnapshotServiceWrapper<F: FileManagerTrait> {
-    inner: SnapshotManagerTrait<F>,
-    event_publisher: SnapshotEventPublisher,
-}
-
-impl<F: FileManagerTrait> SnapshotServiceWrapper<F> {
-    pub fn new(inner: SnapshotManagerTrait<F>, event_publisher: SnapshotEventPublisher) -> Self {
-        Self { inner, event_publisher }
-    }
-
-    pub async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64> {
-        let result = self.inner.save(snapshot).await;
-
-        match &result {
-            Ok(snapshot_counter) => {
-                let file_path = self.inner.get_snapshot_path(*snapshot_counter);
-                self.event_publisher.emit(SnapshotEvent::Saved {
-                    snapshot_counter: *snapshot_counter,
-                    file_path,
-                    size_bytes: 0, // Could calculate this if needed
-                });
-            }
-            Err(e) => {
-                self.event_publisher.emit(SnapshotEvent::Failed {
-                    error: e.to_string(),
-                });
-            }
-        }
-
-        result
-    }
-
-    pub async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
-        let result = self.inner.load_latest().await;
-
-        if let Ok(Some((_, snapshot_counter))) = &result {
-            let file_path = self.inner.get_snapshot_path(*snapshot_counter);
-            self.event_publisher.emit(SnapshotEvent::Loaded {
-                snapshot_counter: *snapshot_counter,
-                file_path,
-            });
-        }
-
-        result
-    }
-
-    pub async fn initialize_counter(&mut self) -> Result<()> {
-        self.inner.initialize_counter().await
-    }
-}
-
 pub type WalService = WalServiceWrapper<FileManager>;
-pub type SnapshotService = SnapshotServiceWrapper<FileManager>;
 
 impl WalService {
     pub fn spawn(config: WalConfig, snapshot_handle: SnapshotHandle, store_handle: StoreHandle) -> (WalHandle, crate::events::WalEventSubscriber) {
@@ -235,66 +142,6 @@ impl WalService {
     }
 }
 
-impl SnapshotService {
-    pub fn spawn(config: SnapshotConfig) -> (SnapshotHandle, crate::events::SnapshotEventSubscriber) {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let (event_publisher, event_subscriber) = crate::events::create_snapshot_event_channel();
-
-        tokio::spawn(async move {
-            let inner = SnapshotManagerTrait::new(FileManager, config);
-            let mut service = SnapshotService::new(inner, event_publisher.clone());
-            service.initialize_counter().await;
-            
-            // Emit service started event
-            event_publisher.emit(SnapshotEvent::ServiceStarted);
-
-            while let Some(request) = receiver.recv().await {
-                match request {
-                    SnapshotRequest::Save { snapshot, response } => {
-                        let result = service.save(&snapshot).await;
-                        let _ = response.send(result);
-                    }
-                }
-            }
-            
-            // Emit service stopped event
-            event_publisher.emit(SnapshotEvent::ServiceStopped {
-                reason: "Channel closed".to_string(),
-            });
-        });
-
-        (SnapshotHandle { sender }, event_subscriber)
-    }
-}
-
-/// Configuration for numbered file management
-#[derive(Debug, Clone)]
-pub struct FileConfig {
-    pub prefix: String,
-    pub suffix: String,
-    pub max_files: usize,
-}
-
-/// Information about a numbered file
-#[derive(Debug, Clone)]
-pub struct FileInfo {
-    pub path: PathBuf,
-    pub counter: u64,
-}
-
-/// Trait for managing numbered files (WAL files, snapshots, etc.)
-#[async_trait]
-pub trait FileManagerTrait: Send + Sync {
-    /// Scan directory for files matching the configuration
-    async fn scan_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<Vec<FileInfo>>;
-    
-    /// Get the next counter value for numbered files
-    async fn get_next_counter(&self, dir: &PathBuf, config: &FileConfig) -> Result<u64>;
-    
-    /// Clean up old files, keeping only the most recent max_files
-    async fn cleanup_old_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<()>;
-}
-
 /// Entry reader for parsing serialized data
 pub trait EntryReaderTrait<T> {
     type Error;
@@ -314,82 +161,6 @@ pub trait WalTrait {
 
     /// Initialize WAL counter from existing files
     async fn initialize_counter(&mut self) -> Result<()>;
-}
-
-/// Trait for snapshot operations
-#[async_trait]
-pub trait SnapshotTrait {
-    /// Save a snapshot to disk and return the snapshot counter
-    async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64>;
-    
-    /// Load the latest snapshot from disk
-    async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>>;
-    
-    /// Initialize snapshot counter from existing files
-    async fn initialize_counter(&mut self) -> Result<()>;
-}
-
-/// Standard implementation of file management operations
-#[derive(Debug, Clone)]
-pub struct FileManager;
-
-#[async_trait]
-impl FileManagerTrait for FileManager {
-    /// Scan directory for files matching the configuration
-    async fn scan_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<Vec<FileInfo>> {
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        
-        let mut entries = read_dir(dir).await?;
-        let mut files = Vec::new();
-        
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if let Some(filename) = path.file_name() {
-                if let Some(filename_str) = filename.to_str() {
-                    if filename_str.starts_with(&config.prefix) && filename_str.ends_with(&config.suffix) {
-                        // Extract counter from filename
-                        if let Some(counter_str) = filename_str.strip_prefix(&config.prefix).and_then(|s| s.strip_suffix(&config.suffix)) {
-                            if let Ok(counter) = counter_str.parse::<u64>() {
-                                files.push(FileInfo { path, counter });
-                            }
-                        } else {
-                            // Files without counter (for compatibility)
-                            files.push(FileInfo { path, counter: 0 });
-                        }
-                    }
-                }
-            }
-        }
-        
-        files.sort_by_key(|f| f.counter);
-        Ok(files)
-    }
-
-    /// Get the next counter value for numbered files
-    async fn get_next_counter(&self, dir: &PathBuf, config: &FileConfig) -> Result<u64> {
-        let files = self.scan_files(dir, config).await?;
-        let max_counter = files.iter().map(|f| f.counter).max().unwrap_or(0);
-        Ok(if max_counter == 0 && files.is_empty() { 0 } else { max_counter + 1 })
-    }
-
-    /// Clean up old files, keeping only the most recent max_files
-    async fn cleanup_old_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<()> {
-        let files = self.scan_files(dir, config).await?;
-        
-        if files.len() > config.max_files {
-            let files_to_remove = files.len() - config.max_files;
-            for file_info in &files[0..files_to_remove] {
-                info!(file = %file_info.path.display(), "Removing old file");
-                if let Err(e) = remove_file(&file_info.path).await {
-                    error!(file = %file_info.path.display(), error = %e, "Failed to remove old file");
-                }
-            }
-        }
-        
-        Ok(())
-    }
 }
 
 /// Iterator for reading WAL entries from a buffer
@@ -869,173 +640,6 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             Err(e) => {
                 Err(anyhow::anyhow!("Failed to deserialize request: {}", e))
             }
-        }
-    }
-}
-
-/// Snapshot manager handles snapshot operations
-pub struct SnapshotManagerTrait<F: FileManagerTrait> {
-    file_manager: F,
-    snapshot_config: FileConfig,
-    /// Configuration for snapshot operations
-    config: SnapshotConfig,
-}
-
-impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
-    pub fn new(file_manager: F, config: SnapshotConfig) -> Self {
-        Self {
-            file_manager,
-            snapshot_config: FileConfig {
-                prefix: "snapshot_".to_string(),
-                suffix: ".bin".to_string(),
-                max_files: config.max_files,
-            },
-            config,
-        }
-    }
-
-    /// Get a snapshot file path for the given counter
-    pub fn get_snapshot_path(&self, snapshot_counter: u64) -> PathBuf {
-        let snapshot_filename = format!("snapshot_{:010}.bin", snapshot_counter);
-        self.config.snapshots_dir.join(snapshot_filename)
-    }
-}
-
-#[async_trait]
-impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
-    /// Save a snapshot to disk and return the snapshot counter
-    #[instrument(skip(self, snapshot))]
-    async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64> {
-        create_dir_all(&self.config.snapshots_dir).await?;
-        
-        let current_snapshot_counter = self.file_manager.get_next_counter(&self.config.snapshots_dir, &self.snapshot_config).await?;
-
-        let snapshot_filename = format!("snapshot_{:010}.bin", current_snapshot_counter);
-        let snapshot_path = self.config.snapshots_dir.join(&snapshot_filename);
-        
-        info!(
-            snapshot_file = %snapshot_path.display(),
-            snapshot_counter = current_snapshot_counter,
-            "Saving snapshot"
-        );
-        
-        let serialized = bincode::serialize(snapshot)?;
-        
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&snapshot_path)
-            .await?;
-        
-        file.write_all(&serialized).await?;
-        file.flush().await?;
-        
-        info!(
-            snapshot_size_bytes = serialized.len(),
-            snapshot_counter = current_snapshot_counter,
-            "Snapshot saved successfully"
-        );
-        
-        // Clean up old snapshots
-        if let Err(e) = self.file_manager.cleanup_old_files(&self.config.snapshots_dir, &self.snapshot_config).await {
-            error!(error = %e, "Failed to clean up old snapshots");
-        }
-        
-        Ok(current_snapshot_counter)
-    }
-    
-    /// Load the latest snapshot from disk
-    async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
-        let snapshot_files = self.file_manager.scan_files(&self.config.snapshots_dir, &self.snapshot_config).await?;
-        
-        if snapshot_files.is_empty() {
-            info!("No snapshot files found, starting with empty store");
-            return Ok(None);
-        }
-        
-        // Try loading snapshots from latest to oldest
-        for file_info in snapshot_files.iter().rev() {
-            info!(
-                snapshot_file = %file_info.path.display(),
-                snapshot_counter = file_info.counter,
-                "Attempting to load snapshot"
-            );
-            
-            match self.try_load_snapshot(&file_info.path).await {
-                Ok(Some(snapshot)) => {
-                    info!(
-                        snapshot_file = %file_info.path.display(),
-                        snapshot_counter = file_info.counter,
-                        "Snapshot loaded successfully"
-                    );
-                    return Ok(Some((snapshot, file_info.counter)));
-                }
-                Ok(None) => {
-                    // File was corrupted and cleaned up, try next
-                    continue;
-                }
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        snapshot_file = %file_info.path.display(),
-                        "Failed to load snapshot, trying previous snapshot"
-                    );
-                    continue;
-                }
-            }
-        }
-        
-        warn!("All snapshot files failed to load or were corrupted, starting with empty store");
-        Ok(None)
-    }
-    
-    /// Initialize snapshot counter from existing files
-    async fn initialize_counter(&mut self) -> Result<()> {
-        let next_snapshot_counter = self.file_manager.get_next_counter(&self.config.snapshots_dir, &self.snapshot_config).await?;
-        
-        info!(
-            snapshot_dir = %self.config.snapshots_dir.display(),
-            next_counter = next_snapshot_counter,
-            "Initialized snapshot file counter"
-        );
-
-        Ok(())
-    }
-}
-
-impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
-    /// Try to load a single snapshot file
-    async fn try_load_snapshot(&self, snapshot_path: &PathBuf) -> Result<Option<qlib_rs::Snapshot>> {
-        match File::open(snapshot_path).await {
-            Ok(mut file) => {
-                let mut buffer = Vec::new();
-                match file.read_to_end(&mut buffer).await {
-                    Ok(_) => {
-                        match bincode::deserialize(&buffer) {
-                            Ok(snapshot) => Ok(Some(snapshot)),
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    snapshot_file = %snapshot_path.display(),
-                                    "Failed to deserialize snapshot, marking for cleanup"
-                                );
-                                // Defensive: Mark corrupted snapshot for cleanup
-                                if let Err(cleanup_err) = remove_file(snapshot_path).await {
-                                    warn!(
-                                        error = %cleanup_err,
-                                        snapshot_file = %snapshot_path.display(),
-                                        "Failed to remove corrupted snapshot file"
-                                    );
-                                }
-                                Ok(None) // Corrupted file cleaned up
-                            }
-                        }
-                    }
-                    Err(e) => Err(anyhow::anyhow!("Failed to read snapshot file: {}", e))
-                }
-            }
-            Err(e) => Err(anyhow::anyhow!("Failed to open snapshot file: {}", e))
         }
     }
 }

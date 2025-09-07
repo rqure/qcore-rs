@@ -8,10 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use qlib_rs::{notification_channel, StoreMessage, EntityId, NotificationSender, NotifyConfig};
 
-use crate::states::Config;
-use crate::store::StoreHandle;
-use crate::events::{ClientEventPublisher, ClientEvent, DisconnectReason};
-
 /// Client service request types
 #[derive(Debug)]
 pub enum ClientRequest {
