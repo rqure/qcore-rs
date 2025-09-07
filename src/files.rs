@@ -1,4 +1,21 @@
 
+
+/// Configuration for numbered file management
+#[derive(Debug, Clone)]
+pub struct FileConfig {
+    pub prefix: String,
+    pub suffix: String,
+    pub max_files: usize,
+}
+
+/// Information about a numbered file
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    pub path: PathBuf,
+    pub counter: u64,
+}
+
+
 /// Standard implementation of file management operations
 #[derive(Debug, Clone)]
 pub struct FileManager;
@@ -60,21 +77,6 @@ impl FileManagerTrait for FileManager {
         
         Ok(())
     }
-}
-
-/// Configuration for numbered file management
-#[derive(Debug, Clone)]
-pub struct FileConfig {
-    pub prefix: String,
-    pub suffix: String,
-    pub max_files: usize,
-}
-
-/// Information about a numbered file
-#[derive(Debug, Clone)]
-pub struct FileInfo {
-    pub path: PathBuf,
-    pub counter: u64,
 }
 
 /// Trait for managing numbered files (WAL files, snapshots, etc.)

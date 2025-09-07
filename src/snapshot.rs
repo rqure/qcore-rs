@@ -1,3 +1,25 @@
+
+
+/// Trait for snapshot operations
+#[async_trait]
+pub trait SnapshotTrait {
+    /// Save a snapshot to disk and return the snapshot counter
+    async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64>;
+    
+    /// Load the latest snapshot from disk
+    async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>>;
+    
+    /// Initialize snapshot counter from existing files
+    async fn initialize_counter(&mut self) -> Result<()>;
+}
+
+
+/// Handle for communicating with snapshot manager task
+#[derive(Debug, Clone)]
+pub struct SnapshotHandle {
+    sender: mpsc::UnboundedSender<SnapshotRequest>,
+}
+
 /// Configuration for snapshot manager operations
 #[derive(Debug, Clone)]
 pub struct SnapshotConfig {
@@ -16,25 +38,6 @@ pub enum SnapshotRequest {
     }
 }
 
-/// Handle for communicating with snapshot manager task
-#[derive(Debug, Clone)]
-pub struct SnapshotHandle {
-    sender: mpsc::UnboundedSender<SnapshotRequest>,
-}
-
-/// Trait for snapshot operations
-#[async_trait]
-pub trait SnapshotTrait {
-    /// Save a snapshot to disk and return the snapshot counter
-    async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64>;
-    
-    /// Load the latest snapshot from disk
-    async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>>;
-    
-    /// Initialize snapshot counter from existing files
-    async fn initialize_counter(&mut self) -> Result<()>;
-}
-
 impl SnapshotHandle {
     pub async fn save(&self, snapshot: qlib_rs::Snapshot) -> Result<u64> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -46,72 +49,15 @@ impl SnapshotHandle {
     }
 }
 
-/// Snapshot service wrapper with event publishing
-pub struct SnapshotServiceWrapper<F: FileManagerTrait> {
-    inner: SnapshotManagerTrait<F>,
-    event_publisher: SnapshotEventPublisher,
-}
-
-impl<F: FileManagerTrait> SnapshotServiceWrapper<F> {
-    pub fn new(inner: SnapshotManagerTrait<F>, event_publisher: SnapshotEventPublisher) -> Self {
-        Self { inner, event_publisher }
-    }
-
-    pub async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64> {
-        let result = self.inner.save(snapshot).await;
-
-        match &result {
-            Ok(snapshot_counter) => {
-                let file_path = self.inner.get_snapshot_path(*snapshot_counter);
-                self.event_publisher.emit(SnapshotEvent::Saved {
-                    snapshot_counter: *snapshot_counter,
-                    file_path,
-                    size_bytes: 0, // Could calculate this if needed
-                });
-            }
-            Err(e) => {
-                self.event_publisher.emit(SnapshotEvent::Failed {
-                    error: e.to_string(),
-                });
-            }
-        }
-
-        result
-    }
-
-    pub async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
-        let result = self.inner.load_latest().await;
-
-        if let Ok(Some((_, snapshot_counter))) = &result {
-            let file_path = self.inner.get_snapshot_path(*snapshot_counter);
-            self.event_publisher.emit(SnapshotEvent::Loaded {
-                snapshot_counter: *snapshot_counter,
-                file_path,
-            });
-        }
-
-        result
-    }
-
-    pub async fn initialize_counter(&mut self) -> Result<()> {
-        self.inner.initialize_counter().await
-    }
-}
-
-pub type SnapshotService = SnapshotServiceWrapper<FileManager>;
+pub type SnapshotService = SnapshotManagerTrait<FileManager>;
 
 impl SnapshotService {
-    pub fn spawn(config: SnapshotConfig) -> (SnapshotHandle, crate::events::SnapshotEventSubscriber) {
+    pub fn spawn(config: SnapshotConfig) -> SnapshotHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let (event_publisher, event_subscriber) = crate::events::create_snapshot_event_channel();
 
         tokio::spawn(async move {
-            let inner = SnapshotManagerTrait::new(FileManager, config);
-            let mut service = SnapshotService::new(inner, event_publisher.clone());
+            let mut service = SnapshotService::new(FileManager, config);
             service.initialize_counter().await;
-            
-            // Emit service started event
-            event_publisher.emit(SnapshotEvent::ServiceStarted);
 
             while let Some(request) = receiver.recv().await {
                 match request {
@@ -121,17 +67,11 @@ impl SnapshotService {
                     }
                 }
             }
-            
-            // Emit service stopped event
-            event_publisher.emit(SnapshotEvent::ServiceStopped {
-                reason: "Channel closed".to_string(),
-            });
         });
 
-        (SnapshotHandle { sender }, event_subscriber)
+        SnapshotHandle { sender }
     }
 }
-
 
 /// Snapshot manager handles snapshot operations
 pub struct SnapshotManagerTrait<F: FileManagerTrait> {
@@ -152,12 +92,6 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
             },
             config,
         }
-    }
-
-    /// Get a snapshot file path for the given counter
-    pub fn get_snapshot_path(&self, snapshot_counter: u64) -> PathBuf {
-        let snapshot_filename = format!("snapshot_{:010}.bin", snapshot_counter);
-        self.config.snapshots_dir.join(snapshot_filename)
     }
 }
 
