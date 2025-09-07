@@ -24,6 +24,7 @@ use clap::Parser;
 use crate::persistance::{SnapshotService, WalService, SnapshotTrait, WalTrait, WalConfig, SnapshotConfig};
 use crate::states::{AppState, AppStateLocks, AvailabilityState, Config, LockRequest, PeerInfo, PeerMessage};
 use crate::store::{StoreService, StoreHandle};
+use crate::clients::{ClientService, ClientHandle};
 
 /// Handle a single peer WebSocket connection
 #[instrument(skip(stream, app_state), fields(peer_addr = %peer_addr))]
