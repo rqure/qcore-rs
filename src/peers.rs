@@ -1,3 +1,4 @@
+use qlib_rs::EntityId;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
@@ -8,8 +9,48 @@ use std::collections::HashMap;
 use std::time::Duration;
 use time;
 
-use crate::states::{Config, AvailabilityState, PeerInfo, PeerMessage, ConnectionState};
+use crate::states::{Config, AvailabilityState};
 use crate::store::StoreHandle;
+
+/// Messages exchanged between peers for leader election
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum PeerMessage {
+    /// Startup message announcing startup time and machine ID
+    Startup {
+        machine_id: String,
+        startup_time: u64, // Timestamp in seconds since UNIX_EPOCH
+    },
+    /// Request for full synchronization from the leader
+    FullSyncRequest {
+        machine_id: String,
+    },
+    /// Response containing a complete snapshot for full synchronization
+    FullSyncResponse {
+        snapshot: qlib_rs::Snapshot,
+    },
+    /// Data synchronization request (existing functionality)
+    SyncRequest {
+        requests: Vec<qlib_rs::Request>,
+    },
+}
+
+/// Information about a peer instance
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub machine_id: String,
+    pub startup_time: u64
+}
+
+/// Connection state separated from main state to reduce lock contention
+#[derive(Debug)]
+pub struct ConnectionState {
+    /// Connected outbound peers with message senders
+    pub connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
+    /// Connected clients with message senders
+    pub connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
+    /// Track authenticated clients
+    pub authenticated_clients: HashMap<String, EntityId>,
+}
 
 /// Peer service request types
 #[derive(Debug)]
@@ -40,9 +81,6 @@ pub enum PeerRequest {
         peer_addr: String,
     },
     FullSyncCompleted,
-    ForceDisconnectClients {
-        response: oneshot::Sender<()>,
-    },
 }
 
 /// Handle for communicating with peer service
@@ -109,15 +147,6 @@ impl PeerHandle {
 
     pub fn full_sync_completed(&self) {
         let _ = self.sender.send(PeerRequest::FullSyncCompleted);
-    }
-
-    pub async fn force_disconnect_clients(&self) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(PeerRequest::ForceDisconnectClients {
-            response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
-        }
     }
 }
 
@@ -247,11 +276,6 @@ impl PeerService {
                 self.full_sync_request_pending = false;
                 self.availability_state = AvailabilityState::Available;
                 self.became_unavailable_at = None;
-            }
-            PeerRequest::ForceDisconnectClients { response } => {
-                let mut connections = self.connections.lock().await;
-                connections.force_disconnect_all_clients();
-                let _ = response.send(());
             }
         }
     }
@@ -398,7 +422,6 @@ impl PeerService {
         if old_state != self.availability_state && 
            matches!(self.availability_state, AvailabilityState::Unavailable) {
             let mut connections = self.connections.lock().await;
-            connections.force_disconnect_all_clients();
         }
     }
     
