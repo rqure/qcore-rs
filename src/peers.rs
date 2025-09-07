@@ -83,16 +83,7 @@ pub struct PeerInfo {
     pub startup_time: u64
 }
 
-/// Connection state separated from main state to reduce lock contention
-#[derive(Debug)]
-pub struct ConnectionState {
-    /// Connected outbound peers with message senders
-    pub connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
-    /// Connected clients with message senders
-    pub connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
-    /// Track authenticated clients
-    pub authenticated_clients: HashMap<String, EntityId>,
-}
+
 
 /// Peer service request types
 #[derive(Debug)]
@@ -203,15 +194,13 @@ pub struct PeerService {
     full_sync_request_pending: bool,
     peer_info: HashMap<String, PeerInfo>,
     connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
-    store: StoreHandle,
-    connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
+    store: StoreHandle
 }
 
 impl PeerService {
     pub fn spawn(
         config: PeerConfig,
         store: StoreHandle,
-        connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     ) -> PeerHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         
@@ -229,7 +218,6 @@ impl PeerService {
             peer_info: HashMap::new(),
             connected_outbound_peers: HashMap::new(),
             store: store.clone(),
-            connections: connections.clone(),
         };
         
         let handle = PeerHandle { sender: sender.clone() };
@@ -463,7 +451,7 @@ impl PeerService {
         // Force disconnect clients if becoming unavailable
         if old_state != self.availability_state && 
            matches!(self.availability_state, AvailabilityState::Unavailable) {
-            let mut connections = self.connections.lock().await;
+            // Clients are now stored directly in PeerService, no need for mutex
         }
     }
     
@@ -761,7 +749,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                if let Ok(PeerMessage::FullSyncResponse { snapshot }) = bincode::deserialize::<PeerMessage>(&data) {
+                if let Ok(PeerMessage::FullSyncResponse { snapshot: _ }) = bincode::deserialize::<PeerMessage>(&data) {
                     // Handle FullSyncResponse - this is a simplified version
                     info!("Received FullSyncResponse via outbound connection");
                     // Process the snapshot...
