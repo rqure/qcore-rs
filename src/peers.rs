@@ -8,6 +8,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::time::Duration;
 use time;
+use serde::{Serialize, Deserialize};
 
 use crate::states::{Config, AvailabilityState};
 use crate::store::StoreHandle;

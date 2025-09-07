@@ -4,6 +4,7 @@ mod clients;
 mod peers;
 mod misc;
 mod store;
+mod events;
 
 use qlib_rs::{et, ft, notification_channel, now, schoice, sread, sref, swrite, AuthConfig, AuthenticationResult, Cache, PushCondition, StoreMessage, StoreTrait, Snowflake, CelExecutor};
 use qlib_rs::auth::{AuthorizationScope, get_scope};

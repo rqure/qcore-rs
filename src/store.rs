@@ -4,6 +4,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashMap;
+use crate::events::{StoreEventPublisher, StoreEvent};
 
 /// Store manager request types
 #[derive(Debug)]
@@ -346,8 +347,9 @@ impl StoreHandle {
 pub struct StoreService;
 
 impl StoreService {
-    pub fn spawn() -> StoreHandle {
+    pub fn spawn() -> (StoreHandle, crate::events::StoreEventSubscriber) {
         let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (event_publisher, event_subscriber) = crate::events::create_store_event_channel();
         
         tokio::spawn(async move {
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
@@ -358,6 +360,9 @@ impl StoreService {
                 vec![ft::scope(), ft::condition()]
             ).await.expect("Failed to create permission cache");
             let mut cel_executor = CelExecutor::new();
+
+            // Emit service started event
+            event_publisher.emit(StoreEvent::ServiceStarted);
 
             while let Some(request) = receiver.recv().await {
                 match request {
@@ -500,9 +505,14 @@ impl StoreService {
                     }
                 }
             }
+            
+            // Emit service stopped event
+            event_publisher.emit(StoreEvent::ServiceStopped {
+                reason: "Channel closed".to_string(),
+            });
         });
 
-        StoreHandle { sender }
+        (StoreHandle { sender }, event_subscriber)
     }
 }
 

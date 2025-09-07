@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 
 use crate::store::StoreHandle;
+use crate::events::{WalEventPublisher, SnapshotEventPublisher, WalEvent, SnapshotEvent, SnapshotReason};
 
 /// Configuration for WAL manager operations
 #[derive(Debug, Clone)]
@@ -86,16 +87,134 @@ impl SnapshotHandle {
     }
 }
 
-pub type WalService = WalManagerTrait<FileManager>;
-pub type SnapshotService = SnapshotManagerTrait<FileManager>;
+/// WAL service wrapper with event publishing
+pub struct WalServiceWrapper<F: FileManagerTrait> {
+    inner: WalManagerTrait<F>,
+    event_publisher: WalEventPublisher,
+}
+
+impl<F: FileManagerTrait> WalServiceWrapper<F> {
+    pub fn new(inner: WalManagerTrait<F>, event_publisher: WalEventPublisher) -> Self {
+        Self { inner, event_publisher }
+    }
+
+    pub async fn write_request(&mut self, request: &qlib_rs::Request, store_handle: &StoreHandle) -> Result<()> {
+        let result = self.inner.write_request(request, store_handle).await;
+        
+        // Emit event based on result
+        if result.is_ok() {
+            self.event_publisher.emit(WalEvent::RequestWritten {
+                request: request.clone(),
+                file_path: self.inner.get_current_wal_path(),
+            });
+        }
+        
+        result
+    }
+
+    pub async fn replay(&self, store_handle: &StoreHandle) -> Result<()> {
+        self.event_publisher.emit(WalEvent::ReplayStarted {
+            file_path: self.inner.config.wal_dir.clone(),
+            from_offset: 0,
+        });
+
+        let result = self.inner.replay(store_handle).await;
+
+        match &result {
+            Ok(_) => {
+                self.event_publisher.emit(WalEvent::ReplayCompleted {
+                    file_path: self.inner.config.wal_dir.clone(),
+                    entries_processed: 0, // Could track this if needed
+                });
+            }
+            Err(e) => {
+                self.event_publisher.emit(WalEvent::ReplayFailed {
+                    file_path: self.inner.config.wal_dir.clone(),
+                    error: e.to_string(),
+                });
+            }
+        }
+
+        result
+    }
+
+    pub async fn initialize_counter(&mut self) -> Result<()> {
+        self.inner.initialize_counter().await
+    }
+}
+
+/// Snapshot service wrapper with event publishing
+pub struct SnapshotServiceWrapper<F: FileManagerTrait> {
+    inner: SnapshotManagerTrait<F>,
+    event_publisher: SnapshotEventPublisher,
+}
+
+impl<F: FileManagerTrait> SnapshotServiceWrapper<F> {
+    pub fn new(inner: SnapshotManagerTrait<F>, event_publisher: SnapshotEventPublisher) -> Self {
+        Self { inner, event_publisher }
+    }
+
+    pub async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64> {
+        let result = self.inner.save(snapshot).await;
+
+        match &result {
+            Ok(snapshot_counter) => {
+                let file_path = self.inner.get_snapshot_path(*snapshot_counter);
+                self.event_publisher.emit(SnapshotEvent::Saved {
+                    snapshot_counter: *snapshot_counter,
+                    file_path,
+                    size_bytes: 0, // Could calculate this if needed
+                });
+            }
+            Err(e) => {
+                self.event_publisher.emit(SnapshotEvent::Failed {
+                    error: e.to_string(),
+                });
+            }
+        }
+
+        result
+    }
+
+    pub async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
+        let result = self.inner.load_latest().await;
+
+        if let Ok(Some((_, snapshot_counter))) = &result {
+            let file_path = self.inner.get_snapshot_path(*snapshot_counter);
+            self.event_publisher.emit(SnapshotEvent::Loaded {
+                snapshot_counter: *snapshot_counter,
+                file_path,
+            });
+        }
+
+        result
+    }
+
+    pub async fn initialize_counter(&mut self) -> Result<()> {
+        self.inner.initialize_counter().await
+    }
+}
+
+pub type WalService = WalServiceWrapper<FileManager>;
+pub type SnapshotService = SnapshotServiceWrapper<FileManager>;
 
 impl WalService {
-    pub fn spawn(config: WalConfig, snapshot_handle: SnapshotHandle, store_handle: StoreHandle) -> WalHandle {
+    pub fn spawn(config: WalConfig, snapshot_handle: SnapshotHandle, store_handle: StoreHandle) -> (WalHandle, crate::events::WalEventSubscriber) {
         let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (event_publisher, event_subscriber) = crate::events::create_wal_event_channel();
+        
         tokio::spawn(async move {
-            let mut service = WalService::new(FileManager, config, Some(snapshot_handle));
+            let inner = WalManagerTrait::new(FileManager, config, Some(snapshot_handle));
+            let mut service = WalService::new(inner, event_publisher.clone());
             service.initialize_counter().await;
-            service.replay(&store_handle).await;
+            
+            // Emit service started event
+            event_publisher.emit(WalEvent::ServiceStarted);
+
+            // Replay WAL files
+            if let Err(e) = service.replay(&store_handle).await {
+                error!(error = %e, "Failed to replay WAL files");
+            }
 
             while let Some(request) = receiver.recv().await {
                 match request {
@@ -105,19 +224,29 @@ impl WalService {
                     }
                 }
             }
+            
+            // Emit service stopped event
+            event_publisher.emit(WalEvent::ServiceStopped {
+                reason: "Channel closed".to_string(),
+            });
         });
 
-        WalHandle { sender }
+        (WalHandle { sender }, event_subscriber)
     }
 }
 
 impl SnapshotService {
-    pub fn spawn(config: SnapshotConfig) -> SnapshotHandle {
+    pub fn spawn(config: SnapshotConfig) -> (SnapshotHandle, crate::events::SnapshotEventSubscriber) {
         let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (event_publisher, event_subscriber) = crate::events::create_snapshot_event_channel();
 
         tokio::spawn(async move {
-            let mut service = SnapshotService::new(FileManager, config);
+            let inner = SnapshotManagerTrait::new(FileManager, config);
+            let mut service = SnapshotService::new(inner, event_publisher.clone());
             service.initialize_counter().await;
+            
+            // Emit service started event
+            event_publisher.emit(SnapshotEvent::ServiceStarted);
 
             while let Some(request) = receiver.recv().await {
                 match request {
@@ -127,9 +256,14 @@ impl SnapshotService {
                     }
                 }
             }
+            
+            // Emit service stopped event
+            event_publisher.emit(SnapshotEvent::ServiceStopped {
+                reason: "Channel closed".to_string(),
+            });
         });
 
-        SnapshotHandle { sender }
+        (SnapshotHandle { sender }, event_subscriber)
     }
 }
 
@@ -354,6 +488,12 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             wal_files_since_snapshot: 0,
             snapshot_handle,
         }
+    }
+
+    /// Get the current WAL file path
+    pub fn get_current_wal_path(&self) -> PathBuf {
+        // This is a best guess based on the current counter
+        self.config.wal_dir.join("current_wal.log")
     }
 }
 
@@ -752,6 +892,12 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
             },
             config,
         }
+    }
+
+    /// Get a snapshot file path for the given counter
+    pub fn get_snapshot_path(&self, snapshot_counter: u64) -> PathBuf {
+        let snapshot_filename = format!("snapshot_{:010}.bin", snapshot_counter);
+        self.config.snapshots_dir.join(snapshot_filename)
     }
 }
 
