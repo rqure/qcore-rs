@@ -1,13 +1,15 @@
 use qlib_rs::{now};
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::vec;
-use tokio::fs::{File, OpenOptions, create_dir_all, read_dir, remove_file};
+use tokio::fs::{File, OpenOptions, create_dir_all};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::sync::{mpsc, oneshot};
 use std::path::PathBuf;
 use async_trait::async_trait;
 
+use crate::files::{FileConfig, FileInfo, FileManager, FileManagerTrait};
+use crate::snapshot::SnapshotHandle;
 use crate::store::StoreHandle;
 
 /// Configuration for WAL manager operations
@@ -32,7 +34,7 @@ pub enum WalRequest {
         request: qlib_rs::Request,
         response: oneshot::Sender<Result<()>>,
     }
-}\
+}
 
 /// Handle for communicating with WAL manager task
 #[derive(Debug, Clone)]
@@ -165,9 +167,9 @@ impl Iterator for WalEntryReader {
 /// WAL manager handles WAL file operations
 pub struct WalManagerTrait<F: FileManagerTrait> {
     file_manager: F,
-    wal_config: FileConfig,
+    file_config: FileConfig,
     /// Configuration for WAL operations
-    config: WalConfig,
+    wal_config: WalConfig,
     /// Current WAL file handle and size
     current_wal_file: Option<File>,
     current_wal_size: usize,
@@ -181,12 +183,12 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     pub fn new(file_manager: F, config: WalConfig, snapshot_handle: Option<SnapshotHandle>) -> Self {
         Self {
             file_manager,
-            wal_config: FileConfig {
+            file_config: FileConfig {
                 prefix: "wal_".to_string(),
                 suffix: ".log".to_string(),
                 max_files: config.max_files, // Will be overridden by config
             },
-            config,
+            wal_config: config,
             current_wal_file: None,
             current_wal_size: 0,
             wal_files_since_snapshot: 0,
@@ -204,7 +206,7 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
         
         // Check if we need to create a new WAL file
         let should_create_new_file = self.current_wal_file.is_none() || 
-           (!self.current_wal_size + serialized_len > self.config.max_file_size);
+           (!self.current_wal_size + serialized_len > self.wal_config.max_file_size);
 
         if should_create_new_file {
             self.rotate_file(store_handle).await?;
@@ -218,7 +220,7 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     
     /// Replay WAL files to restore store state
     async fn replay(&self, store_handle: &StoreHandle) -> Result<()> {
-        let wal_files = self.file_manager.scan_files(&self.config.wal_dir, &self.wal_config).await?;
+        let wal_files = self.file_manager.scan_files(&self.wal_config.wal_dir, &self.file_config).await?;
         
         if wal_files.is_empty() {
             info!("No WAL files found, no replay needed");
@@ -250,10 +252,10 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     
     /// Initialize WAL counter from existing files
     async fn initialize_counter(&mut self) -> Result<()> {
-        let next_wal_counter = self.file_manager.get_next_counter(&self.config.wal_dir, &self.wal_config).await?;
+        let next_wal_counter = self.file_manager.get_next_counter(&self.wal_config.wal_dir, &self.file_config).await?;
         // The counter is now managed internally by tracking through the file manager
         info!(
-            wal_dir = %self.config.wal_dir.display(),
+            wal_dir = %self.wal_config.wal_dir.display(),
             next_counter = next_wal_counter,
             "Initialized WAL file counter"
         );
@@ -263,14 +265,14 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {
     async fn rotate_file(&mut self, store_handle: &StoreHandle) -> Result<()> {
-        create_dir_all(&self.config.wal_dir).await?;
+        create_dir_all(&self.wal_config.wal_dir).await?;
         
-        let wal_file_counter = self.file_manager.get_next_counter(&self.config.wal_dir, &self.wal_config).await?;
+        let wal_file_counter = self.file_manager.get_next_counter(&self.wal_config.wal_dir, &self.file_config).await?;
         let wal_filename = format!("wal_{:010}.log", wal_file_counter);
-        let wal_path = self.config.wal_dir.join(&wal_filename);
+        let wal_path = self.wal_config.wal_dir.join(&wal_filename);
 
         let current_size = self.current_wal_size;
-        let max_size = self.config.max_file_size;
+        let max_size = self.wal_config.max_file_size;
 
         info!(
             wal_file = %wal_path.display(),
@@ -287,7 +289,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
         self.wal_files_since_snapshot += 1;
         self.handle_snapshot_if_needed(store_handle).await?;
 
-        if let Err(e) = self.file_manager.cleanup_old_files(&self.config.wal_dir, &self.wal_config).await {
+        if let Err(e) = self.file_manager.cleanup_old_files(&self.wal_config.wal_dir, &self.file_config).await {
             error!(error = %e, "Failed to clean up old WAL files");
         }
         
@@ -296,7 +298,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     
     /// Handle snapshot creation if the interval is reached
     async fn handle_snapshot_if_needed(&mut self, store_handle: &StoreHandle) -> Result<()> {
-        if self.wal_files_since_snapshot >= self.config.snapshot_wal_interval {
+        if self.wal_files_since_snapshot >= self.wal_config.snapshot_wal_interval {
             info!(wal_files_count = self.wal_files_since_snapshot, "Taking snapshot after WAL file rollovers");
             
             // Store current state for potential rollback
@@ -312,7 +314,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                                 let snapshot_request = qlib_rs::Request::Snapshot {
                                     snapshot_counter,
                                     timestamp: Some(now()),
-                                    originator: Some(self.config.machine_id.clone()),
+                                    originator: Some(self.wal_config.machine_id.clone()),
                                 };
 
                                 if let Err(e) = self.write_request(&snapshot_request, store_handle).await {

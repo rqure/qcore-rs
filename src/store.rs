@@ -346,9 +346,8 @@ impl StoreHandle {
 pub struct StoreService;
 
 impl StoreService {
-    pub fn spawn() -> (StoreHandle, crate::events::StoreEventSubscriber) {
+    pub fn spawn() -> StoreHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let (event_publisher, event_subscriber) = crate::events::create_store_event_channel();
         
         tokio::spawn(async move {
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
@@ -359,9 +358,6 @@ impl StoreService {
                 vec![ft::scope(), ft::condition()]
             ).await.expect("Failed to create permission cache");
             let mut cel_executor = CelExecutor::new();
-
-            // Emit service started event
-            event_publisher.emit(StoreEvent::ServiceStarted);
 
             while let Some(request) = receiver.recv().await {
                 match request {
@@ -504,14 +500,9 @@ impl StoreService {
                     }
                 }
             }
-            
-            // Emit service stopped event
-            event_publisher.emit(StoreEvent::ServiceStopped {
-                reason: "Channel closed".to_string(),
-            });
         });
 
-        (StoreHandle { sender }, event_subscriber)
+        StoreHandle { sender }
     }
 }
 
