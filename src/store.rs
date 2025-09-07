@@ -4,7 +4,6 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashMap;
-use crate::events::{StoreEventPublisher, StoreEvent};
 
 /// Store manager request types
 #[derive(Debug)]

@@ -10,8 +10,14 @@ use std::time::Duration;
 use time;
 use serde::{Serialize, Deserialize};
 
-use crate::states::{Config, AvailabilityState};
-use crate::store::StoreHandle;
+/// Application availability state
+#[derive(Debug, Clone, PartialEq)]
+pub enum AvailabilityState {
+    /// Application is unavailable - attempting to sync with leader, clients are force disconnected
+    Unavailable,
+    /// Application is available - clients are allowed to connect and perform operations
+    Available,
+}
 
 /// Messages exchanged between peers for leader election
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -152,7 +158,6 @@ impl PeerHandle {
 }
 
 pub struct PeerService {
-    config: Config,
     startup_time: u64,
     availability_state: AvailabilityState,
     is_leader: bool,
@@ -162,14 +167,11 @@ pub struct PeerService {
     full_sync_request_pending: bool,
     peer_info: HashMap<String, PeerInfo>,
     connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
-    store: StoreHandle,
     connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
 }
 
 impl PeerService {
     pub fn spawn(
-        config: Config,
-        store: StoreHandle,
         connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     ) -> PeerHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -177,7 +179,6 @@ impl PeerService {
         let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
         
         let mut service = PeerService {
-            config: config.clone(),
             startup_time,
             availability_state: AvailabilityState::Available,
             is_leader: false,
@@ -187,7 +188,6 @@ impl PeerService {
             full_sync_request_pending: false,
             peer_info: HashMap::new(),
             connected_outbound_peers: HashMap::new(),
-            store: store.clone(),
             connections: connections.clone(),
         };
         
@@ -196,9 +196,8 @@ impl PeerService {
         // Start subtasks with the handle
         {
             let handle_clone = handle.clone();
-            let config_clone = config.clone();
             tokio::spawn(async move {
-                if let Err(e) = start_inbound_peer_server(config_clone, handle_clone, store.clone()).await {
+                if let Err(e) = start_inbound_peer_server(handle_clone).await {
                     error!(error = %e, "Inbound peer server failed");
                 }
             });
@@ -206,9 +205,8 @@ impl PeerService {
         
         {
             let handle_clone = handle.clone();
-            let config_clone = config.clone();
             tokio::spawn(async move {
-                if let Err(e) = manage_outbound_peer_connections(config_clone, handle_clone).await {
+                if let Err(e) = manage_outbound_peer_connections(handle_clone).await {
                     error!(error = %e, "Outbound peer connection manager failed");
                 }
             });
@@ -543,12 +541,12 @@ async fn handle_inbound_peer_connection(
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(peer_msg) = serde_json::from_str::<PeerMessage>(&text) {
-                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle, &store).await;
+                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
                 }
             }
             Ok(Message::Binary(data)) => {
                 if let Ok(peer_msg) = bincode::deserialize::<PeerMessage>(&data) {
-                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle, &store).await;
+                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
                 }
             }
             Ok(Message::Ping(payload)) => {
@@ -573,7 +571,6 @@ async fn handle_peer_message(
     peer_addr: &std::net::SocketAddr,
     ws_sender: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
     handle: &PeerHandle,
-    store: &StoreHandle,
 ) {
     match peer_msg {
         PeerMessage::Startup { machine_id, startup_time } => {
@@ -671,7 +668,7 @@ async fn start_inbound_peer_server(
     }
 }
 
-async fn manage_outbound_peer_connections(config: Config, handle: PeerHandle) -> Result<()> {
+async fn manage_outbound_peer_connections(handle: PeerHandle) -> Result<()> {
     info!("Starting outbound peer connection manager");
     
     let reconnect_interval = Duration::from_secs(config.peer_reconnect_interval_secs);
