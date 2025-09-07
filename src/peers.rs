@@ -10,6 +10,7 @@ use std::time::Duration;
 use time;
 use serde::{Serialize, Deserialize};
 
+use crate::Config;
 use crate::store::StoreHandle;
 
 /// Application availability state

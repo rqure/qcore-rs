@@ -10,6 +10,13 @@ use qlib_rs::{notification_channel, StoreMessage, EntityId, NotificationSender, 
 
 use crate::store::StoreHandle;
 
+/// Configuration for the client service
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    /// Port for client communication (StoreProxy clients)
+    pub client_port: u16,
+}
+
 /// Client service request types
 #[derive(Debug)]
 pub enum ClientRequest {
@@ -127,7 +134,7 @@ impl ClientHandle {
 }
 
 pub struct ClientService {
-    config: Config,
+    config: ClientConfig,
     connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
     client_notification_senders: HashMap<String, NotificationSender>,
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
@@ -136,7 +143,7 @@ pub struct ClientService {
 }
 
 impl ClientService {
-    pub fn spawn(config: Config, store: StoreHandle) -> ClientHandle {
+    pub fn spawn(config: ClientConfig, store: StoreHandle) -> ClientHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         
         let mut service = ClientService {
@@ -675,7 +682,7 @@ async fn handle_client_connection(
 }
 
 /// Start the client WebSocket server
-async fn start_client_server(config: Config, handle: ClientHandle, store: StoreHandle) -> Result<()> {
+async fn start_client_server(config: ClientConfig, handle: ClientHandle, store: StoreHandle) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.client_port);
     let listener = TcpListener::bind(&addr).await?;
     info!(bind_address = %addr, "Client WebSocket server started");
