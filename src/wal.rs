@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use crate::files::{FileConfig, FileInfo, FileManager, FileManagerTrait};
 use crate::snapshot::SnapshotHandle;
 use crate::store::StoreHandle;
+use crate::Services;
 
 /// Configuration for WAL manager operations
 #[derive(Debug, Clone)]
@@ -35,7 +36,7 @@ pub enum WalRequest {
         response: oneshot::Sender<Result<()>>,
     },
     SetServices {
-        services: crate::Services,
+        services: Services,
         response: oneshot::Sender<()>,
     },
 }
@@ -57,7 +58,7 @@ impl WalHandle {
     }
 
     /// Set services for dependencies
-    pub async fn set_services(&self, services: crate::Services) {
+    pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(WalRequest::SetServices {
             services,
@@ -204,7 +205,7 @@ pub struct WalManagerTrait<F: FileManagerTrait> {
     /// Handle to communicate with snapshot manager
     snapshot_handle: Option<SnapshotHandle>,
     /// Services for dependencies
-    services: Option<crate::Services>,
+    services: Option<Services>,
 }
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {

@@ -93,7 +93,7 @@ pub enum StoreRequest {
         response: oneshot::Sender<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>>,
     },
     SetServices {
-        services: crate::Services,
+        services: Services,
         response: oneshot::Sender<()>,
     },
 }
@@ -321,7 +321,7 @@ impl StoreHandle {
     }
 
     /// Set services for dependencies
-    pub async fn set_services(&self, services: crate::Services) {
+    pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(StoreRequest::SetServices {
             services,

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
-use crate::{auth::{AuthHandle, AuthenticationService}, clients::{ClientConfig, ClientHandle, ClientService}, peers::{PeerConfig, PeerHandle, PeerService}, snapshot::{SnapshotConfig, SnapshotHandle, SnapshotService}, store::{StoreHandle, StoreService}, wal::{WalConfig, WalHandle, WalService}};
+use crate::{auth::{AuthHandle, AuthService}, clients::{ClientConfig, ClientHandle, ClientService}, peers::{PeerConfig, PeerHandle, PeerService}, snapshot::{SnapshotConfig, SnapshotHandle, SnapshotService}, store::{StoreHandle, StoreService}, wal::{WalConfig, WalHandle, WalService}};
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
         .with_line_number(cfg!(debug_assertions))
         .init();
 
-    let auth_handle = AuthenticationService::spawn();
+    let auth_handle = AuthService::spawn();
     let store_handle = StoreService::spawn();
     let snapshot_handle = SnapshotService::spawn(SnapshotConfig {
         snapshots_dir: PathBuf::from(&config.data_dir).join("snapshots"),

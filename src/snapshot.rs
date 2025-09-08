@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::{fs::{create_dir_all, remove_file, File, OpenOptions}, io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, oneshot}};
 use tracing::{info, instrument, warn, error};
 
-use crate::files::{FileConfig, FileManager, FileManagerTrait};
+use crate::{files::{FileConfig, FileManager, FileManagerTrait}, Services};
 
 /// Trait for snapshot operations
 #[async_trait]
@@ -44,7 +44,7 @@ pub enum SnapshotRequest {
         response: oneshot::Sender<Result<u64>>,
     },
     SetServices {
-        services: crate::Services,
+        services: Services,
         response: oneshot::Sender<()>,
     },
 }
@@ -60,7 +60,7 @@ impl SnapshotHandle {
     }
 
     /// Set services for dependencies
-    pub async fn set_services(&self, services: crate::Services) {
+    pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(SnapshotRequest::SetServices {
             services,

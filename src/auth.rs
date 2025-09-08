@@ -1,8 +1,10 @@
-use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, FieldType, Request, Snowflake};
+use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, Request, Snowflake};
 use qlib_rs::auth::{AuthorizationScope, get_scope};
 use tokio::sync::{mpsc, oneshot};
 use anyhow::Result;
 use std::sync::Arc;
+
+use crate::Services;
 
 /// Authentication service request types
 #[derive(Debug)]
@@ -13,7 +15,7 @@ pub enum AuthRequest {
         response: oneshot::Sender<Result<Vec<Request>>>,
     },
     SetServices {
-        services: crate::Services,
+        services: Services,
         response: oneshot::Sender<()>,
     },
 }
@@ -41,7 +43,7 @@ impl AuthHandle {
     }
 
     /// Set services for dependencies
-    pub async fn set_services(&self, services: crate::Services) {
+    pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(AuthRequest::SetServices {
             services,
@@ -52,11 +54,11 @@ impl AuthHandle {
     }
 }
 
-pub struct AuthenticationService {
-    services: Option<crate::Services>,
+pub struct AuthService {
+    services: Option<Services>,
 }
 
-impl AuthenticationService {
+impl AuthService {
     pub fn spawn() -> AuthHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         

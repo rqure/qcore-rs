@@ -10,6 +10,8 @@ use std::time::Duration;
 use time;
 use serde::{Serialize, Deserialize};
 
+use crate::Services;
+
 /// Configuration for the peer service
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
@@ -122,7 +124,7 @@ pub enum PeerRequest {
     },
     FullSyncCompleted,
     SetServices {
-        services: crate::Services,
+        services: Services,
         response: oneshot::Sender<()>,
     },
 }
@@ -194,7 +196,7 @@ impl PeerHandle {
     }
 
     /// Set services for dependencies
-    pub async fn set_services(&self, services: crate::Services) {
+    pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(PeerRequest::SetServices {
             services,
@@ -217,7 +219,7 @@ pub struct PeerService {
     peer_info: HashMap<String, PeerInfo>,
     connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
     connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
-    services: Option<crate::Services>,
+    services: Option<Services>,
 }
 
 impl PeerService {
