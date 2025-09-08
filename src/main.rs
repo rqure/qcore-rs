@@ -65,12 +65,12 @@ pub struct Config {
 }
 
 struct Services {
-    auth_handle: Option<AuthHandle>,
-    client_handle: Option<ClientHandle>,
-    peer_handle: Option<PeerHandle>,
-    snapshot_handle: Option<SnapshotHandle>,
-    store_handle: Option<StoreHandle>,
-    wal_handle: Option<WalHandle>,
+    auth_handle: AuthHandle,
+    client_handle: ClientHandle,
+    peer_handle: PeerHandle,
+    snapshot_handle: SnapshotHandle,
+    store_handle: StoreHandle,
+    wal_handle: WalHandle,
 }
 
 #[tokio::main]
