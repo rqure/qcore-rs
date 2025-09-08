@@ -4,9 +4,13 @@ mod peers;
 mod store;
 mod snapshot;
 mod files;
+mod authentication;
+mod authorization;
 
 use anyhow::Result;
 use clap::Parser;
+
+use crate::{clients::ClientHandle, peers::PeerHandle, snapshot::SnapshotHandle, store::StoreHandle, wal::WalHandle};
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -59,6 +63,14 @@ pub struct Config {
     /// Delay in seconds after startup before self-promoting to leader when no peers are available
     #[arg(long, default_value_t = 5)]
     pub self_promotion_delay_secs: u64,
+}
+
+struct Services {
+    store_handle: StoreHandle,
+    client_handle: ClientHandle,
+    peer_handle: PeerHandle,
+    wal_handle: WalHandle,
+    snapshot_handle: SnapshotHandle,
 }
 
 #[tokio::main]
