@@ -8,8 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use qlib_rs::{notification_channel, StoreMessage, EntityId, NotificationSender, NotifyConfig};
 
-use crate::store::StoreHandle;
-
 /// Configuration for the client service
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -23,6 +21,54 @@ impl From<&crate::Config> for ClientConfig {
             client_port: config.client_port,
         }
     }
+}
+
+/// Events emitted by the client service
+#[derive(Debug)]
+pub enum ClientEvent {
+    /// Emitted when a client connects
+    ClientConnected {
+        client_addr: String,
+    },
+    /// Emitted when a client disconnects
+    ClientDisconnected {
+        client_addr: String,
+    },
+    /// Emitted when a client authenticates successfully
+    ClientAuthenticated {
+        client_addr: String,
+        client_id: EntityId,
+    },
+    /// Emitted when a client requests authentication
+    AuthenticationRequested {
+        client_addr: String,
+        message: StoreMessage,
+        response: oneshot::Sender<StoreMessage>,
+    },
+    /// Emitted when a client sends a store message that needs processing
+    StoreMessageReceived {
+        client_addr: String,
+        message: StoreMessage,
+        response: oneshot::Sender<StoreMessage>,
+    },
+    /// Emitted when a client requests notification registration
+    NotificationRegistrationRequested {
+        client_addr: String,
+        config: NotifyConfig,
+        notification_sender: NotificationSender,
+        response: oneshot::Sender<Result<()>>,
+    },
+    /// Emitted when a client requests notification unregistration
+    NotificationUnregistrationRequested {
+        client_addr: String,
+        config: NotifyConfig,
+        notification_sender: NotificationSender,
+        response: oneshot::Sender<bool>,
+    },
+    /// Emitted when all clients need to be force disconnected
+    ForceDisconnectAllRequested {
+        response: oneshot::Sender<()>,
+    },
 }
 
 /// Client service request types
@@ -57,6 +103,9 @@ pub enum ClientRequest {
     },
     ForceDisconnectAll {
         response: oneshot::Sender<()>,
+    },
+    EmitEvent {
+        event: ClientEvent,
     },
 }
 
@@ -139,28 +188,35 @@ impl ClientHandle {
             let _ = response_rx.await;
         }
     }
+
+    pub async fn emit_event(&self, event: ClientEvent) -> Result<()> {
+        self.sender.send(ClientRequest::EmitEvent { event })
+            .map_err(|_| anyhow::anyhow!("Client service task has stopped"))
+    }
 }
 
-pub struct ClientService {
+pub struct ClientServiceTrait {
     config: ClientConfig,
     connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
     client_notification_senders: HashMap<String, NotificationSender>,
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
     authenticated_clients: HashMap<String, EntityId>,
-    store: StoreHandle,
+    event_sender: mpsc::UnboundedSender<ClientEvent>,
 }
 
+pub type ClientService = ClientServiceTrait;
+
 impl ClientService {
-    pub fn spawn(config: ClientConfig, store: StoreHandle) -> ClientHandle {
+    pub fn spawn(config: ClientConfig, event_sender: mpsc::UnboundedSender<ClientEvent>) -> ClientHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         
-        let mut service = ClientService {
+        let mut service = ClientServiceTrait {
             config: config.clone(),
             connected_clients: HashMap::new(),
             client_notification_senders: HashMap::new(),
             client_notification_configs: HashMap::new(),
             authenticated_clients: HashMap::new(),
-            store: store.clone(),
+            event_sender: event_sender.clone(),
         };
         
         let handle = ClientHandle { sender: sender.clone() };
@@ -169,9 +225,8 @@ impl ClientService {
         {
             let handle_clone = handle.clone();
             let config_clone = config.clone();
-            let store_clone = store.clone();
             tokio::spawn(async move {
-                if let Err(e) = start_client_server(config_clone, handle_clone, store_clone).await {
+                if let Err(e) = start_client_server(config_clone, handle_clone).await {
                     error!(error = %e, "Client server task failed");
                 }
             });
@@ -201,13 +256,24 @@ impl ClientService {
         match request {
             ClientRequest::ClientConnected { client_addr, sender, notification_sender } => {
                 self.connected_clients.insert(client_addr.clone(), sender);
-                self.client_notification_senders.insert(client_addr, notification_sender);
+                self.client_notification_senders.insert(client_addr.clone(), notification_sender);
+                
+                // Emit client connected event
+                let _ = self.event_sender.send(ClientEvent::ClientConnected {
+                    client_addr,
+                });
             }
             ClientRequest::ClientDisconnected { client_addr } => {
                 self.handle_client_disconnected(client_addr).await;
             }
             ClientRequest::ClientAuthenticated { client_addr, client_id } => {
-                self.authenticated_clients.insert(client_addr, client_id);
+                self.authenticated_clients.insert(client_addr.clone(), client_id.clone());
+                
+                // Emit client authenticated event
+                let _ = self.event_sender.send(ClientEvent::ClientAuthenticated {
+                    client_addr,
+                    client_id,
+                });
             }
             ClientRequest::ProcessStoreMessage { message, client_addr, response } => {
                 let result = self.process_store_message(message, client_addr).await;
@@ -225,6 +291,9 @@ impl ClientService {
                 self.force_disconnect_all_clients().await;
                 let _ = response.send(());
             }
+            ClientRequest::EmitEvent { event } => {
+                let _ = self.event_sender.send(event);
+            }
         }
     }
     
@@ -239,24 +308,35 @@ impl ClientService {
         // Remove authentication state for this client
         self.authenticated_clients.remove(&client_addr);
         
-        // Unregister all notifications for this client from the store
+        // For each notification config, emit an unregistration event
         if let Some(configs) = client_configs {
             if let Some(sender) = notification_sender {
                 for config in configs {
-                    let removed = self.store.unregister_notification(&config, &sender).await;
-                    if removed {
-                        debug!(
-                            client_addr = %client_addr,
-                            config = ?config,
-                            "Cleaned up notification config for disconnected client"
-                        );
-                    } else {
-                        warn!(
-                            client_addr = %client_addr,
-                            config = ?config,
-                            "Failed to clean up notification config for disconnected client"
-                        );
-                    }
+                    let (response_tx, response_rx) = oneshot::channel();
+                    let client_addr_clone = client_addr.clone();
+                    let _ = self.event_sender.send(ClientEvent::NotificationUnregistrationRequested {
+                        client_addr: client_addr_clone.clone(),
+                        config,
+                        notification_sender: sender.clone(),
+                        response: response_tx,
+                    });
+                    
+                    // Wait for the response but don't block on it
+                    tokio::spawn(async move {
+                        if let Ok(removed) = response_rx.await {
+                            if removed {
+                                debug!(
+                                    client_addr = %client_addr_clone,
+                                    "Cleaned up notification config for disconnected client"
+                                );
+                            } else {
+                                warn!(
+                                    client_addr = %client_addr_clone,
+                                    "Failed to clean up notification config for disconnected client"
+                                );
+                            }
+                        }
+                    });
                 }
                 // The notification sender being dropped will close the channel
                 drop(sender);
@@ -265,6 +345,11 @@ impl ClientService {
             // Just drop the sender if no configs were tracked
             drop(sender);
         }
+        
+        // Emit client disconnected event
+        let _ = self.event_sender.send(ClientEvent::ClientDisconnected {
+            client_addr,
+        });
     }
     
     async fn process_store_message(&mut self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
@@ -276,26 +361,22 @@ impl ClientService {
         };
 
         match message {
-            StoreMessage::Authenticate { id, subject_name: _, credential: _ } => {
-                // TODO: Implement proper authentication
-                // For now, we'll simulate successful authentication
-                if let Some(ref addr) = client_addr {
-                    let client_id = EntityId::new("User", 0); // Temporary ID
-                    self.authenticated_clients.insert(addr.clone(), client_id.clone());
-                    
-                    StoreMessage::AuthenticateResponse {
-                        id,
-                        response: Ok(qlib_rs::AuthenticationResult {
-                            subject_id: client_id,
-                            subject_type: "User".to_string(),
-                        }),
-                    }
-                } else {
-                    StoreMessage::AuthenticateResponse {
-                        id,
-                        response: Err("No client address provided".to_string()),
-                    }
-                }
+            StoreMessage::Authenticate { .. } => {
+                // Emit authentication request event
+                let (response_tx, response_rx) = oneshot::channel();
+                let client_addr_clone = client_addr.clone().unwrap_or_else(|| "unknown".to_string());
+                
+                let _ = self.event_sender.send(ClientEvent::AuthenticationRequested {
+                    client_addr: client_addr_clone,
+                    message,
+                    response: response_tx,
+                });
+                
+                // Wait for the response
+                response_rx.await.unwrap_or_else(|_| StoreMessage::Error {
+                    id: "unknown".to_string(),
+                    error: "Authentication service unavailable".to_string(),
+                })
             }
             
             StoreMessage::AuthenticateResponse { .. } => {
@@ -306,108 +387,150 @@ impl ClientService {
                 }
             }
             
-            // Handle other store messages by delegating to the store
-            _ => {
-                // Get the client ID if the client is authenticated
-                let _client_id = if let Some(ref addr) = client_addr {
-                    self.authenticated_clients.get(addr).cloned()
-                } else {
-                    None
-                };
-                
-                // Process the message with the store
-                match &message {
-                    StoreMessage::RegisterNotification { id, config } => {
-                        if let Some(ref addr) = client_addr {
-                            if let Some(notification_sender) = client_notification_sender {
-                                match self.store.register_notification(config.clone(), notification_sender).await {
-                            Ok(()) => {
+            // Handle notification registration and unregistration
+            StoreMessage::RegisterNotification { id, config } => {
+                if let Some(ref addr) = client_addr {
+                    if let Some(notification_sender) = client_notification_sender {
+                        let (response_tx, response_rx) = oneshot::channel();
+                        
+                        let _ = self.event_sender.send(ClientEvent::NotificationRegistrationRequested {
+                            client_addr: addr.clone(),
+                            config: config.clone(),
+                            notification_sender,
+                            response: response_tx,
+                        });
+                        
+                        match response_rx.await {
+                            Ok(Ok(())) => {
                                 // Track this config for cleanup on disconnect
                                 self.client_notification_configs
                                     .entry(addr.clone())
                                     .or_insert_with(HashSet::new)
-                                    .insert(config.clone());
+                                    .insert(config);
                                 
                                 StoreMessage::RegisterNotificationResponse {
-                                    id: id.clone(),
+                                    id,
                                     response: Ok(()),
                                 }
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 StoreMessage::Error {
-                                    id: id.clone(),
+                                    id,
                                     error: format!("Failed to register notification: {}", e),
                                 }
                             }
-                        }
-                            } else {
+                            Err(_) => {
                                 StoreMessage::Error {
-                                    id: id.clone(),
-                                    error: "No notification channel available for client".to_string(),
+                                    id,
+                                    error: "Notification service unavailable".to_string(),
                                 }
                             }
-                        } else {
-                            StoreMessage::Error {
-                                id: id.clone(),
-                                error: "No client address provided".to_string(),
-                            }
+                        }
+                    } else {
+                        StoreMessage::Error {
+                            id,
+                            error: "No notification channel available for client".to_string(),
                         }
                     }
-                    
-                    StoreMessage::UnregisterNotification { id, config } => {
-                        if let Some(ref addr) = client_addr {
-                            if let Some(notification_sender) = client_notification_sender {
-                                let removed = self.store.unregister_notification(config, &notification_sender).await;
+                } else {
+                    StoreMessage::Error {
+                        id,
+                        error: "No client address provided".to_string(),
+                    }
+                }
+            }
+            
+            StoreMessage::UnregisterNotification { id, config } => {
+                if let Some(ref addr) = client_addr {
+                    if let Some(notification_sender) = client_notification_sender {
+                        let (response_tx, response_rx) = oneshot::channel();
+                        
+                        let _ = self.event_sender.send(ClientEvent::NotificationUnregistrationRequested {
+                            client_addr: addr.clone(),
+                            config: config.clone(),
+                            notification_sender,
+                            response: response_tx,
+                        });
+                        
+                        match response_rx.await {
+                            Ok(removed) => {
                                 if removed {
                                     // Remove from our tracking
                                     if let Some(configs) = self.client_notification_configs.get_mut(addr) {
-                                        configs.remove(config);
+                                        configs.remove(&config);
                                     }
                                 }
                                 
                                 StoreMessage::UnregisterNotificationResponse {
-                                    id: id.clone(),
+                                    id,
                                     response: removed,
                                 }
-                            } else {
+                            }
+                            Err(_) => {
                                 StoreMessage::Error {
-                                    id: id.clone(),
-                                    error: "No notification channel available for client".to_string(),
+                                    id,
+                                    error: "Notification service unavailable".to_string(),
                                 }
                             }
-                        } else {
-                            StoreMessage::Error {
-                                id: id.clone(),
-                                error: "No client address provided".to_string(),
-                            }
+                        }
+                    } else {
+                        StoreMessage::Error {
+                            id,
+                            error: "No notification channel available for client".to_string(),
                         }
                     }
-                    
-                    // For all other messages, we need to implement delegation to the store
-                    // This is a simplified version - you may need to implement more specific handling
-                    _ => {
-                        // TODO: Implement delegation to store for other message types
-                        StoreMessage::Error {
-                            id: "unknown".to_string(),
-                            error: "Message type not yet implemented in ClientService".to_string(),
-                        }
+                } else {
+                    StoreMessage::Error {
+                        id,
+                        error: "No client address provided".to_string(),
                     }
                 }
+            }
+            
+            // For all other messages, emit store message received event
+            _ => {
+                let (response_tx, response_rx) = oneshot::channel();
+                let client_addr_clone = client_addr.clone().unwrap_or_else(|| "unknown".to_string());
+                
+                let _ = self.event_sender.send(ClientEvent::StoreMessageReceived {
+                    client_addr: client_addr_clone,
+                    message,
+                    response: response_tx,
+                });
+                
+                // Wait for the response
+                response_rx.await.unwrap_or_else(|_| StoreMessage::Error {
+                    id: "unknown".to_string(),
+                    error: "Store service unavailable".to_string(),
+                })
             }
         }
     }
     
     async fn register_notification_internal(&mut self, client_addr: String, config: NotifyConfig) -> Result<()> {
         if let Some(notification_sender) = self.client_notification_senders.get(&client_addr) {
-            self.store.register_notification(config.clone(), notification_sender.clone()).await?;
+            let (response_tx, response_rx) = oneshot::channel();
             
-            // Track this config for cleanup on disconnect
-            self.client_notification_configs
-                .entry(client_addr)
-                .or_insert_with(HashSet::new)
-                .insert(config);
+            let _ = self.event_sender.send(ClientEvent::NotificationRegistrationRequested {
+                client_addr: client_addr.clone(),
+                config: config.clone(),
+                notification_sender: notification_sender.clone(),
+                response: response_tx,
+            });
             
-            Ok(())
+            match response_rx.await {
+                Ok(result) => {
+                    if result.is_ok() {
+                        // Track this config for cleanup on disconnect
+                        self.client_notification_configs
+                            .entry(client_addr)
+                            .or_insert_with(HashSet::new)
+                            .insert(config);
+                    }
+                    result
+                }
+                Err(_) => Err(anyhow::anyhow!("Notification service unavailable"))
+            }
         } else {
             Err(anyhow::anyhow!("No notification channel available for client"))
         }
@@ -415,14 +538,27 @@ impl ClientService {
     
     async fn unregister_notification_internal(&mut self, client_addr: String, config: NotifyConfig) -> bool {
         if let Some(notification_sender) = self.client_notification_senders.get(&client_addr) {
-            let removed = self.store.unregister_notification(&config, notification_sender).await;
-            if removed {
-                // Remove from our tracking
-                if let Some(configs) = self.client_notification_configs.get_mut(&client_addr) {
-                    configs.remove(&config);
+            let (response_tx, response_rx) = oneshot::channel();
+            
+            let _ = self.event_sender.send(ClientEvent::NotificationUnregistrationRequested {
+                client_addr: client_addr.clone(),
+                config: config.clone(),
+                notification_sender: notification_sender.clone(),
+                response: response_tx,
+            });
+            
+            match response_rx.await {
+                Ok(removed) => {
+                    if removed {
+                        // Remove from our tracking
+                        if let Some(configs) = self.client_notification_configs.get_mut(&client_addr) {
+                            configs.remove(&config);
+                        }
+                    }
+                    removed
                 }
+                Err(_) => false
             }
-            removed
         } else {
             false
         }
@@ -456,16 +592,24 @@ impl ClientService {
         self.client_notification_senders.clear();
         self.client_notification_configs.clear();
         self.authenticated_clients.clear();
+        
+        // Emit force disconnect all requested event
+        let (response_tx, response_rx) = oneshot::channel();
+        let _ = self.event_sender.send(ClientEvent::ForceDisconnectAllRequested {
+            response: response_tx,
+        });
+        
+        // Wait for confirmation (optional)
+        let _ = response_rx.await;
     }
 }
 
 /// Handle a single client WebSocket connection
-#[instrument(skip(stream, handle, _store), fields(client_addr = %client_addr))]
+#[instrument(skip(stream, handle), fields(client_addr = %client_addr))]
 async fn handle_client_connection(
     stream: TcpStream,
     client_addr: std::net::SocketAddr,
     handle: ClientHandle,
-    _store: StoreHandle,
 ) -> Result<()> {
     info!("Accepting client connection");
     
@@ -690,7 +834,7 @@ async fn handle_client_connection(
 }
 
 /// Start the client WebSocket server
-async fn start_client_server(config: ClientConfig, handle: ClientHandle, store: StoreHandle) -> Result<()> {
+async fn start_client_server(config: ClientConfig, handle: ClientHandle) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.client_port);
     let listener = TcpListener::bind(&addr).await?;
     info!(bind_address = %addr, "Client WebSocket server started");
@@ -701,9 +845,8 @@ async fn start_client_server(config: ClientConfig, handle: ClientHandle, store: 
                 debug!(client_addr = %client_addr, "Accepted new client connection");
                 
                 let handle_clone = handle.clone();
-                let store_clone = store.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client_connection(stream, client_addr, handle_clone, store_clone).await {
+                    if let Err(e) = handle_client_connection(stream, client_addr, handle_clone).await {
                         error!(
                             error = %e,
                             client_addr = %client_addr,
