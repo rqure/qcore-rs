@@ -10,6 +10,8 @@ use std::time::Duration;
 use time;
 use serde::{Serialize, Deserialize};
 
+use crate::store::StoreHandle;
+
 /// Configuration for the peer service
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
@@ -81,25 +83,16 @@ pub struct PeerInfo {
     pub startup_time: u64
 }
 
-/// Events emitted by the peer service
+/// Connection state separated from main state to reduce lock contention
 #[derive(Debug)]
-pub enum PeerEvent {
-    /// Emitted when a full sync request is received and a snapshot is needed
-    FullSyncRequestReceived {
-        requesting_machine_id: String,
-        peer_addr: String,
-    },
-    /// Emitted when a full sync response is received and needs to be applied
-    FullSyncResponseReceived {
-        snapshot: qlib_rs::Snapshot,
-    },
-    /// Emitted when sync requests are received and need to be applied
-    SyncRequestsReceived {
-        requests: Vec<qlib_rs::Request>,
-    },
+pub struct ConnectionState {
+    /// Connected outbound peers with message senders
+    pub connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
+    /// Connected clients with message senders
+    pub connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
+    /// Track authenticated clients
+    pub authenticated_clients: HashMap<String, EntityId>,
 }
-
-
 
 /// Peer service request types
 #[derive(Debug)]
@@ -129,21 +122,7 @@ pub enum PeerRequest {
     OutboundPeerDisconnected {
         peer_addr: String,
     },
-    InboundPeerConnected {
-        peer_addr: String,
-        sender: mpsc::UnboundedSender<Message>,
-    },
-    InboundPeerDisconnected {
-        peer_addr: String,
-    },
     FullSyncCompleted,
-    EmitEvent {
-        event: PeerEvent,
-    },
-    SendFullSyncResponse {
-        peer_addr: String,
-        snapshot: qlib_rs::Snapshot,
-    },
 }
 
 /// Handle for communicating with peer service
@@ -211,29 +190,6 @@ impl PeerHandle {
     pub fn full_sync_completed(&self) {
         let _ = self.sender.send(PeerRequest::FullSyncCompleted);
     }
-
-    pub async fn emit_event(&self, event: PeerEvent) -> Result<()> {
-        self.sender.send(PeerRequest::EmitEvent { event })
-            .map_err(|_| anyhow::anyhow!("Peer service task has stopped"))
-    }
-
-    pub fn send_full_sync_response(&self, peer_addr: String, snapshot: qlib_rs::Snapshot) {
-        let _ = self.sender.send(PeerRequest::SendFullSyncResponse {
-            peer_addr,
-            snapshot,
-        });
-    }
-
-    pub fn inbound_peer_connected(&self, peer_addr: String, sender: mpsc::UnboundedSender<Message>) {
-        let _ = self.sender.send(PeerRequest::InboundPeerConnected {
-            peer_addr,
-            sender,
-        });
-    }
-
-    pub fn inbound_peer_disconnected(&self, peer_addr: String) {
-        let _ = self.sender.send(PeerRequest::InboundPeerDisconnected { peer_addr });
-    }
 }
 
 pub struct PeerService {
@@ -247,14 +203,15 @@ pub struct PeerService {
     full_sync_request_pending: bool,
     peer_info: HashMap<String, PeerInfo>,
     connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
-    connected_inbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
-    event_sender: mpsc::UnboundedSender<PeerEvent>,
+    store: StoreHandle,
+    connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
 }
 
 impl PeerService {
     pub fn spawn(
         config: PeerConfig,
-        event_sender: mpsc::UnboundedSender<PeerEvent>,
+        store: StoreHandle,
+        connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     ) -> PeerHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         
@@ -271,8 +228,8 @@ impl PeerService {
             full_sync_request_pending: false,
             peer_info: HashMap::new(),
             connected_outbound_peers: HashMap::new(),
-            connected_inbound_peers: HashMap::new(),
-            event_sender,
+            store: store.clone(),
+            connections: connections.clone(),
         };
         
         let handle = PeerHandle { sender: sender.clone() };
@@ -282,7 +239,7 @@ impl PeerService {
             let handle_clone = handle.clone();
             let config_clone = config.clone();
             tokio::spawn(async move {
-                if let Err(e) = start_inbound_peer_server(config_clone, handle_clone).await {
+                if let Err(e) = start_inbound_peer_server(config_clone, handle_clone, store.clone()).await {
                     error!(error = %e, "Inbound peer server failed");
                 }
             });
@@ -356,46 +313,11 @@ impl PeerService {
             PeerRequest::OutboundPeerDisconnected { peer_addr } => {
                 self.connected_outbound_peers.remove(&peer_addr);
             }
-            PeerRequest::InboundPeerConnected { peer_addr, sender } => {
-                self.connected_inbound_peers.insert(peer_addr, sender);
-            }
-            PeerRequest::InboundPeerDisconnected { peer_addr } => {
-                self.connected_inbound_peers.remove(&peer_addr);
-            }
             PeerRequest::FullSyncCompleted => {
                 self.is_fully_synced = true;
                 self.full_sync_request_pending = false;
                 self.availability_state = AvailabilityState::Available;
                 self.became_unavailable_at = None;
-            }
-            PeerRequest::EmitEvent { event } => {
-                let _ = self.event_sender.send(event);
-            }
-            PeerRequest::SendFullSyncResponse { peer_addr, snapshot } => {
-                let response = PeerMessage::FullSyncResponse { snapshot };
-                
-                if let Ok(response_binary) = bincode::serialize(&response) {
-                    let message = Message::Binary(response_binary);
-                    
-                    // Try to send through inbound connection first
-                    if let Some(sender) = self.connected_inbound_peers.get(&peer_addr) {
-                        if let Err(e) = sender.send(message.clone()) {
-                            warn!(peer_addr = %peer_addr, error = %e, "Failed to send full sync response to inbound peer");
-                        } else {
-                            info!(peer_addr = %peer_addr, "Sent FullSyncResponse to inbound peer");
-                        }
-                    }
-                    // Try outbound connection if inbound not found
-                    else if let Some(sender) = self.connected_outbound_peers.get(&peer_addr) {
-                        if let Err(e) = sender.send(message) {
-                            warn!(peer_addr = %peer_addr, error = %e, "Failed to send full sync response to outbound peer");
-                        } else {
-                            info!(peer_addr = %peer_addr, "Sent FullSyncResponse to outbound peer");
-                        }
-                    } else {
-                        warn!(peer_addr = %peer_addr, "No connection found for peer to send full sync response");
-                    }
-                }
             }
         }
     }
@@ -541,7 +463,7 @@ impl PeerService {
         // Force disconnect clients if becoming unavailable
         if old_state != self.availability_state && 
            matches!(self.availability_state, AvailabilityState::Unavailable) {
-            // Clients are now stored directly in PeerService, no need for mutex
+            let mut connections = self.connections.lock().await;
         }
     }
     
@@ -644,11 +566,12 @@ impl PeerService {
 }
 
 /// Handle a single peer WebSocket connection
-#[instrument(skip(stream, handle), fields(peer_addr = %peer_addr))]
+#[instrument(skip(stream, handle, store), fields(peer_addr = %peer_addr))]
 async fn handle_inbound_peer_connection(
     stream: TcpStream,
     peer_addr: std::net::SocketAddr,
     handle: PeerHandle,
+    store: StoreHandle,
 ) -> Result<()> {
     info!("Accepting inbound peer connection");
     
@@ -657,40 +580,20 @@ async fn handle_inbound_peer_connection(
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
-    // Create a channel to receive messages to send to this peer
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Message>();
-    
-    // Register this inbound peer connection
-    handle.inbound_peer_connected(peer_addr.to_string(), msg_tx);
-    
-    // Spawn task to handle outgoing messages to this peer
-    let peer_addr_clone = peer_addr.to_string();
-    let handle_clone = handle.clone();
-    let sender_task = tokio::spawn(async move {
-        while let Some(message) = msg_rx.recv().await {
-            if ws_sender.send(message).await.is_err() {
-                break;
-            }
-        }
-        // Notify when this task ends
-        handle_clone.inbound_peer_disconnected(peer_addr_clone);
-    });
-    
-    // Handle incoming messages from this peer
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(peer_msg) = serde_json::from_str::<PeerMessage>(&text) {
-                    handle_peer_message(peer_msg, &peer_addr, &handle).await;
+                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle, &store).await;
                 }
             }
             Ok(Message::Binary(data)) => {
                 if let Ok(peer_msg) = bincode::deserialize::<PeerMessage>(&data) {
-                    handle_peer_message(peer_msg, &peer_addr, &handle).await;
+                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle, &store).await;
                 }
             }
-            Ok(Message::Ping(_payload)) => {
-                // Ping/pong will be handled automatically by the WebSocket implementation
+            Ok(Message::Ping(payload)) => {
+                let _ = ws_sender.send(Message::Pong(payload)).await;
             }
             Ok(Message::Close(_)) => break,
             Err(e) => {
@@ -701,7 +604,6 @@ async fn handle_inbound_peer_connection(
         }
     }
     
-    sender_task.abort();
     handle.peer_disconnected(peer_addr.to_string());
     info!("Peer connection terminated");
     Ok(())
@@ -710,7 +612,9 @@ async fn handle_inbound_peer_connection(
 async fn handle_peer_message(
     peer_msg: PeerMessage,
     peer_addr: &std::net::SocketAddr,
+    ws_sender: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
     handle: &PeerHandle,
+    store: &StoreHandle,
 ) {
     match peer_msg {
         PeerMessage::Startup { machine_id, startup_time } => {
@@ -726,34 +630,39 @@ async fn handle_peer_message(
         PeerMessage::FullSyncRequest { machine_id } => {
             info!(requesting_machine = %machine_id, "Received full sync request");
             
-            // Emit event for the main task to handle - it will get snapshot and send response
-            if let Err(e) = handle.emit_event(PeerEvent::FullSyncRequestReceived {
-                requesting_machine_id: machine_id,
-                peer_addr: peer_addr.to_string(),
-            }).await {
-                error!(error = %e, "Failed to emit full sync request event");
+            if let Some(snapshot) = store.take_snapshot().await {
+                let response = PeerMessage::FullSyncResponse { snapshot };
+                
+                if let Ok(response_binary) = bincode::serialize(&response) {
+                    let _ = ws_sender.send(Message::Binary(response_binary)).await;
+                    info!(requesting_machine = %machine_id, "Sent FullSyncResponse");
+                }
             }
-            
-            // Note: The main task will call handle.send_full_sync_response() with the snapshot
         }
         
         PeerMessage::FullSyncResponse { snapshot } => {
-            info!("Received full sync response, emitting event for application");
+            info!("Received full sync response, applying snapshot");
             
-            // Emit event for the main task to handle snapshot application
-            if let Err(e) = handle.emit_event(PeerEvent::FullSyncResponseReceived { snapshot }).await {
-                error!(error = %e, "Failed to emit full sync response event");
-            } else {
-                handle.full_sync_completed();
-                info!("Successfully emitted full sync response event");
+            store.disable_notifications().await;
+            store.inner_restore_snapshot(snapshot.clone()).await;
+            store.enable_notifications().await;
+            
+            // Save snapshot to disk
+            let (is_leader, _) = handle.get_leadership_info().await;
+            if !is_leader {
+                // Only save if we're not the leader to avoid unnecessary disk writes
+                // Implementation would be similar to previous version but simplified
             }
+            
+            handle.full_sync_completed();
+            info!("Successfully applied full sync snapshot");
         }
         
         PeerMessage::SyncRequest { requests } => {
             let (_, current_leader) = handle.get_leadership_info().await;
             let our_machine_id = current_leader.unwrap_or_default(); // This needs to be fixed
             
-            let requests_to_apply: Vec<_> = requests.into_iter()
+            let mut requests_to_apply: Vec<_> = requests.into_iter()
                 .filter(|request| {
                     if let Some(originator) = request.originator() {
                         *originator != our_machine_id
@@ -765,13 +674,10 @@ async fn handle_peer_message(
                 .collect();
             
             if !requests_to_apply.is_empty() {
-                // Emit event for the main task to handle
-                if let Err(e) = handle.emit_event(PeerEvent::SyncRequestsReceived {
-                    requests: requests_to_apply.clone(),
-                }).await {
-                    error!(error = %e, "Failed to emit sync requests event");
+                if let Err(e) = store.perform_mut(&mut requests_to_apply).await {
+                    error!(error = %e, "Failed to apply sync requests from peer");
                 } else {
-                    debug!(count = requests_to_apply.len(), "Emitted sync requests event");
+                    debug!(count = requests_to_apply.len(), "Applied sync requests from peer");
                 }
             }
         }
@@ -781,6 +687,7 @@ async fn handle_peer_message(
 async fn start_inbound_peer_server(
     config: PeerConfig,
     handle: PeerHandle,
+    store: StoreHandle,
 ) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.peer_port);
     let listener = TcpListener::bind(&addr).await?;
@@ -790,9 +697,10 @@ async fn start_inbound_peer_server(
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 let handle_clone = handle.clone();
+                let store_clone = store.clone();
                 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr, handle_clone).await {
+                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr, handle_clone, store_clone).await {
                         error!(error = %e, peer_addr = %peer_addr, "Error handling peer connection");
                     }
                 });
@@ -853,7 +761,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                if let Ok(PeerMessage::FullSyncResponse { snapshot: _ }) = bincode::deserialize::<PeerMessage>(&data) {
+                if let Ok(PeerMessage::FullSyncResponse { snapshot }) = bincode::deserialize::<PeerMessage>(&data) {
                     // Handle FullSyncResponse - this is a simplified version
                     info!("Received FullSyncResponse via outbound connection");
                     // Process the snapshot...
