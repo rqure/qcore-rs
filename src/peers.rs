@@ -123,6 +123,10 @@ pub enum PeerRequest {
         peer_addr: String,
     },
     FullSyncCompleted,
+    SetServices {
+        services: crate::Services,
+        response: oneshot::Sender<()>,
+    },
 }
 
 /// Handle for communicating with peer service
@@ -190,6 +194,17 @@ impl PeerHandle {
     pub fn full_sync_completed(&self) {
         let _ = self.sender.send(PeerRequest::FullSyncCompleted);
     }
+
+    /// Set services for dependencies
+    pub async fn set_services(&self, services: crate::Services) {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.sender.send(PeerRequest::SetServices {
+            services,
+            response: response_tx,
+        }).is_ok() {
+            let _ = response_rx.await;
+        }
+    }
 }
 
 pub struct PeerService {
@@ -205,6 +220,7 @@ pub struct PeerService {
     connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
     store: StoreHandle,
     connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
+    services: Option<crate::Services>,
 }
 
 impl PeerService {
@@ -230,6 +246,7 @@ impl PeerService {
             connected_outbound_peers: HashMap::new(),
             store: store.clone(),
             connections: connections.clone(),
+            services: None,
         };
         
         let handle = PeerHandle { sender: sender.clone() };
@@ -318,6 +335,10 @@ impl PeerService {
                 self.full_sync_request_pending = false;
                 self.availability_state = AvailabilityState::Available;
                 self.became_unavailable_at = None;
+            }
+            PeerRequest::SetServices { services, response } => {
+                self.services = Some(services);
+                let _ = response.send(());
             }
         }
     }

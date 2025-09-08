@@ -42,7 +42,11 @@ pub enum SnapshotRequest {
     Save {
         snapshot: qlib_rs::Snapshot,
         response: oneshot::Sender<Result<u64>>,
-    }
+    },
+    SetServices {
+        services: crate::Services,
+        response: oneshot::Sender<()>,
+    },
 }
 
 impl SnapshotHandle {
@@ -53,6 +57,17 @@ impl SnapshotHandle {
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("Snapshot manager task has stopped"))?;
         response_rx.await.map_err(|_| anyhow::anyhow!("Snapshot manager task response channel closed"))?
+    }
+
+    /// Set services for dependencies
+    pub async fn set_services(&self, services: crate::Services) {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.sender.send(SnapshotRequest::SetServices {
+            services,
+            response: response_tx,
+        }).is_ok() {
+            let _ = response_rx.await;
+        }
     }
 }
 
@@ -71,6 +86,10 @@ impl SnapshotService {
                     SnapshotRequest::Save { snapshot, response } => {
                         let result = service.save(&snapshot).await;
                         let _ = response.send(result);
+                    }
+                    SnapshotRequest::SetServices { services: _, response } => {
+                        // Snapshot service currently doesn't need other services
+                        let _ = response.send(());
                     }
                 }
             }

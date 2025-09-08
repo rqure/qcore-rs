@@ -64,13 +64,14 @@ pub struct Config {
     pub self_promotion_delay_secs: u64,
 }
 
-struct Services {
-    auth_handle: AuthHandle,
-    client_handle: ClientHandle,
-    peer_handle: PeerHandle,
-    snapshot_handle: SnapshotHandle,
-    store_handle: StoreHandle,
-    wal_handle: WalHandle,
+#[derive(Debug, Clone)]
+pub struct Services {
+    pub auth_handle: AuthHandle,
+    pub client_handle: ClientHandle,
+    pub peer_handle: PeerHandle,
+    pub snapshot_handle: SnapshotHandle,
+    pub store_handle: StoreHandle,
+    pub wal_handle: WalHandle,
 }
 
 #[tokio::main]
@@ -88,6 +89,66 @@ async fn main() -> Result<()> {
         .with_file(cfg!(debug_assertions))
         .with_line_number(cfg!(debug_assertions))
         .init();
+
+    // Initialize services in dependency order
+    
+    // 1. Start authentication service (no dependencies)
+    let auth_handle = crate::auth::AuthenticationService::spawn();
+    
+    // 2. Start store service (no dependencies)
+    let store_handle = crate::store::StoreService::spawn();
+    
+    // 3. Start snapshot service (no dependencies)
+    let snapshot_config = crate::snapshot::SnapshotConfig {
+        snapshots_dir: std::path::PathBuf::from(&config.data_dir).join("snapshots"),
+        max_files: config.snapshot_max_files,
+    };
+    let snapshot_handle = crate::snapshot::SnapshotService::spawn(snapshot_config);
+    
+    // 4. Start WAL service (temporarily with placeholder dependencies)
+    let wal_config = crate::wal::WalConfig {
+        wal_dir: std::path::PathBuf::from(&config.data_dir).join("wal"),
+        max_file_size: config.wal_max_file_size * 1024 * 1024,
+        max_files: config.wal_max_files,
+        snapshot_wal_interval: config.snapshot_wal_interval,
+        machine_id: config.machine.clone(),
+    };
+    let wal_handle = crate::wal::WalService::spawn(wal_config, snapshot_handle.clone(), store_handle.clone());
+    
+    // 5. Start client service (temporarily with store dependency)
+    let client_config = crate::clients::ClientConfig::from(&config);
+    let client_handle = crate::clients::ClientService::spawn(client_config, store_handle.clone());
+    
+    // 6. Start peer service (temporarily with store dependency and connections)
+    let peer_config = crate::peers::PeerConfig::from(&config);
+    let connections = std::sync::Arc::new(tokio::sync::Mutex::new(crate::peers::ConnectionState {
+        connected_outbound_peers: std::collections::HashMap::new(),
+        connected_clients: std::collections::HashMap::new(),
+        authenticated_clients: std::collections::HashMap::new(),
+    }));
+    let peer_handle = crate::peers::PeerService::spawn(peer_config, store_handle.clone(), connections);
+
+    // Create services struct
+    let services = Services {
+        auth_handle: auth_handle.clone(),
+        client_handle: client_handle.clone(),
+        peer_handle: peer_handle.clone(),
+        snapshot_handle: snapshot_handle.clone(),
+        store_handle: store_handle.clone(),
+        wal_handle: wal_handle.clone(),
+    };
+
+    // Set services for all services that need dependencies
+    wal_handle.set_services(services.clone()).await;
+    client_handle.set_services(services.clone()).await;
+    peer_handle.set_services(services.clone()).await;
+    auth_handle.set_services(services.clone()).await;
+    store_handle.set_services(services.clone()).await;
+    snapshot_handle.set_services(services.clone()).await;
+
+    // Keep the main task alive
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("Received shutdown signal, terminating...");
 
     Ok(())
 }

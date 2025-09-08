@@ -92,6 +92,10 @@ pub enum StoreRequest {
     InnerGetWriteChannelReceiver {
         response: oneshot::Sender<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>>,
     },
+    SetServices {
+        services: crate::Services,
+        response: oneshot::Sender<()>,
+    },
 }
 
 /// Handle for communicating with store manager task
@@ -315,6 +319,17 @@ impl StoreHandle {
             None
         }
     }
+
+    /// Set services for dependencies
+    pub async fn set_services(&self, services: crate::Services) {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.sender.send(StoreRequest::SetServices {
+            services,
+            response: response_tx,
+        }).is_ok() {
+            let _ = response_rx.await;
+        }
+    }
 }
 
 pub struct StoreService;
@@ -403,6 +418,10 @@ impl StoreService {
                     StoreRequest::InnerGetWriteChannelReceiver { response } => {
                         let receiver = store.inner().get_write_channel_receiver();
                         let _ = response.send(receiver);
+                    }
+                    StoreRequest::SetServices { services: _, response } => {
+                        // Store service currently doesn't need other services
+                        let _ = response.send(());
                     }
                 }
             }

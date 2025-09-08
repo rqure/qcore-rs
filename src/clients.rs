@@ -58,6 +58,10 @@ pub enum ClientRequest {
     ForceDisconnectAll {
         response: oneshot::Sender<()>,
     },
+    SetServices {
+        services: crate::Services,
+        response: oneshot::Sender<()>,
+    },
 }
 
 /// Handle for communicating with client service
@@ -139,6 +143,17 @@ impl ClientHandle {
             let _ = response_rx.await;
         }
     }
+
+    /// Set services for dependencies
+    pub async fn set_services(&self, services: crate::Services) {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.sender.send(ClientRequest::SetServices {
+            services,
+            response: response_tx,
+        }).is_ok() {
+            let _ = response_rx.await;
+        }
+    }
 }
 
 pub struct ClientService {
@@ -148,6 +163,7 @@ pub struct ClientService {
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
     authenticated_clients: HashMap<String, EntityId>,
     store: StoreHandle,
+    services: Option<crate::Services>,
 }
 
 impl ClientService {
@@ -161,6 +177,7 @@ impl ClientService {
             client_notification_configs: HashMap::new(),
             authenticated_clients: HashMap::new(),
             store: store.clone(),
+            services: None,
         };
         
         let handle = ClientHandle { sender: sender.clone() };
@@ -223,6 +240,10 @@ impl ClientService {
             }
             ClientRequest::ForceDisconnectAll { response } => {
                 self.force_disconnect_all_clients().await;
+                let _ = response.send(());
+            }
+            ClientRequest::SetServices { services, response } => {
+                self.services = Some(services);
                 let _ = response.send(());
             }
         }

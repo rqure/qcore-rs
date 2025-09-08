@@ -12,6 +12,10 @@ pub enum AuthRequest {
         requests: Vec<Request>,
         response: oneshot::Sender<Result<Vec<Request>>>,
     },
+    SetServices {
+        services: crate::Services,
+        response: oneshot::Sender<()>,
+    },
 }
 
 /// Handle for communicating with authentication service
@@ -35,15 +39,32 @@ impl AuthHandle {
         }).map_err(|_| anyhow::anyhow!("Authentication service has stopped"))?;
         response_rx.await.map_err(|_| anyhow::anyhow!("Authentication service response channel closed"))?
     }
+
+    /// Set services for dependencies
+    pub async fn set_services(&self, services: crate::Services) {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.sender.send(AuthRequest::SetServices {
+            services,
+            response: response_tx,
+        }).is_ok() {
+            let _ = response_rx.await;
+        }
+    }
 }
 
-pub struct AuthenticationService;
+pub struct AuthenticationService {
+    services: Option<crate::Services>,
+}
 
 impl AuthenticationService {
     pub fn spawn() -> AuthHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         
         tokio::spawn(async move {
+            let mut service = Self {
+                services: None,
+            };
+            
             // Create our own store instance for authentication
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
             
@@ -118,6 +139,10 @@ impl AuthenticationService {
                         };
 
                         let _ = response.send(result);
+                    }
+                    AuthRequest::SetServices { services, response } => {
+                        service.services = Some(services);
+                        let _ = response.send(());
                     }
                 }
             }

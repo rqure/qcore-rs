@@ -33,7 +33,11 @@ pub enum WalRequest {
     WriteRequest {
         request: qlib_rs::Request,
         response: oneshot::Sender<Result<()>>,
-    }
+    },
+    SetServices {
+        services: crate::Services,
+        response: oneshot::Sender<()>,
+    },
 }
 
 /// Handle for communicating with WAL manager task
@@ -50,6 +54,17 @@ impl WalHandle {
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("WAL manager task has stopped"))?;
         response_rx.await.map_err(|_| anyhow::anyhow!("WAL manager task response channel closed"))?
+    }
+
+    /// Set services for dependencies
+    pub async fn set_services(&self, services: crate::Services) {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.sender.send(WalRequest::SetServices {
+            services,
+            response: response_tx,
+        }).is_ok() {
+            let _ = response_rx.await;
+        }
     }
 }
 
@@ -68,6 +83,10 @@ impl WalService {
                     WalRequest::WriteRequest { request, response } => {
                         let result = service.write_request(&request, &store_handle).await;
                         let _ = response.send(result);
+                    }
+                    WalRequest::SetServices { services: _, response } => {
+                        // WAL service already has its dependencies set during spawn
+                        let _ = response.send(());
                     }
                 }
             }
