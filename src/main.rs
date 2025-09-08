@@ -6,10 +6,12 @@ mod snapshot;
 mod files;
 mod auth;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
 
-use crate::{auth::AuthHandle, clients::ClientHandle, peers::PeerHandle, snapshot::SnapshotHandle, store::StoreHandle, wal::WalHandle};
+use crate::{auth::{AuthHandle, AuthenticationService}, clients::{ClientConfig, ClientHandle, ClientService}, peers::{PeerConfig, PeerHandle, PeerService}, snapshot::{SnapshotConfig, SnapshotHandle, SnapshotService}, store::{StoreHandle, StoreService}, wal::{WalConfig, WalHandle, WalService}};
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -90,40 +92,21 @@ async fn main() -> Result<()> {
         .with_line_number(cfg!(debug_assertions))
         .init();
 
-    // Initialize services in dependency order
-    
-    // 1. Start authentication service (no dependencies)
-    let auth_handle = crate::auth::AuthenticationService::spawn();
-    
-    // 2. Start store service (no dependencies)
-    let store_handle = crate::store::StoreService::spawn();
-    
-    // 3. Start snapshot service (no dependencies)
-    let snapshot_config = crate::snapshot::SnapshotConfig {
-        snapshots_dir: std::path::PathBuf::from(&config.data_dir).join("snapshots"),
+    let auth_handle = AuthenticationService::spawn();
+    let store_handle = StoreService::spawn();
+    let snapshot_handle = SnapshotService::spawn(SnapshotConfig {
+        snapshots_dir: PathBuf::from(&config.data_dir).join("snapshots"),
         max_files: config.snapshot_max_files,
-    };
-    let snapshot_handle = crate::snapshot::SnapshotService::spawn(snapshot_config);
-    
-    // 4. Start WAL service
-    let wal_config = crate::wal::WalConfig {
-        wal_dir: std::path::PathBuf::from(&config.data_dir).join("wal"),
+    });
+    let wal_handle = WalService::spawn(WalConfig {
+        wal_dir: PathBuf::from(&config.data_dir).join("wal"),
         max_file_size: config.wal_max_file_size * 1024 * 1024,
         max_files: config.wal_max_files,
         snapshot_wal_interval: config.snapshot_wal_interval,
         machine_id: config.machine.clone(),
-    };
-    let wal_handle = crate::wal::WalService::spawn(wal_config);
-    
-    // 5. Start client service
-    let client_config = crate::clients::ClientConfig::from(&config);
-    let client_handle = crate::clients::ClientService::spawn(client_config);
-    
-    // 6. Start peer service
-    let peer_config = crate::peers::PeerConfig::from(&config);
-    let peer_handle = crate::peers::PeerService::spawn(peer_config);
-
-    // Create services struct
+    });
+    let client_handle = ClientService::spawn(ClientConfig::from(&config));
+    let peer_handle = PeerService::spawn(PeerConfig::from(&config));
     let services = Services {
         auth_handle: auth_handle.clone(),
         client_handle: client_handle.clone(),
