@@ -1,9 +1,10 @@
-use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
-use qlib_rs::auth::{AuthorizationScope, get_scope};
+use qlib_rs::{AsyncStore, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashMap;
+
+use crate::Services;
 
 /// Store manager request types
 #[derive(Debug)]
@@ -42,11 +43,6 @@ pub enum StoreRequest {
     },
     PerformMut {
         requests: Vec<Request>,
-        response: oneshot::Sender<Result<Vec<Request>>>,
-    },
-    PerformMutWithAuth {
-        requests: Vec<Request>,
-        client_id: Option<EntityId>,
         response: oneshot::Sender<Result<Vec<Request>>>,
     },
     PerformMap {
@@ -207,28 +203,6 @@ impl StoreHandle {
         }
     }
 
-    pub async fn perform_mut_with_auth(&self, requests: &mut Vec<Request>, client_id: Option<EntityId>) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::PerformMutWithAuth {
-            requests: requests.clone(),
-            client_id,
-            response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-
-        match response_rx.await {
-            Ok(result) => {
-                match result {
-                    Ok(response) => {
-                        *requests = response;
-                        Ok(())
-                    },
-                    Err(e) => Err(anyhow::anyhow!("Store service error: {}", e)),
-                }
-            },
-            Err(_) => Err(anyhow::anyhow!("Store service response channel closed")),
-        }
-    }
-
     pub async fn perform_map(&self, requests: Vec<Request>) -> Result<HashMap<FieldType, Request>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender.send(StoreRequest::PerformMap {
@@ -351,13 +325,6 @@ impl StoreService {
         
         tokio::spawn(async move {
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
-            let permission_cache = Cache::new(
-                &mut store,
-                et::permission(),
-                vec![ft::resource_type(), ft::resource_field()],
-                vec![ft::scope(), ft::condition()]
-            ).await.expect("Failed to create permission cache");
-            let mut cel_executor = CelExecutor::new();
 
             while let Some(request) = receiver.recv().await {
                 match request {
@@ -392,67 +359,6 @@ impl StoreService {
                     StoreRequest::PerformMut { mut requests, response } => {
                         let result = store.perform_mut(&mut requests).await.map(|_| requests);
                         let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::PerformMutWithAuth { requests, client_id, response } => {
-                        // Perform authorization check if client_id is provided
-                        if let Some(client_id) = client_id {
-                            // Check authorization for each request
-                            let mut authorized_requests = Vec::new();
-                            let mut authorization_failed_reason = None;
-
-                            for request in requests {
-                                if let Some(entity_id) = request.entity_id() {
-                                    if let Some(field_type) = request.field_type() {
-                                        match get_scope(
-                                            &store,
-                                            &mut cel_executor,
-                                            &permission_cache,
-                                            &client_id,
-                                            entity_id,
-                                            field_type,
-                                        ).await {
-                                            Ok(scope) => {
-                                                if scope == AuthorizationScope::None {
-                                                    authorization_failed_reason = Some(anyhow::anyhow!(
-                                                        "Access denied: Subject {} is not authorized to access {} on entity {}",
-                                                        client_id, field_type, entity_id
-                                                    ));
-                                                    break;
-                                                }
-                                                // For write operations, check if we have write access
-                                                if is_write_operation(&request) && scope == AuthorizationScope::ReadOnly {
-                                                    authorization_failed_reason = Some(anyhow::anyhow!(
-                                                        "Access denied: Subject {} only has read access to {} on entity {}",
-                                                        client_id, field_type, entity_id
-                                                    ));
-                                                    break;
-                                                }
-                                                authorized_requests.push(request);
-                                            }
-                                            Err(e) => {
-                                                authorization_failed_reason = Some(anyhow::anyhow!(
-                                                    "Authorization error: {}", e
-                                                ));
-                                                break;
-                                            }
-                                        }
-                                    } else {
-                                        authorized_requests.push(request);
-                                    }
-                                } else {
-                                    authorized_requests.push(request);
-                                }
-                            }
-
-                            if let Some(reason) = authorization_failed_reason {
-                                let _ = response.send(Err(reason));
-                            } else {
-                                let result = store.perform_mut(&mut authorized_requests).await.map(|_| authorized_requests);
-                                let _ = response.send(result.map_err(anyhow::Error::from));
-                            }
-                        } else {
-                            let _= response.send(Err(anyhow::anyhow!("Client ID is required for authorized operations")));
-                        }
                     }
                     StoreRequest::PerformMap { mut requests, response } => {
                         let result = store.perform_map(&mut requests).await;
@@ -504,14 +410,4 @@ impl StoreService {
 
         StoreHandle { sender }
     }
-}
-
-/// Helper function to check if a request is a write operation
-fn is_write_operation(request: &Request) -> bool {
-    matches!(request, 
-        Request::Write { .. } | 
-        Request::Create { .. } | 
-        Request::Delete { .. } | 
-        Request::SchemaUpdate { .. }
-    )
 }

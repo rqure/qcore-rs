@@ -4,13 +4,12 @@ mod peers;
 mod store;
 mod snapshot;
 mod files;
-mod authentication;
-mod authorization;
+mod auth;
 
 use anyhow::Result;
 use clap::Parser;
 
-use crate::{clients::ClientHandle, peers::PeerHandle, snapshot::SnapshotHandle, store::StoreHandle, wal::WalHandle};
+use crate::{auth::AuthHandle, clients::ClientHandle, peers::PeerHandle, snapshot::SnapshotHandle, store::StoreHandle, wal::WalHandle};
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -66,11 +65,12 @@ pub struct Config {
 }
 
 struct Services {
-    store_handle: StoreHandle,
-    client_handle: ClientHandle,
-    peer_handle: PeerHandle,
-    wal_handle: WalHandle,
-    snapshot_handle: SnapshotHandle,
+    auth_handle: Option<AuthHandle>,
+    client_handle: Option<ClientHandle>,
+    peer_handle: Option<PeerHandle>,
+    snapshot_handle: Option<SnapshotHandle>,
+    store_handle: Option<StoreHandle>,
+    wal_handle: Option<WalHandle>,
 }
 
 #[tokio::main]
