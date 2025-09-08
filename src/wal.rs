@@ -71,21 +71,28 @@ impl WalHandle {
 pub type WalService = WalManagerTrait<FileManager>;
 
 impl WalService {
-    pub fn spawn(config: WalConfig, snapshot_handle: SnapshotHandle, store_handle: StoreHandle) -> WalHandle {
+    pub fn spawn(config: WalConfig) -> WalHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut service = WalService::new(FileManager, config, Some(snapshot_handle));
+            let mut service = WalService::new(FileManager, config, None);
             service.initialize_counter().await;
-            service.replay(&store_handle).await;
 
             while let Some(request) = receiver.recv().await {
                 match request {
                     WalRequest::WriteRequest { request, response } => {
-                        let result = service.write_request(&request, &store_handle).await;
-                        let _ = response.send(result);
+                        // For now, we'll need to wait until services are set
+                        if let Some(services) = &service.services {
+                            let store_handle = services.store_handle.clone();
+                            let result = service.write_request(&request, &store_handle).await;
+                            let _ = response.send(result);
+                        } else {
+                            let _ = response.send(Err(anyhow::anyhow!("Services not yet initialized")));
+                        }
                     }
-                    WalRequest::SetServices { services: _, response } => {
-                        // WAL service already has its dependencies set during spawn
+                    WalRequest::SetServices { services, response } => {
+                        service.services = Some(services.clone());
+                        // Now that we have services, we can replay from the store
+                        let _ = service.replay(&services.store_handle).await;
                         let _ = response.send(());
                     }
                 }
@@ -196,6 +203,8 @@ pub struct WalManagerTrait<F: FileManagerTrait> {
     wal_files_since_snapshot: u64,
     /// Handle to communicate with snapshot manager
     snapshot_handle: Option<SnapshotHandle>,
+    /// Services for dependencies
+    services: Option<crate::Services>,
 }
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {
@@ -212,6 +221,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             current_wal_size: 0,
             wal_files_since_snapshot: 0,
             snapshot_handle,
+            services: None,
         }
     }
 }

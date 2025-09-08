@@ -8,8 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use qlib_rs::{notification_channel, StoreMessage, EntityId, NotificationSender, NotifyConfig};
 
-use crate::store::StoreHandle;
-
 /// Configuration for the client service
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -162,56 +160,34 @@ pub struct ClientService {
     client_notification_senders: HashMap<String, NotificationSender>,
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
     authenticated_clients: HashMap<String, EntityId>,
-    store: StoreHandle,
     services: Option<crate::Services>,
 }
 
 impl ClientService {
-    pub fn spawn(config: ClientConfig, store: StoreHandle) -> ClientHandle {
+    pub fn spawn(config: ClientConfig) -> ClientHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         
-        let mut service = ClientService {
-            config: config.clone(),
-            connected_clients: HashMap::new(),
-            client_notification_senders: HashMap::new(),
-            client_notification_configs: HashMap::new(),
-            authenticated_clients: HashMap::new(),
-            store: store.clone(),
-            services: None,
-        };
-        
-        let handle = ClientHandle { sender: sender.clone() };
-        
-        // Start client server
-        {
-            let handle_clone = handle.clone();
-            let config_clone = config.clone();
-            let store_clone = store.clone();
-            tokio::spawn(async move {
-                if let Err(e) = start_client_server(config_clone, handle_clone, store_clone).await {
-                    error!(error = %e, "Client server task failed");
-                }
-            });
-        }
-        
-        // Main service loop
+        let config_clone = config.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    request = receiver.recv() => {
-                        match request {
-                            Some(req) => service.handle_request(req).await,
-                            None => {
-                                info!("Client service channel closed, shutting down");
-                                break;
-                            }
-                        }
-                    }
-                }
+            let mut service = ClientService {
+                config,
+                connected_clients: HashMap::new(),
+                client_notification_senders: HashMap::new(),
+                client_notification_configs: HashMap::new(),
+                authenticated_clients: HashMap::new(),
+                services: None,
+            };
+
+            while let Some(request) = receiver.recv().await {
+                service.handle_request(request).await;
             }
         });
 
-        handle
+        // Start the client WebSocket server
+        let handle_clone = ClientHandle { sender: sender.clone() };
+        tokio::spawn(start_client_server(config_clone, handle_clone));
+
+        ClientHandle { sender }
     }
     
     async fn handle_request(&mut self, request: ClientRequest) {
@@ -264,7 +240,7 @@ impl ClientService {
         if let Some(configs) = client_configs {
             if let Some(sender) = notification_sender {
                 for config in configs {
-                    let removed = self.store.unregister_notification(&config, &sender).await;
+                    let removed = self.services.as_ref().unwrap().store_handle.unregister_notification(&config, &sender).await;
                     if removed {
                         debug!(
                             client_addr = %client_addr,
@@ -341,7 +317,7 @@ impl ClientService {
                     StoreMessage::RegisterNotification { id, config } => {
                         if let Some(ref addr) = client_addr {
                             if let Some(notification_sender) = client_notification_sender {
-                                match self.store.register_notification(config.clone(), notification_sender).await {
+                                match self.services.as_ref().unwrap().store_handle.register_notification(config.clone(), notification_sender).await {
                             Ok(()) => {
                                 // Track this config for cleanup on disconnect
                                 self.client_notification_configs
@@ -378,7 +354,7 @@ impl ClientService {
                     StoreMessage::UnregisterNotification { id, config } => {
                         if let Some(ref addr) = client_addr {
                             if let Some(notification_sender) = client_notification_sender {
-                                let removed = self.store.unregister_notification(config, &notification_sender).await;
+                                let removed = self.services.as_ref().unwrap().store_handle.unregister_notification(config, &notification_sender).await;
                                 if removed {
                                     // Remove from our tracking
                                     if let Some(configs) = self.client_notification_configs.get_mut(addr) {
@@ -420,7 +396,7 @@ impl ClientService {
     
     async fn register_notification_internal(&mut self, client_addr: String, config: NotifyConfig) -> Result<()> {
         if let Some(notification_sender) = self.client_notification_senders.get(&client_addr) {
-            self.store.register_notification(config.clone(), notification_sender.clone()).await?;
+            self.services.as_ref().unwrap().store_handle.register_notification(config.clone(), notification_sender.clone()).await?;
             
             // Track this config for cleanup on disconnect
             self.client_notification_configs
@@ -436,7 +412,7 @@ impl ClientService {
     
     async fn unregister_notification_internal(&mut self, client_addr: String, config: NotifyConfig) -> bool {
         if let Some(notification_sender) = self.client_notification_senders.get(&client_addr) {
-            let removed = self.store.unregister_notification(&config, notification_sender).await;
+            let removed = self.services.as_ref().unwrap().store_handle.unregister_notification(&config, notification_sender).await;
             if removed {
                 // Remove from our tracking
                 if let Some(configs) = self.client_notification_configs.get_mut(&client_addr) {
@@ -481,12 +457,11 @@ impl ClientService {
 }
 
 /// Handle a single client WebSocket connection
-#[instrument(skip(stream, handle, _store), fields(client_addr = %client_addr))]
+#[instrument(skip(stream, handle), fields(client_addr = %client_addr))]
 async fn handle_client_connection(
     stream: TcpStream,
     client_addr: std::net::SocketAddr,
     handle: ClientHandle,
-    _store: StoreHandle,
 ) -> Result<()> {
     info!("Accepting client connection");
     
@@ -711,7 +686,7 @@ async fn handle_client_connection(
 }
 
 /// Start the client WebSocket server
-async fn start_client_server(config: ClientConfig, handle: ClientHandle, store: StoreHandle) -> Result<()> {
+async fn start_client_server(config: ClientConfig, handle: ClientHandle) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.client_port);
     let listener = TcpListener::bind(&addr).await?;
     info!(bind_address = %addr, "Client WebSocket server started");
@@ -722,9 +697,8 @@ async fn start_client_server(config: ClientConfig, handle: ClientHandle, store: 
                 debug!(client_addr = %client_addr, "Accepted new client connection");
                 
                 let handle_clone = handle.clone();
-                let store_clone = store.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client_connection(stream, client_addr, handle_clone, store_clone).await {
+                    if let Err(e) = handle_client_connection(stream, client_addr, handle_clone).await {
                         error!(
                             error = %e,
                             client_addr = %client_addr,

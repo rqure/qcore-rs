@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     };
     let snapshot_handle = crate::snapshot::SnapshotService::spawn(snapshot_config);
     
-    // 4. Start WAL service (temporarily with placeholder dependencies)
+    // 4. Start WAL service
     let wal_config = crate::wal::WalConfig {
         wal_dir: std::path::PathBuf::from(&config.data_dir).join("wal"),
         max_file_size: config.wal_max_file_size * 1024 * 1024,
@@ -113,20 +113,15 @@ async fn main() -> Result<()> {
         snapshot_wal_interval: config.snapshot_wal_interval,
         machine_id: config.machine.clone(),
     };
-    let wal_handle = crate::wal::WalService::spawn(wal_config, snapshot_handle.clone(), store_handle.clone());
+    let wal_handle = crate::wal::WalService::spawn(wal_config);
     
-    // 5. Start client service (temporarily with store dependency)
+    // 5. Start client service
     let client_config = crate::clients::ClientConfig::from(&config);
-    let client_handle = crate::clients::ClientService::spawn(client_config, store_handle.clone());
+    let client_handle = crate::clients::ClientService::spawn(client_config);
     
-    // 6. Start peer service (temporarily with store dependency and connections)
+    // 6. Start peer service
     let peer_config = crate::peers::PeerConfig::from(&config);
-    let connections = std::sync::Arc::new(tokio::sync::Mutex::new(crate::peers::ConnectionState {
-        connected_outbound_peers: std::collections::HashMap::new(),
-        connected_clients: std::collections::HashMap::new(),
-        authenticated_clients: std::collections::HashMap::new(),
-    }));
-    let peer_handle = crate::peers::PeerService::spawn(peer_config, store_handle.clone(), connections);
+    let peer_handle = crate::peers::PeerService::spawn(peer_config);
 
     // Create services struct
     let services = Services {

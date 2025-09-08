@@ -10,8 +10,6 @@ use std::time::Duration;
 use time;
 use serde::{Serialize, Deserialize};
 
-use crate::store::StoreHandle;
-
 /// Configuration for the peer service
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
@@ -218,7 +216,6 @@ pub struct PeerService {
     full_sync_request_pending: bool,
     peer_info: HashMap<String, PeerInfo>,
     connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
-    store: StoreHandle,
     connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     services: Option<crate::Services>,
 }
@@ -226,12 +223,16 @@ pub struct PeerService {
 impl PeerService {
     pub fn spawn(
         config: PeerConfig,
-        store: StoreHandle,
-        connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     ) -> PeerHandle {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         
         let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+        
+        let connections = std::sync::Arc::new(tokio::sync::Mutex::new(ConnectionState {
+            connected_outbound_peers: std::collections::HashMap::new(),
+            connected_clients: std::collections::HashMap::new(),
+            authenticated_clients: std::collections::HashMap::new(),
+        }));
         
         let mut service = PeerService {
             config: config.clone(),
@@ -244,7 +245,6 @@ impl PeerService {
             full_sync_request_pending: false,
             peer_info: HashMap::new(),
             connected_outbound_peers: HashMap::new(),
-            store: store.clone(),
             connections: connections.clone(),
             services: None,
         };
@@ -256,7 +256,7 @@ impl PeerService {
             let handle_clone = handle.clone();
             let config_clone = config.clone();
             tokio::spawn(async move {
-                if let Err(e) = start_inbound_peer_server(config_clone, handle_clone, store.clone()).await {
+                if let Err(e) = start_inbound_peer_server(config_clone, handle_clone).await {
                     error!(error = %e, "Inbound peer server failed");
                 }
             });
@@ -587,12 +587,11 @@ impl PeerService {
 }
 
 /// Handle a single peer WebSocket connection
-#[instrument(skip(stream, handle, store), fields(peer_addr = %peer_addr))]
+#[instrument(skip(stream, handle), fields(peer_addr = %peer_addr))]
 async fn handle_inbound_peer_connection(
     stream: TcpStream,
     peer_addr: std::net::SocketAddr,
     handle: PeerHandle,
-    store: StoreHandle,
 ) -> Result<()> {
     info!("Accepting inbound peer connection");
     
@@ -605,12 +604,12 @@ async fn handle_inbound_peer_connection(
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(peer_msg) = serde_json::from_str::<PeerMessage>(&text) {
-                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle, &store).await;
+                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
                 }
             }
             Ok(Message::Binary(data)) => {
                 if let Ok(peer_msg) = bincode::deserialize::<PeerMessage>(&data) {
-                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle, &store).await;
+                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
                 }
             }
             Ok(Message::Ping(payload)) => {
@@ -635,7 +634,6 @@ async fn handle_peer_message(
     peer_addr: &std::net::SocketAddr,
     ws_sender: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
     handle: &PeerHandle,
-    store: &StoreHandle,
 ) {
     match peer_msg {
         PeerMessage::Startup { machine_id, startup_time } => {
@@ -651,22 +649,24 @@ async fn handle_peer_message(
         PeerMessage::FullSyncRequest { machine_id } => {
             info!(requesting_machine = %machine_id, "Received full sync request");
             
-            if let Some(snapshot) = store.take_snapshot().await {
-                let response = PeerMessage::FullSyncResponse { snapshot };
-                
-                if let Ok(response_binary) = bincode::serialize(&response) {
-                    let _ = ws_sender.send(Message::Binary(response_binary)).await;
-                    info!(requesting_machine = %machine_id, "Sent FullSyncResponse");
-                }
-            }
+            // TODO: Use services to get store handle
+            // if let Some(snapshot) = store.take_snapshot().await {
+            //     let response = PeerMessage::FullSyncResponse { snapshot };
+            //     
+            //     if let Ok(response_binary) = bincode::serialize(&response) {
+            //         let _ = ws_sender.send(Message::Binary(response_binary)).await;
+            //         info!(requesting_machine = %machine_id, "Sent FullSyncResponse");
+            //     }
+            // }
         }
         
         PeerMessage::FullSyncResponse { snapshot } => {
             info!("Received full sync response, applying snapshot");
             
-            store.disable_notifications().await;
-            store.inner_restore_snapshot(snapshot.clone()).await;
-            store.enable_notifications().await;
+            // TODO: Use services to get store handle
+            // store.disable_notifications().await;
+            // store.inner_restore_snapshot(snapshot.clone()).await;
+            // store.enable_notifications().await;
             
             // Save snapshot to disk
             let (is_leader, _) = handle.get_leadership_info().await;
@@ -695,11 +695,12 @@ async fn handle_peer_message(
                 .collect();
             
             if !requests_to_apply.is_empty() {
-                if let Err(e) = store.perform_mut(&mut requests_to_apply).await {
-                    error!(error = %e, "Failed to apply sync requests from peer");
-                } else {
-                    debug!(count = requests_to_apply.len(), "Applied sync requests from peer");
-                }
+                // TODO: Use services to get store handle
+                // if let Err(e) = store.perform_mut(&mut requests_to_apply).await {
+                //     error!(error = %e, "Failed to apply sync requests from peer");
+                // } else {
+                //     debug!(count = requests_to_apply.len(), "Applied sync requests from peer");
+                // }
             }
         }
     }
@@ -708,7 +709,6 @@ async fn handle_peer_message(
 async fn start_inbound_peer_server(
     config: PeerConfig,
     handle: PeerHandle,
-    store: StoreHandle,
 ) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.peer_port);
     let listener = TcpListener::bind(&addr).await?;
@@ -718,10 +718,9 @@ async fn start_inbound_peer_server(
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 let handle_clone = handle.clone();
-                let store_clone = store.clone();
                 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr, handle_clone, store_clone).await {
+                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr, handle_clone).await {
                         error!(error = %e, peer_addr = %peer_addr, "Error handling peer connection");
                     }
                 });
