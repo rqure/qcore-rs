@@ -79,7 +79,13 @@ impl SnapshotService {
 
         tokio::spawn(async move {
             let mut service = SnapshotService::new(FileManager, config);
-            service.initialize_counter().await;
+            match service.initialize_counter().await {
+                Ok(_) => info!("Snapshot service initialized successfully"),
+                Err(e) => {
+                    error!(error = %e, "Failed to initialize snapshot service");
+                    return;
+                },
+            }
 
             while let Some(request) = receiver.recv().await {
                 match request {
@@ -88,7 +94,7 @@ impl SnapshotService {
                         let _ = response.send(result);
                     }
                     SnapshotRequest::SetServices { services: _, response } => {
-                        // Snapshot service currently doesn't need other services
+                        let _ = service.load_latest().await;
                         let _ = response.send(());
                     }
                 }
