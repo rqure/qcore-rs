@@ -44,7 +44,7 @@ pub enum SnapshotRequest {
         response: oneshot::Sender<Result<u64>>,
     },
     SetServices {
-        services: Services,
+        _services: Services,
         response: oneshot::Sender<()>,
     },
 }
@@ -63,7 +63,7 @@ impl SnapshotHandle {
     pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(SnapshotRequest::SetServices {
-            services,
+            _services: services,
             response: response_tx,
         }).is_ok() {
             let _ = response_rx.await;
@@ -93,7 +93,7 @@ impl SnapshotService {
                         let result = service.save(&snapshot).await;
                         let _ = response.send(result);
                     }
-                    SnapshotRequest::SetServices { services: _, response } => {
+                    SnapshotRequest::SetServices { _services: _, response } => {
                         let _ = service.load_latest().await;
                         let _ = response.send(());
                     }

@@ -76,7 +76,7 @@ impl WalService {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut service = WalService::new(FileManager, config, None);
-            service.initialize_counter().await;
+            let _ = service.initialize_counter().await;
 
             while let Some(request) = receiver.recv().await {
                 match request {

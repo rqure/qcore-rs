@@ -83,17 +83,6 @@ pub struct PeerInfo {
     pub startup_time: u64
 }
 
-/// Connection state separated from main state to reduce lock contention
-#[derive(Debug)]
-pub struct ConnectionState {
-    /// Connected outbound peers with message senders
-    pub connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
-    /// Connected clients with message senders
-    pub connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
-    /// Track authenticated clients
-    pub authenticated_clients: HashMap<String, EntityId>,
-}
-
 /// Peer service request types
 #[derive(Debug)]
 pub enum PeerRequest {
@@ -218,7 +207,6 @@ pub struct PeerService {
     full_sync_request_pending: bool,
     peer_info: HashMap<String, PeerInfo>,
     connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
-    connections: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     services: Option<Services>,
 }
 
@@ -229,12 +217,6 @@ impl PeerService {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         
         let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
-        
-        let connections = std::sync::Arc::new(tokio::sync::Mutex::new(ConnectionState {
-            connected_outbound_peers: std::collections::HashMap::new(),
-            connected_clients: std::collections::HashMap::new(),
-            authenticated_clients: std::collections::HashMap::new(),
-        }));
         
         let mut service = PeerService {
             config: config.clone(),
@@ -247,7 +229,6 @@ impl PeerService {
             full_sync_request_pending: false,
             peer_info: HashMap::new(),
             connected_outbound_peers: HashMap::new(),
-            connections: connections.clone(),
             services: None,
         };
         
@@ -486,7 +467,11 @@ impl PeerService {
         // Force disconnect clients if becoming unavailable
         if old_state != self.availability_state && 
            matches!(self.availability_state, AvailabilityState::Unavailable) {
-            let mut connections = self.connections.lock().await;
+            if let Some(services) = &self.services {
+                let client_handle = &services.client_handle;
+                client_handle.force_disconnect_all().await;
+                info!("Disconnected all clients due to unavailability");
+            }
         }
     }
     
@@ -573,18 +558,6 @@ impl PeerService {
             error!("Failed to serialize FullSyncRequest");
             self.full_sync_request_pending = false;
         }
-    }
-
-    fn get_wal_dir(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from(&self.config.data_dir)
-            .join(&self.config.machine)
-            .join("wal")
-    }
-
-    fn get_snapshots_dir(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from(&self.config.data_dir)
-            .join(&self.config.machine)
-            .join("snapshots")
     }
 }
 

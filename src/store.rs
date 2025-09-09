@@ -105,7 +105,7 @@ pub enum StoreRequest {
         response: oneshot::Sender<Result<EntityId>>,
     },
     SetServices {
-        services: Services,
+        _services: Services,
         response: oneshot::Sender<()>,
     },
 }
@@ -336,7 +336,7 @@ impl StoreHandle {
     pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(StoreRequest::SetServices {
-            services,
+            _services: services,
             response: response_tx,
         }).is_ok() {
             let _ = response_rx.await;
@@ -519,7 +519,7 @@ impl StoreService {
                 let result = self.authenticate_subject(&subject_name, &credential).await;
                 let _ = response.send(result);
             }
-            StoreRequest::SetServices { services: _, response } => {
+            StoreRequest::SetServices { _services: _, response } => {
                 // Store service currently doesn't need other services
                 let _ = response.send(());
             }
