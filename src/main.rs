@@ -4,7 +4,6 @@ mod peers;
 mod store;
 mod snapshot;
 mod files;
-mod auth;
 mod misc;
 
 use std::path::PathBuf;
@@ -12,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
-use crate::{auth::{AuthHandle, AuthService}, clients::{ClientConfig, ClientHandle, ClientService}, misc::{MiscConfig, MiscHandle, MiscService}, peers::{PeerConfig, PeerHandle, PeerService}, snapshot::{SnapshotConfig, SnapshotHandle, SnapshotService}, store::{StoreHandle, StoreService}, wal::{WalConfig, WalHandle, WalService}};
+use crate::{clients::{ClientConfig, ClientHandle, ClientService}, misc::{MiscConfig, MiscHandle, MiscService}, peers::{PeerConfig, PeerHandle, PeerService}, snapshot::{SnapshotConfig, SnapshotHandle, SnapshotService}, store::{StoreHandle, StoreService}, wal::{WalConfig, WalHandle, WalService}};
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -69,7 +68,6 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub struct Services {
-    pub auth_handle: AuthHandle,
     pub client_handle: ClientHandle,
     pub misc_handle: MiscHandle,
     pub peer_handle: PeerHandle,
@@ -142,7 +140,6 @@ async fn main() -> Result<()> {
         .with_line_number(cfg!(debug_assertions))
         .init();
 
-    let auth_handle = AuthService::spawn();
     let store_handle = StoreService::spawn();
     let snapshot_handle = SnapshotService::spawn(SnapshotConfig {
         snapshots_dir: PathBuf::from(&config.data_dir).join("snapshots"),
@@ -159,7 +156,6 @@ async fn main() -> Result<()> {
     let peer_handle = PeerService::spawn(PeerConfig::from(&config));
     let misc_handle = MiscService::spawn(MiscConfig::from(&config));
     let services = Services {
-        auth_handle: auth_handle.clone(),
         client_handle: client_handle.clone(),
         misc_handle: misc_handle.clone(),
         peer_handle: peer_handle.clone(),
@@ -172,10 +168,8 @@ async fn main() -> Result<()> {
     wal_handle.set_services(services.clone()).await;
     client_handle.set_services(services.clone()).await;
     peer_handle.set_services(services.clone()).await;
-    auth_handle.set_services(services.clone()).await;
     store_handle.set_services(services.clone()).await;
     snapshot_handle.set_services(services.clone()).await;
-    misc_handle.set_services(services.clone()).await;
     misc_handle.set_services(services.clone()).await;
 
     // Keep the main task alive

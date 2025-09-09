@@ -1,4 +1,5 @@
-use qlib_rs::{AsyncStore, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
+use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
+use qlib_rs::auth::{AuthorizationScope, get_scope};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use anyhow::Result;
 use std::sync::Arc;
@@ -91,6 +92,11 @@ pub enum StoreRequest {
     },
     InnerGetWriteChannelReceiver {
         response: oneshot::Sender<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>>,
+    },
+    CheckRequestsAuthorization {
+        client_id: EntityId,
+        requests: Vec<Request>,
+        response: oneshot::Sender<Result<Vec<Request>>>,
     },
     SetServices {
         services: Services,
@@ -330,94 +336,138 @@ impl StoreHandle {
             let _ = response_rx.await;
         }
     }
+
+    /// Check authorization for a list of requests and return only authorized ones
+    pub async fn check_requests_authorization(
+        &self,
+        client_id: &EntityId,
+        requests: Vec<Request>,
+    ) -> Result<Vec<Request>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender.send(StoreRequest::CheckRequestsAuthorization {
+            client_id: client_id.clone(),
+            requests,
+            response: response_tx,
+        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+    }
 }
 
-pub struct StoreService;
+pub struct StoreService {
+    store: AsyncStore,
+    permission_cache: Option<Cache>,
+    cel_executor: CelExecutor,
+}
 
 impl StoreService {
     pub fn spawn() -> StoreHandle {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::unbounded_channel();
         
         tokio::spawn(async move {
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
+            
+            // Initialize permission cache
+            let permission_cache = match Cache::new(
+                &mut store,
+                et::permission(),
+                vec![ft::resource_type(), ft::resource_field()],
+                vec![ft::scope(), ft::condition()]
+            ).await {
+                Ok(cache) => Some(cache),
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to create permission cache, authorization will be disabled");
+                    None
+                }
+            };
+            
+            let mut service = StoreService {
+                store,
+                permission_cache,
+                cel_executor: CelExecutor::new(),
+            };
 
+            let mut receiver = receiver;
             while let Some(request) = receiver.recv().await {
                 match request {
                     StoreRequest::GetEntitySchema { entity_type, response } => {
-                        let result = store.get_entity_schema(&entity_type).await;
+                        let result = service.store.get_entity_schema(&entity_type).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::GetCompleteEntitySchema { entity_type, response } => {
-                        let result = store.get_complete_entity_schema(&entity_type).await;
+                        let result = service.store.get_complete_entity_schema(&entity_type).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::GetFieldSchema { entity_type, field_type, response } => {
-                        let result = store.get_field_schema(&entity_type, &field_type).await;
+                        let result = service.store.get_field_schema(&entity_type, &field_type).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::SetFieldSchema { entity_type, field_type, schema, response } => {
-                        let result = store.set_field_schema(&entity_type, &field_type, schema).await;
+                        let result = service.store.set_field_schema(&entity_type, &field_type, schema).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::EntityExists { entity_id, response } => {
-                        let result = store.entity_exists(&entity_id).await;
+                        let result = service.store.entity_exists(&entity_id).await;
                         let _ = response.send(result);
                     }
                     StoreRequest::FieldExists { entity_type, field_type, response } => {
-                        let result = store.field_exists(&entity_type, &field_type).await;
+                        let result = service.store.field_exists(&entity_type, &field_type).await;
                         let _ = response.send(result);
                     }
                     StoreRequest::Perform { mut requests, response } => {
-                        let result = store.perform(&mut requests).await.map(|_| requests);
+                        let result = service.store.perform(&mut requests).await.map(|_| requests);
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::PerformMut { mut requests, response } => {
-                        let result = store.perform_mut(&mut requests).await.map(|_| requests);
+                        let result = service.store.perform_mut(&mut requests).await.map(|_| requests);
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::PerformMap { mut requests, response } => {
-                        let result = store.perform_map(&mut requests).await;
+                        let result = service.store.perform_map(&mut requests).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::FindEntitiesPaginated { entity_type, page_opts, filter, response } => {
-                        let result = store.find_entities_paginated(&entity_type, page_opts, filter).await;
+                        let result = service.store.find_entities_paginated(&entity_type, page_opts, filter).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::FindEntitiesExact { entity_type, page_opts, filter, response } => {
-                        let result = store.find_entities_exact(&entity_type, page_opts, filter).await;
+                        let result = service.store.find_entities_exact(&entity_type, page_opts, filter).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::GetEntityTypesPaginated { page_opts, response } => {
-                        let result = store.get_entity_types_paginated(page_opts).await;
+                        let result = service.store.get_entity_types_paginated(page_opts).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::RegisterNotification { config, sender, response } => {
-                        let result = store.register_notification(config, sender).await;
+                        let result = service.store.register_notification(config, sender).await;
                         let _ = response.send(result.map_err(anyhow::Error::from));
                     }
                     StoreRequest::UnregisterNotification { config, sender, response } => {
-                        let result = store.unregister_notification(&config, &sender).await;
+                        let result = service.store.unregister_notification(&config, &sender).await;
                         let _ = response.send(result);
                     }
                     StoreRequest::InnerDisableNotifications { response } => {
-                        store.inner_mut().disable_notifications();
+                        service.store.inner_mut().disable_notifications();
                         let _ = response.send(());
                     }
                     StoreRequest::InnerEnableNotifications { response } => {
-                        store.inner_mut().enable_notifications();
+                        service.store.inner_mut().enable_notifications();
                         let _ = response.send(());
                     }
                     StoreRequest::InnerRestoreSnapshot { snapshot, response } => {
-                        store.inner_mut().restore_snapshot(snapshot);
+                        service.store.inner_mut().restore_snapshot(snapshot);
                         let _ = response.send(());
                     }
                     StoreRequest::InnerTakeSnapshot { response } => {
-                        let snapshot = store.inner().take_snapshot();
+                        let snapshot = service.store.inner().take_snapshot();
                         let _ = response.send(snapshot);
                     }
                     StoreRequest::InnerGetWriteChannelReceiver { response } => {
-                        let receiver = store.inner().get_write_channel_receiver();
+                        let receiver = service.store.inner().get_write_channel_receiver();
                         let _ = response.send(receiver);
+                    }
+                    StoreRequest::CheckRequestsAuthorization { client_id, requests, response } => {
+                        let result = service.check_requests_authorization(&client_id, requests).await;
+                        let _ = response.send(result);
                     }
                     StoreRequest::SetServices { services: _, response } => {
                         // Store service currently doesn't need other services
@@ -429,4 +479,76 @@ impl StoreService {
 
         StoreHandle { sender }
     }
+}
+
+impl StoreService {
+    async fn check_requests_authorization(
+        &mut self,
+        client_id: &EntityId,
+        requests: Vec<Request>,
+    ) -> Result<Vec<Request>> {
+        let mut authorized_requests = Vec::new();
+
+        // If permission cache is not available, skip authorization checks
+        let permission_cache = match &self.permission_cache {
+            Some(cache) => cache,
+            None => {
+                tracing::warn!("Permission cache not available, skipping authorization checks");
+                return Ok(requests);
+            }
+        };
+
+        for request in requests {
+            if let Some(entity_id) = request.entity_id() {
+                if let Some(field_type) = request.field_type() {
+                    match get_scope(
+                        &mut self.store,
+                        &mut self.cel_executor,
+                        permission_cache,
+                        client_id,
+                        entity_id,
+                        field_type,
+                    ).await {
+                        Ok(scope) => {
+                            if scope == AuthorizationScope::None {
+                                return Err(anyhow::anyhow!(
+                                    "Access denied: Subject {} is not authorized to access {} on entity {}",
+                                    client_id, field_type, entity_id
+                                ));
+                            }
+                            // For write operations, check if we have write access
+                            if is_write_operation(&request) && scope == AuthorizationScope::ReadOnly {
+                                return Err(anyhow::anyhow!(
+                                    "Access denied: Subject {} only has read access to {} on entity {}",
+                                    client_id, field_type, entity_id
+                                ));
+                            }
+                            authorized_requests.push(request);
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "Authorization error: {}", e
+                            ));
+                        }
+                    }
+                } else {
+                    authorized_requests.push(request);
+                }
+            } else {
+                authorized_requests.push(request);
+            }
+        }
+
+        Ok(authorized_requests)
+    }
+}
+
+/// Helper function to check if a request is a write operation
+fn is_write_operation(request: &Request) -> bool {
+    matches!(request, 
+        Request::Write { .. } | 
+        Request::Create { .. } | 
+        Request::Delete { .. } | 
+        Request::SchemaUpdate { .. }
+    )
 }
