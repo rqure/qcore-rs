@@ -5,13 +5,14 @@ mod store;
 mod snapshot;
 mod files;
 mod auth;
+mod misc;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
 
-use crate::{auth::{AuthHandle, AuthService}, clients::{ClientConfig, ClientHandle, ClientService}, peers::{PeerConfig, PeerHandle, PeerService}, snapshot::{SnapshotConfig, SnapshotHandle, SnapshotService}, store::{StoreHandle, StoreService}, wal::{WalConfig, WalHandle, WalService}};
+use crate::{auth::{AuthHandle, AuthService}, clients::{ClientConfig, ClientHandle, ClientService}, misc::{MiscConfig, MiscHandle, MiscService}, peers::{PeerConfig, PeerHandle, PeerService}, snapshot::{SnapshotConfig, SnapshotHandle, SnapshotService}, store::{StoreHandle, StoreService}, wal::{WalConfig, WalHandle, WalService}};
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -70,6 +71,7 @@ pub struct Config {
 pub struct Services {
     pub auth_handle: AuthHandle,
     pub client_handle: ClientHandle,
+    pub misc_handle: MiscHandle,
     pub peer_handle: PeerHandle,
     pub snapshot_handle: SnapshotHandle,
     pub store_handle: StoreHandle,
@@ -155,9 +157,11 @@ async fn main() -> Result<()> {
     });
     let client_handle = ClientService::spawn(ClientConfig::from(&config));
     let peer_handle = PeerService::spawn(PeerConfig::from(&config));
+    let misc_handle = MiscService::spawn(MiscConfig::from(&config));
     let services = Services {
         auth_handle: auth_handle.clone(),
         client_handle: client_handle.clone(),
+        misc_handle: misc_handle.clone(),
         peer_handle: peer_handle.clone(),
         snapshot_handle: snapshot_handle.clone(),
         store_handle: store_handle.clone(),
@@ -171,6 +175,8 @@ async fn main() -> Result<()> {
     auth_handle.set_services(services.clone()).await;
     store_handle.set_services(services.clone()).await;
     snapshot_handle.set_services(services.clone()).await;
+    misc_handle.set_services(services.clone()).await;
+    misc_handle.set_services(services.clone()).await;
 
     // Keep the main task alive
     tokio::signal::ctrl_c().await?;
