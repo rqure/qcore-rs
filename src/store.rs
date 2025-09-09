@@ -1,5 +1,5 @@
 use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
-use qlib_rs::auth::{AuthorizationScope, get_scope};
+use qlib_rs::auth::{AuthorizationScope, get_scope, authenticate_subject, AuthConfig};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{interval, Duration};
 use anyhow::Result;
@@ -98,6 +98,11 @@ pub enum StoreRequest {
         client_id: EntityId,
         requests: Vec<Request>,
         response: oneshot::Sender<Result<Vec<Request>>>,
+    },
+    AuthenticateSubject {
+        subject_name: String,
+        credential: String,
+        response: oneshot::Sender<Result<EntityId>>,
     },
     SetServices {
         services: Services,
@@ -352,6 +357,21 @@ impl StoreHandle {
         }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
         response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
+
+    /// Authenticate a subject with credentials
+    pub async fn authenticate_subject(
+        &self,
+        subject_name: &str,
+        credential: &str,
+    ) -> Result<EntityId> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender.send(StoreRequest::AuthenticateSubject {
+            subject_name: subject_name.to_string(),
+            credential: credential.to_string(),
+            response: response_tx,
+        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+    }
 }
 
 pub struct StoreService {
@@ -495,6 +515,10 @@ impl StoreService {
                 let result = self.check_requests_authorization(&client_id, requests).await;
                 let _ = response.send(result);
             }
+            StoreRequest::AuthenticateSubject { subject_name, credential, response } => {
+                let result = self.authenticate_subject(&subject_name, &credential).await;
+                let _ = response.send(result);
+            }
             StoreRequest::SetServices { services: _, response } => {
                 // Store service currently doesn't need other services
                 let _ = response.send(());
@@ -562,6 +586,13 @@ impl StoreService {
         }
 
         Ok(authorized_requests)
+    }
+
+    async fn authenticate_subject(&mut self, subject_name: &str, credential: &str) -> Result<EntityId> {
+        let auth_config = AuthConfig::default();
+        authenticate_subject(&mut self.store, subject_name, credential, &auth_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Authentication failed: {:?}", e))
     }
 }
 

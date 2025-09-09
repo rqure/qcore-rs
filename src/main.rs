@@ -74,6 +74,7 @@ pub struct Services {
     pub snapshot_handle: SnapshotHandle,
     pub store_handle: StoreHandle,
     pub wal_handle: WalHandle,
+    pub machine_id: String,
 }
 
 impl Services {
@@ -162,6 +163,7 @@ async fn main() -> Result<()> {
         snapshot_handle: snapshot_handle.clone(),
         store_handle: store_handle.clone(),
         wal_handle: wal_handle.clone(),
+        machine_id: config.machine.clone(),
     };
 
     // Set services for all services that need dependencies

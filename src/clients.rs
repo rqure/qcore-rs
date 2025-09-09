@@ -6,7 +6,10 @@ use tracing::{info, warn, error, debug, instrument};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use qlib_rs::{notification_channel, StoreMessage, EntityId, NotificationSender, NotifyConfig};
+use qlib_rs::{
+    notification_channel, StoreMessage, EntityId, NotificationSender, NotifyConfig,
+    AuthenticationResult
+};
 
 use crate::Services;
 
@@ -157,7 +160,6 @@ impl ClientHandle {
 }
 
 pub struct ClientService {
-    config: ClientConfig,
     connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
     client_notification_senders: HashMap<String, NotificationSender>,
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
@@ -172,7 +174,6 @@ impl ClientService {
         let config_clone = config.clone();
         tokio::spawn(async move {
             let mut service = ClientService {
-                config,
                 connected_clients: HashMap::new(),
                 client_notification_senders: HashMap::new(),
                 client_notification_configs: HashMap::new(),
@@ -267,6 +268,17 @@ impl ClientService {
     }
     
     async fn process_store_message(&mut self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
+        // Get the services first
+        let services = match &self.services {
+            Some(services) => services.clone(),
+            None => {
+                return StoreMessage::Error {
+                    id: "unknown".to_string(),
+                    error: "Services not available".to_string(),
+                };
+            }
+        };
+
         // Extract client notification sender if needed
         let client_notification_sender = if let Some(ref addr) = client_addr {
             self.client_notification_senders.get(addr).cloned()
@@ -275,24 +287,30 @@ impl ClientService {
         };
 
         match message {
-            StoreMessage::Authenticate { id, subject_name: _, credential: _ } => {
-                // TODO: Implement proper authentication
-                // For now, we'll simulate successful authentication
-                if let Some(ref addr) = client_addr {
-                    let client_id = EntityId::new("User", 0); // Temporary ID
-                    self.authenticated_clients.insert(addr.clone(), client_id.clone());
-                    
-                    StoreMessage::AuthenticateResponse {
-                        id,
-                        response: Ok(qlib_rs::AuthenticationResult {
-                            subject_id: client_id,
-                            subject_type: "User".to_string(),
-                        }),
+            StoreMessage::Authenticate { id, subject_name, credential } => {
+                // Perform authentication via the store service
+                match services.store_handle.authenticate_subject(&subject_name, &credential).await {
+                    Ok(subject_id) => {
+                        // Store authentication state
+                        if let Some(ref addr) = client_addr {
+                            self.authenticated_clients.insert(addr.clone(), subject_id.clone());
+                        }
+                        
+                        let auth_result = AuthenticationResult {
+                            subject_id: subject_id.clone(),
+                            subject_type: subject_id.get_type().to_string(),
+                        };
+                        
+                        StoreMessage::AuthenticateResponse {
+                            id,
+                            response: Ok(auth_result),
+                        }
                     }
-                } else {
-                    StoreMessage::AuthenticateResponse {
-                        id,
-                        response: Err("No client address provided".to_string()),
+                    Err(e) => {
+                        StoreMessage::AuthenticateResponse {
+                            id,
+                            response: Err(format!("Authentication failed: {:?}", e)),
+                        }
                     }
                 }
             }
@@ -301,94 +319,292 @@ impl ClientService {
                 // This should not be sent by clients, only by server
                 StoreMessage::Error {
                     id: "unknown".to_string(),
-                    error: "AuthenticateResponse is not a valid client message".to_string(),
+                    error: "Invalid message type".to_string(),
                 }
             }
             
-            // Handle other store messages by delegating to the store
+            // All other messages require authentication
             _ => {
-                // Get the client ID if the client is authenticated
-                let _client_id = if let Some(ref addr) = client_addr {
+                // Check if client is authenticated
+                let client_id = if let Some(ref addr) = client_addr {
                     self.authenticated_clients.get(addr).cloned()
                 } else {
-                    None
+                    None // No client address means not authenticated
                 };
                 
-                // Process the message with the store
-                match &message {
-                    StoreMessage::RegisterNotification { id, config } => {
-                        if let Some(ref addr) = client_addr {
-                            if let Some(notification_sender) = client_notification_sender {
-                                match self.services.as_ref().unwrap().store_handle.register_notification(config.clone(), notification_sender).await {
-                            Ok(()) => {
-                                // Track this config for cleanup on disconnect
-                                self.client_notification_configs
-                                    .entry(addr.clone())
-                                    .or_insert_with(HashSet::new)
-                                    .insert(config.clone());
-                                
-                                StoreMessage::RegisterNotificationResponse {
-                                    id: id.clone(),
-                                    response: Ok(()),
-                                }
-                            }
-                            Err(e) => {
-                                StoreMessage::Error {
-                                    id: id.clone(),
-                                    error: format!("Failed to register notification: {}", e),
-                                }
-                            }
+                if client_id.is_none() {
+                    return StoreMessage::Error {
+                        id: "unknown".to_string(),
+                        error: "Authentication required".to_string(),
+                    };
+                }
+                let client_id = client_id.unwrap();
+                
+                match message {
+                    StoreMessage::Authenticate { .. } |
+                    StoreMessage::AuthenticateResponse { .. } => {
+                        // These are handled in the outer match, should not reach here
+                        StoreMessage::Error {
+                            id: "unknown".to_string(),
+                            error: "Authentication messages should not reach this point".to_string(),
                         }
+                    }
+            
+                    StoreMessage::GetEntitySchema { id, entity_type } => {
+                        match services.store_handle.get_entity_schema(&entity_type).await {
+                            Ok(schema) => StoreMessage::GetEntitySchemaResponse {
+                                id,
+                                response: Ok(Some(schema)),
+                            },
+                            Err(e) => StoreMessage::GetEntitySchemaResponse {
+                                id,
+                                response: Err(format!("{:?}", e)),
+                            },
+                        }
+                    }
+                    
+                    StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
+                        match services.store_handle.get_complete_entity_schema(&entity_type).await {
+                            Ok(schema) => StoreMessage::GetCompleteEntitySchemaResponse {
+                                id,
+                                response: Ok(schema),
+                            },
+                            Err(e) => StoreMessage::GetCompleteEntitySchemaResponse {
+                                id,
+                                response: Err(format!("{:?}", e)),
+                            },
+                        }
+                    }
+                    
+                    StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
+                        match services.store_handle.get_field_schema(&entity_type, &field_type).await {
+                            Ok(schema) => StoreMessage::GetFieldSchemaResponse {
+                                id,
+                                response: Ok(Some(schema)),
+                            },
+                            Err(e) => StoreMessage::GetFieldSchemaResponse {
+                                id,
+                                response: Err(format!("{:?}", e)),
+                            },
+                        }
+                    }
+                    
+                    StoreMessage::EntityExists { id, entity_id } => {
+                        let exists = services.store_handle.entity_exists(&entity_id).await;
+                        StoreMessage::EntityExistsResponse {
+                            id,
+                            response: exists,
+                        }
+                    }
+                    
+                    StoreMessage::FieldExists { id, entity_type, field_type } => {
+                        let exists = services.store_handle.field_exists(&entity_type, &field_type).await;
+                        StoreMessage::FieldExistsResponse {
+                            id,
+                            response: exists,
+                        }
+                    }
+                    
+                    StoreMessage::Perform { id, mut requests } => {
+                        // Check authorization for requests
+                        match services.store_handle.check_requests_authorization(&client_id, requests.clone()).await {
+                            Ok(authorized_requests) => {
+                                if authorized_requests.len() != requests.len() {
+                                    StoreMessage::PerformResponse {
+                                        id,
+                                        response: Err("Some requests were not authorized".to_string()),
+                                    }
+                                } else {
+                                    // Set originator and writer_id for the requests
+                                    requests.iter_mut().for_each(|req| {
+                                        req.try_set_originator(services.machine_id.clone());
+                                        req.try_set_writer_id(client_id.clone());
+                                    });
+
+                                    match services.store_handle.perform_mut(&mut requests).await {
+                                        Ok(()) => StoreMessage::PerformResponse {
+                                            id,
+                                            response: Ok(requests),
+                                        },
+                                        Err(e) => StoreMessage::PerformResponse {
+                                            id,
+                                            response: Err(format!("{:?}", e)),
+                                        },
+                                    }
+                                }
+                            }
+                            Err(e) => StoreMessage::PerformResponse {
+                                id,
+                                response: Err(format!("Authorization check failed: {:?}", e)),
+                            },
+                        }
+                    }
+                    
+                    StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
+                        match services.store_handle.find_entities_paginated(&entity_type, page_opts, filter).await {
+                            Ok(result) => StoreMessage::FindEntitiesResponse {
+                                id,
+                                response: Ok(result),
+                            },
+                            Err(e) => StoreMessage::FindEntitiesResponse {
+                                id,
+                                response: Err(format!("{:?}", e)),
+                            },
+                        }
+                    }
+                    
+                    StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
+                        match services.store_handle.find_entities_exact(&entity_type, page_opts, filter).await {
+                            Ok(result) => StoreMessage::FindEntitiesExactResponse {
+                                id,
+                                response: Ok(result),
+                            },
+                            Err(e) => StoreMessage::FindEntitiesExactResponse {
+                                id,
+                                response: Err(format!("{:?}", e)),
+                            },
+                        }
+                    }
+                    
+                    StoreMessage::GetEntityTypes { id, page_opts } => {
+                        match services.store_handle.get_entity_types_paginated(page_opts).await {
+                            Ok(result) => StoreMessage::GetEntityTypesResponse {
+                                id,
+                                response: Ok(result),
+                            },
+                            Err(e) => StoreMessage::GetEntityTypesResponse {
+                                id,
+                                response: Err(format!("{:?}", e)),
+                            },
+                        }
+                    }
+                    
+                    StoreMessage::RegisterNotification { id, config } => {
+                        // Register notification for this client
+                        if let Some(client_addr) = &client_addr {
+                            if let Some(ref notification_sender) = client_notification_sender {
+                                match services.store_handle.register_notification(config.clone(), notification_sender.clone()).await {
+                                    Ok(()) => {
+                                        self.client_notification_configs
+                                            .entry(client_addr.clone())
+                                            .or_insert_with(HashSet::new)
+                                            .insert(config.clone());
+                                        
+                                        debug!(
+                                            client_addr = %client_addr,
+                                            config = ?config,
+                                            "Registered notification for client"
+                                        );
+                                        StoreMessage::RegisterNotificationResponse {
+                                            id,
+                                            response: Ok(()),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            client_addr = %client_addr,
+                                            error = ?e,
+                                            "Failed to register notification for client"
+                                        );
+                                        StoreMessage::RegisterNotificationResponse {
+                                            id,
+                                            response: Err(format!("Failed to register notification: {:?}", e)),
+                                        }
+                                    }
+                                }
                             } else {
-                                StoreMessage::Error {
-                                    id: id.clone(),
-                                    error: "No notification channel available for client".to_string(),
+                                error!(
+                                    client_addr = %client_addr,
+                                    "No notification sender found for client"
+                                );
+                                StoreMessage::RegisterNotificationResponse {
+                                    id,
+                                    response: Err("Client notification sender not found".to_string()),
                                 }
                             }
                         } else {
-                            StoreMessage::Error {
-                                id: id.clone(),
-                                error: "No client address provided".to_string(),
+                            StoreMessage::RegisterNotificationResponse {
+                                id,
+                                response: Err("Client address not provided".to_string()),
                             }
                         }
                     }
                     
                     StoreMessage::UnregisterNotification { id, config } => {
-                        if let Some(ref addr) = client_addr {
-                            if let Some(notification_sender) = client_notification_sender {
-                                let removed = self.services.as_ref().unwrap().store_handle.unregister_notification(config, &notification_sender).await;
+                        // Unregister notification for this client
+                        if let Some(client_addr) = &client_addr {
+                            if let Some(ref notification_sender) = client_notification_sender {
+                                let removed = services.store_handle.unregister_notification(&config, notification_sender).await;
+                                
+                                // Remove from client's tracked configs if successfully unregistered
                                 if removed {
-                                    // Remove from our tracking
-                                    if let Some(configs) = self.client_notification_configs.get_mut(addr) {
-                                        configs.remove(config);
+                                    if let Some(client_configs) = self.client_notification_configs.get_mut(client_addr) {
+                                        client_configs.remove(&config);
                                     }
                                 }
                                 
+                                debug!(
+                                    client_addr = %client_addr,
+                                    config = ?config,
+                                    removed = removed,
+                                    "Unregistered notification for client"
+                                );
                                 StoreMessage::UnregisterNotificationResponse {
-                                    id: id.clone(),
+                                    id,
                                     response: removed,
                                 }
                             } else {
-                                StoreMessage::Error {
-                                    id: id.clone(),
-                                    error: "No notification channel available for client".to_string(),
+                                error!(
+                                    client_addr = %client_addr,
+                                    "No notification sender found for client"
+                                );
+                                StoreMessage::UnregisterNotificationResponse {
+                                    id,
+                                    response: false,
                                 }
                             }
                         } else {
-                            StoreMessage::Error {
-                                id: id.clone(),
-                                error: "No client address provided".to_string(),
+                            StoreMessage::UnregisterNotificationResponse {
+                                id,
+                                response: false,
                             }
                         }
                     }
                     
-                    // For all other messages, we need to implement delegation to the store
-                    // This is a simplified version - you may need to implement more specific handling
-                    _ => {
-                        // TODO: Implement delegation to store for other message types
+                    // These message types should not be received by the server
+                    StoreMessage::GetEntitySchemaResponse { id, .. } |
+                    StoreMessage::GetCompleteEntitySchemaResponse { id, .. } |
+                    StoreMessage::GetFieldSchemaResponse { id, .. } |
+                    StoreMessage::EntityExistsResponse { id, .. } |
+                    StoreMessage::FieldExistsResponse { id, .. } |
+                    StoreMessage::PerformResponse { id, .. } |
+                    StoreMessage::FindEntitiesResponse { id, .. } |
+                    StoreMessage::FindEntitiesExactResponse { id, .. } |
+                    StoreMessage::GetEntityTypesResponse { id, .. } |
+                    StoreMessage::RegisterNotificationResponse { id, .. } |
+                    StoreMessage::UnregisterNotificationResponse { id, .. } => {
                         StoreMessage::Error {
-                            id: "unknown".to_string(),
-                            error: "Message type not yet implemented in ClientService".to_string(),
+                            id,
+                            error: "Received response message on server - this should not happen".to_string(),
+                        }
+                    }
+                    
+                    StoreMessage::Notification { .. } => {
+                        StoreMessage::Error {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            error: "Received notification message on server - this should not happen".to_string(),
+                        }
+                    }
+                    
+                    StoreMessage::Error { id, error } => {
+                        warn!(
+                            message_id = %id,
+                            error_message = %error,
+                            "Received error message from client"
+                        );
+                        StoreMessage::Error {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            error: "Server received error message from client".to_string(),
                         }
                     }
                 }
