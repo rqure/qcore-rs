@@ -109,7 +109,7 @@ pub enum StoreRequest {
         response: oneshot::Sender<Result<EntityId>>,
     },
     SetServices {
-        _services: Services,
+        services: Services,
         response: oneshot::Sender<()>,
     },
 }
@@ -329,7 +329,7 @@ impl StoreHandle {
     pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(StoreRequest::SetServices {
-            _services: services,
+            services,
             response: response_tx,
         }).is_ok() {
             let _ = response_rx.await;
@@ -372,7 +372,8 @@ pub struct StoreService {
     store: AsyncStore,
     permission_cache: Option<Cache>,
     cel_executor: CelExecutor,
-    services: Option<Services>,
+    write_channel_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>,
+    write_channel_task_spawned: bool,
 }
 
 impl StoreService {
@@ -396,19 +397,20 @@ impl StoreService {
                 }
             };
             
+            // Get the write channel receiver for consuming write operations
+            let write_channel_receiver = store.inner().get_write_channel_receiver();
+            
             let mut service = StoreService {
-                config,
+                config: config.clone(),
                 store,
                 permission_cache,
                 cel_executor: CelExecutor::new(),
-                services: None,
+                write_channel_receiver,
+                write_channel_task_spawned: false,
             };
 
             let mut receiver = receiver;
             let mut notification_timer = interval(Duration::from_millis(100)); // Process notifications every 100ms
-
-            // Get the write channel receiver for consuming write operations
-            let write_channel_receiver = service.store.inner().get_write_channel_receiver();
 
             loop {
                 tokio::select! {
@@ -424,15 +426,6 @@ impl StoreService {
                         // Process cache notifications periodically
                         if let Some(ref mut cache) = service.permission_cache {
                             cache.process_notifications();
-                        }
-                    }
-                    // Process write channel requests
-                    write_requests = async {
-                        let mut receiver_guard = write_channel_receiver.lock().await;
-                        receiver_guard.recv().await
-                    } => {
-                        if let Some(requests) = write_requests {
-                            service.process_write_channel_requests(requests).await;
                         }
                     }
                 }
@@ -526,8 +519,19 @@ impl StoreService {
                 let result = self.authenticate_subject(&subject_name, &credential).await;
                 let _ = response.send(result);
             }
-            StoreRequest::SetServices { _services, response } => {
-                self.services = Some(_services);
+            StoreRequest::SetServices { services, response } => {
+                // Spawn the write channel processing task if it hasn't been spawned yet
+                if !self.write_channel_task_spawned {
+                    let write_channel_receiver = self.write_channel_receiver.clone();
+                    let config = self.config.clone();
+                    
+                    tokio::spawn(async move {
+                        Self::process_write_channel_task(write_channel_receiver, config, services).await;
+                    });
+                    
+                    self.write_channel_task_spawned = true;
+                }
+                
                 let _ = response.send(());
             }
         }
@@ -535,6 +539,75 @@ impl StoreService {
 }
 
 impl StoreService {
+    async fn process_write_channel_task(
+        write_channel_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>,
+        config: StoreConfig,
+        services: Services,
+    ) {
+        loop {
+            // Wait for write requests from the channel
+            let requests = {
+                let mut receiver_guard = write_channel_receiver.lock().await;
+                match receiver_guard.recv().await {
+                    Some(requests) => requests,
+                    None => {
+                        tracing::info!("Write channel closed, terminating write channel task");
+                        break;
+                    }
+                }
+            };
+
+            Self::process_write_requests(requests, &config, &services).await;
+        }
+    }
+
+    async fn process_write_requests(
+        mut requests: Vec<Request>,
+        config: &StoreConfig,
+        services: &Services,
+    ) {
+        // Get the machine ID from the config
+        let machine_id = &config.machine_id;
+
+        // Ensure the originator is set for all requests
+        requests.iter_mut().for_each(|req| {
+            if req.originator().is_none() {
+                req.try_set_originator(machine_id.clone());
+            }
+        });
+
+        // Write all requests to the WAL file - these requests have already been applied to the store
+        for request in &requests {
+            if let Err(e) = services.wal_handle.write_request(request.clone()).await {
+                tracing::error!(
+                    error = %e,
+                    "Failed to write request to WAL"
+                );
+            }
+        }
+
+        // Send batch of requests to peers for synchronization if we have any
+        let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
+            .filter(|request| {
+                if let Some(originator) = request.originator() {
+                    originator == machine_id
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+
+        if !requests_to_sync.is_empty() {
+            tracing::debug!(
+                count = requests_to_sync.len(),
+                "Sending sync requests to peers"
+            );
+            
+            services.peer_handle.send_sync_message(requests_to_sync).await;
+        }
+    }
+
     async fn check_requests_authorization(
         &mut self,
         client_id: &EntityId,
@@ -600,59 +673,6 @@ impl StoreService {
         authenticate_subject(&mut self.store, subject_name, credential, &auth_config)
             .await
             .map_err(|e| anyhow::anyhow!("Authentication for '{}' failed: {:?}", subject_name, e))
-    }
-
-    /// Process a batch of requests from the write channel
-    async fn process_write_channel_requests(&mut self, mut requests: Vec<Request>) {
-        // Ensure we have services available
-        let services = match &self.services {
-            Some(services) => services,
-            None => {
-                tracing::error!("Services not available, cannot process write channel requests");
-                return;
-            }
-        };
-
-        // Get the machine ID from the config
-        let machine_id = &self.config.machine_id;
-
-        // Ensure the originator is set for all requests
-        requests.iter_mut().for_each(|req| {
-            if req.originator().is_none() {
-                req.try_set_originator(machine_id.clone());
-            }
-        });
-
-        // Write all requests to the WAL file - these requests have already been applied to the store
-        for request in &requests {
-            if let Err(e) = services.wal_handle.write_request(request.clone()).await {
-                tracing::error!(
-                    error = %e,
-                    "Failed to write request to WAL"
-                );
-            }
-        }
-
-        // Send batch of requests to peers for synchronization if we have any
-        let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
-            .filter(|request| {
-                if let Some(originator) = request.originator() {
-                    originator == machine_id
-                } else {
-                    false
-                }
-            })
-            .cloned()
-            .collect();
-
-        if !requests_to_sync.is_empty() {
-            tracing::debug!(
-                count = requests_to_sync.len(),
-                "Sending sync requests to peers"
-            );
-            
-            services.peer_handle.send_sync_message(requests_to_sync).await;
-        }
     }
 }
 
