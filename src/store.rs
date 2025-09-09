@@ -615,7 +615,7 @@ impl StoreService {
         let auth_config = AuthConfig::default();
         authenticate_subject(&mut self.store, subject_name, credential, &auth_config)
             .await
-            .map_err(|e| anyhow::anyhow!("Authentication failed: {:?}", e))
+            .map_err(|e| anyhow::anyhow!("Authentication for '{}' failed: {:?}", subject_name, e))
     }
 
     /// Process a batch of requests from the write channel

@@ -756,7 +756,7 @@ async fn handle_client_connection(
     let is_authenticated = matches!(auth_response, StoreMessage::AuthenticateResponse { response: Ok(_), .. });
     
     if !is_authenticated {
-        info!("Client authentication failed, closing connection");
+        warn!("Client authentication failed, closing connection");
         let _ = ws_sender.close().await;
         return Ok(());
     }

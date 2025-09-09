@@ -93,6 +93,10 @@ pub enum PeerRequest {
     GetLeadershipInfo {
         response: oneshot::Sender<(bool, Option<String>)>, // (is_leader, current_leader)
     },
+    IsOutboundPeerConnected {
+        peer_addr: String,
+        response: oneshot::Sender<bool>,
+    },
     PeerConnected {
         peer_addr: String,
         machine_id: String,
@@ -196,6 +200,19 @@ impl PeerHandle {
             response_rx.await.unwrap_or(None)
         } else {
             None
+        }
+    }
+
+    /// Check if we already have an outbound connection to a peer
+    pub async fn is_outbound_peer_connected(&self, peer_addr: &str) -> bool {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.sender.send(PeerRequest::IsOutboundPeerConnected {
+            peer_addr: peer_addr.to_string(),
+            response: response_tx,
+        }).is_ok() {
+            response_rx.await.unwrap_or(false)
+        } else {
+            false
         }
     }
 
@@ -303,6 +320,10 @@ impl PeerService {
             }
             PeerRequest::GetLeadershipInfo { response } => {
                 let _ = response.send((self.is_leader, self.current_leader.clone()));
+            }
+            PeerRequest::IsOutboundPeerConnected { peer_addr, response } => {
+                let is_connected = self.connected_outbound_peers.contains_key(&peer_addr);
+                let _ = response.send(is_connected);
             }
             PeerRequest::PeerConnected { peer_addr, machine_id, startup_time } => {
                 self.handle_peer_connected(peer_addr, machine_id, startup_time).await;
@@ -849,6 +870,11 @@ async fn manage_outbound_peer_connections(config: PeerConfig, handle: PeerHandle
         interval.tick().await;
         
         for peer_addr in &config.peer_addresses {
+            // Check if we already have an active connection to this peer
+            if handle.is_outbound_peer_connected(peer_addr).await {
+                continue;
+            }
+            
             let peer_addr_clone = peer_addr.clone();
             let handle_clone = handle.clone();
             
@@ -869,7 +895,8 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     let (ws_sender, mut ws_receiver) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     
-    handle.outbound_peer_connected(peer_addr.to_string(), tx);
+    // Notify the service about the connection - it will handle sending the startup message
+    handle.outbound_peer_connected(peer_addr.to_string(), tx.clone());
     
     let peer_addr_clone = peer_addr.to_string();
     let handle_clone = handle.clone();
