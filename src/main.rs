@@ -140,7 +140,9 @@ async fn main() -> Result<()> {
         .with_line_number(cfg!(debug_assertions))
         .init();
 
-    let store_handle = StoreService::spawn();
+    let store_handle = StoreService::spawn(store::StoreConfig {
+        machine_id: config.machine.clone(),
+    });
     let snapshot_handle = SnapshotService::spawn(SnapshotConfig {
         snapshots_dir: PathBuf::from(&config.data_dir).join("snapshots"),
         max_files: config.snapshot_max_files,

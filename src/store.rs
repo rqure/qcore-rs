@@ -8,6 +8,13 @@ use std::collections::HashMap;
 
 use crate::Services;
 
+/// Configuration for the store service
+#[derive(Debug, Clone)]
+pub struct StoreConfig {
+    /// Machine ID (unique identifier for this instance)
+    pub machine_id: String,
+}
+
 /// Store manager request types
 #[derive(Debug)]
 pub enum StoreRequest {
@@ -375,13 +382,15 @@ impl StoreHandle {
 }
 
 pub struct StoreService {
+    config: StoreConfig,
     store: AsyncStore,
     permission_cache: Option<Cache>,
     cel_executor: CelExecutor,
+    services: Option<Services>,
 }
 
 impl StoreService {
-    pub fn spawn() -> StoreHandle {
+    pub fn spawn(config: StoreConfig) -> StoreHandle {
         let (sender, receiver) = mpsc::unbounded_channel();
         
         tokio::spawn(async move {
@@ -402,13 +411,18 @@ impl StoreService {
             };
             
             let mut service = StoreService {
+                config,
                 store,
                 permission_cache,
                 cel_executor: CelExecutor::new(),
+                services: None,
             };
 
             let mut receiver = receiver;
             let mut notification_timer = interval(Duration::from_millis(100)); // Process notifications every 100ms
+
+            // Get the write channel receiver for consuming write operations
+            let write_channel_receiver = service.store.inner().get_write_channel_receiver();
 
             loop {
                 tokio::select! {
@@ -424,6 +438,15 @@ impl StoreService {
                         // Process cache notifications periodically
                         if let Some(ref mut cache) = service.permission_cache {
                             cache.process_notifications();
+                        }
+                    }
+                    // Process write channel requests
+                    write_requests = async {
+                        let mut receiver_guard = write_channel_receiver.lock().await;
+                        receiver_guard.recv().await
+                    } => {
+                        if let Some(requests) = write_requests {
+                            service.process_write_channel_requests(requests).await;
                         }
                     }
                 }
@@ -519,8 +542,8 @@ impl StoreService {
                 let result = self.authenticate_subject(&subject_name, &credential).await;
                 let _ = response.send(result);
             }
-            StoreRequest::SetServices { _services: _, response } => {
-                // Store service currently doesn't need other services
+            StoreRequest::SetServices { _services, response } => {
+                self.services = Some(_services);
                 let _ = response.send(());
             }
         }
@@ -593,6 +616,59 @@ impl StoreService {
         authenticate_subject(&mut self.store, subject_name, credential, &auth_config)
             .await
             .map_err(|e| anyhow::anyhow!("Authentication failed: {:?}", e))
+    }
+
+    /// Process a batch of requests from the write channel
+    async fn process_write_channel_requests(&mut self, mut requests: Vec<Request>) {
+        // Ensure we have services available
+        let services = match &self.services {
+            Some(services) => services,
+            None => {
+                tracing::error!("Services not available, cannot process write channel requests");
+                return;
+            }
+        };
+
+        // Get the machine ID from the config
+        let machine_id = &self.config.machine_id;
+
+        // Ensure the originator is set for all requests
+        requests.iter_mut().for_each(|req| {
+            if req.originator().is_none() {
+                req.try_set_originator(machine_id.clone());
+            }
+        });
+
+        // Write all requests to the WAL file - these requests have already been applied to the store
+        for request in &requests {
+            if let Err(e) = services.wal_handle.write_request(request.clone()).await {
+                tracing::error!(
+                    error = %e,
+                    "Failed to write request to WAL"
+                );
+            }
+        }
+
+        // Send batch of requests to peers for synchronization if we have any
+        let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
+            .filter(|request| {
+                if let Some(originator) = request.originator() {
+                    originator == machine_id
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+
+        if !requests_to_sync.is_empty() {
+            tracing::debug!(
+                count = requests_to_sync.len(),
+                "Sending sync requests to peers"
+            );
+            
+            services.peer_handle.send_sync_message(requests_to_sync).await;
+        }
     }
 }
 
