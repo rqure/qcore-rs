@@ -1,4 +1,4 @@
-use qlib_rs::EntityId;
+use qlib_rs::now;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
@@ -17,8 +17,6 @@ use crate::Services;
 pub struct PeerConfig {
     /// Machine ID (unique identifier for this instance)
     pub machine: String,
-    /// Data directory for storing WAL files and other persistent data
-    pub data_dir: String,
     /// Port for peer-to-peer communication
     pub peer_port: u16,
     /// List of peer addresses to connect to (format: host:port)
@@ -35,7 +33,6 @@ impl From<&crate::Config> for PeerConfig {
     fn from(config: &crate::Config) -> Self {
         Self {
             machine: config.machine.clone(),
-            data_dir: config.data_dir.clone(),
             peer_port: config.peer_port,
             peer_addresses: config.peer_addresses.clone(),
             peer_reconnect_interval_secs: config.peer_reconnect_interval_secs,
@@ -112,6 +109,11 @@ pub enum PeerRequest {
         peer_addr: String,
     },
     FullSyncCompleted,
+    ProcessPeerMessage {
+        peer_msg: PeerMessage,
+        peer_addr: String,
+        response: oneshot::Sender<Option<PeerMessage>>,
+    },
     SetServices {
         services: Services,
         response: oneshot::Sender<()>,
@@ -182,6 +184,19 @@ impl PeerHandle {
 
     pub fn full_sync_completed(&self) {
         let _ = self.sender.send(PeerRequest::FullSyncCompleted);
+    }
+
+    pub async fn process_peer_message(&self, peer_msg: PeerMessage, peer_addr: String) -> Option<PeerMessage> {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.sender.send(PeerRequest::ProcessPeerMessage {
+            peer_msg,
+            peer_addr,
+            response: response_tx,
+        }).is_ok() {
+            response_rx.await.unwrap_or(None)
+        } else {
+            None
+        }
     }
 
     /// Set services for dependencies
@@ -318,6 +333,10 @@ impl PeerService {
                 self.full_sync_request_pending = false;
                 self.availability_state = AvailabilityState::Available;
                 self.became_unavailable_at = None;
+            }
+            PeerRequest::ProcessPeerMessage { peer_msg, peer_addr, response } => {
+                let reply = self.process_peer_message_internal(peer_msg, peer_addr).await;
+                let _ = response.send(reply);
             }
             PeerRequest::SetServices { services, response } => {
                 self.services = Some(services);
@@ -559,6 +578,134 @@ impl PeerService {
             self.full_sync_request_pending = false;
         }
     }
+
+    async fn process_peer_message_internal(&mut self, peer_msg: PeerMessage, _peer_addr: String) -> Option<PeerMessage> {
+        match peer_msg {
+            PeerMessage::Startup { .. } => {
+                // Startup messages are handled separately through PeerConnected
+                None
+            }
+            
+            PeerMessage::FullSyncRequest { machine_id } => {
+                info!(requesting_machine = %machine_id, "Received full sync request, preparing snapshot");
+                
+                if let Some(services) = &self.services {
+                    // Take a snapshot and send it
+                    if let Some(snapshot) = services.store_handle.take_snapshot().await {
+                        info!(
+                            requesting_machine = %machine_id,
+                            snapshot_entities = snapshot.entities.len(),
+                            "Snapshot prepared for full sync response"
+                        );
+                        
+                        Some(PeerMessage::FullSyncResponse { snapshot })
+                    } else {
+                        error!("Failed to take snapshot for full sync request");
+                        None
+                    }
+                } else {
+                    error!("Services not available for full sync request");
+                    None
+                }
+            }
+            
+            PeerMessage::FullSyncResponse { snapshot } => {
+                info!("Processing full sync response, applying snapshot");
+                
+                if let Some(services) = &self.services {
+                    // Apply the snapshot to the store
+                    services.store_handle.disable_notifications().await;
+                    services.store_handle.inner_restore_snapshot(snapshot.clone()).await;
+                    services.store_handle.enable_notifications().await;
+                    
+                    // Save the snapshot to disk for persistence
+                    match services.snapshot_handle.save(snapshot).await {
+                        Ok(snapshot_counter) => {
+                            info!(
+                                snapshot_counter = snapshot_counter,
+                                "Snapshot saved to disk during full sync"
+                            );
+                            
+                            // Write a snapshot marker to the WAL to indicate the sync point
+                            let snapshot_request = qlib_rs::Request::Snapshot {
+                                snapshot_counter,
+                                timestamp: Some(now()),
+                                originator: Some(self.config.machine.clone()),
+                            };
+                            
+                            if let Err(e) = services.wal_handle.write_request(snapshot_request).await {
+                                error!(
+                                    error = %e,
+                                    snapshot_counter = snapshot_counter,
+                                    "Failed to write snapshot marker to WAL"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to save snapshot during full sync");
+                        }
+                    }
+                    
+                    // Update state to indicate full sync completion
+                    self.is_fully_synced = true;
+                    self.full_sync_request_pending = false;
+                    self.availability_state = AvailabilityState::Available;
+                    self.became_unavailable_at = None;
+                    
+                    info!("Successfully applied full sync snapshot, instance is now fully synchronized");
+                } else {
+                    error!("Services not available for full sync response");
+                }
+                
+                None
+            }
+            
+            PeerMessage::SyncRequest { requests } => {
+                // Handle data synchronization (existing functionality)
+                if let Some(services) = &self.services {
+                    let our_machine_id = &self.config.machine;
+                    
+                    // Filter requests to only include those with valid originators (different from our machine)
+                    let mut requests_to_apply: Vec<_> = requests.into_iter()
+                        .filter(|request| {
+                            if let Some(originator) = request.originator() {
+                                originator != our_machine_id
+                            } else {
+                                false
+                            }
+                        })
+                        .filter(|request| {
+                            match request {
+                                qlib_rs::Request::Snapshot { .. } => false, // Ignore snapshot requests from peers
+                                _ => true,
+                            }
+                        })
+                        .collect();
+                    
+                    if !requests_to_apply.is_empty() {
+                        if let Err(e) = services.store_handle.perform_mut(&mut requests_to_apply).await {
+                            error!(
+                                error = %e,
+                                request_count = requests_to_apply.len(),
+                                "Failed to apply sync requests from peer"
+                            );
+                        } else {
+                            debug!(
+                                request_count = requests_to_apply.len(),
+                                "Successfully applied sync requests from peer"
+                            );
+                        }
+                    } else {
+                        debug!("No valid sync requests to apply from peer");
+                    }
+                } else {
+                    error!("Services not available for sync request");
+                }
+                
+                None
+            }
+        }
+    }
 }
 
 /// Handle a single peer WebSocket connection
@@ -621,61 +768,46 @@ async fn handle_peer_message(
             handle.peer_connected(peer_addr.to_string(), machine_id, startup_time);
         }
         
-        PeerMessage::FullSyncRequest { machine_id } => {
-            info!(requesting_machine = %machine_id, "Received full sync request");
-            
-            // TODO: Use services to get store handle
-            // if let Some(snapshot) = store.take_snapshot().await {
-            //     let response = PeerMessage::FullSyncResponse { snapshot };
-            //     
-            //     if let Ok(response_binary) = bincode::serialize(&response) {
-            //         let _ = ws_sender.send(Message::Binary(response_binary)).await;
-            //         info!(requesting_machine = %machine_id, "Sent FullSyncResponse");
-            //     }
-            // }
-        }
-        
-        PeerMessage::FullSyncResponse { snapshot } => {
-            info!("Received full sync response, applying snapshot");
-            
-            // TODO: Use services to get store handle
-            // store.disable_notifications().await;
-            // store.inner_restore_snapshot(snapshot.clone()).await;
-            // store.enable_notifications().await;
-            
-            // Save snapshot to disk
-            let (is_leader, _) = handle.get_leadership_info().await;
-            if !is_leader {
-                // Only save if we're not the leader to avoid unnecessary disk writes
-                // Implementation would be similar to previous version but simplified
-            }
-            
-            handle.full_sync_completed();
-            info!("Successfully applied full sync snapshot");
-        }
-        
-        PeerMessage::SyncRequest { requests } => {
-            let (_, current_leader) = handle.get_leadership_info().await;
-            let our_machine_id = current_leader.unwrap_or_default(); // This needs to be fixed
-            
-            let mut requests_to_apply: Vec<_> = requests.into_iter()
-                .filter(|request| {
-                    if let Some(originator) = request.originator() {
-                        *originator != our_machine_id
-                    } else {
-                        false
+        other_msg => {
+            // Process the message and get potential response
+            if let Some(response_msg) = handle.process_peer_message(other_msg, peer_addr.to_string()).await {
+                match &response_msg {
+                    PeerMessage::FullSyncResponse { .. } => {
+                        // Use binary serialization for the snapshot since it contains complex key types
+                        match bincode::serialize(&response_msg) {
+                            Ok(response_binary) => {
+                                info!(
+                                    response_size = response_binary.len(),
+                                    "Snapshot serialized to binary, sending response to requesting peer"
+                                );
+                                
+                                let message = Message::Binary(response_binary);
+                                if let Err(e) = ws_sender.send(message).await {
+                                    error!(
+                                        error = %e,
+                                        "Failed to send FullSyncResponse to requesting peer"
+                                    );
+                                } else {
+                                    info!("Successfully sent FullSyncResponse to requesting peer");
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    "Failed to serialize full sync response"
+                                );
+                            }
+                        }
                     }
-                })
-                .filter(|request| !matches!(request, qlib_rs::Request::Snapshot { .. }))
-                .collect();
-            
-            if !requests_to_apply.is_empty() {
-                // TODO: Use services to get store handle
-                // if let Err(e) = store.perform_mut(&mut requests_to_apply).await {
-                //     error!(error = %e, "Failed to apply sync requests from peer");
-                // } else {
-                //     debug!(count = requests_to_apply.len(), "Applied sync requests from peer");
-                // }
+                    _ => {
+                        // For other response types, use JSON serialization
+                        if let Ok(response_json) = serde_json::to_string(&response_msg) {
+                            if let Err(e) = ws_sender.send(Message::Text(response_json)).await {
+                                error!(error = %e, "Failed to send response to peer");
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -756,10 +888,23 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                if let Ok(PeerMessage::FullSyncResponse { snapshot }) = bincode::deserialize::<PeerMessage>(&data) {
-                    // Handle FullSyncResponse - this is a simplified version
-                    info!("Received FullSyncResponse via outbound connection");
-                    // Process the snapshot...
+                if let Ok(peer_msg) = bincode::deserialize::<PeerMessage>(&data) {
+                    match peer_msg {
+                        PeerMessage::FullSyncResponse { .. } => {
+                            // Handle FullSyncResponse - process it through the service
+                            info!("Received FullSyncResponse via outbound connection");
+                            if let Some(_) = handle_clone.process_peer_message(peer_msg, peer_addr_clone.clone()).await {
+                                // FullSyncResponse processing is handled internally
+                            }
+                        }
+                        _ => {
+                            // Other peer messages - ignore (handled via inbound connection)
+                            debug!("Ignoring received binary peer message from outbound peer (handled via inbound connection)");
+                        }
+                    }
+                } else {
+                    // Not a peer message - ignore
+                    debug!("Ignoring received binary data from outbound peer (not a peer message)");
                 }
             }
             Ok(Message::Close(_)) => break,
