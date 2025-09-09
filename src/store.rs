@@ -1,6 +1,6 @@
 use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
 use qlib_rs::auth::{AuthorizationScope, get_scope, authenticate_subject, AuthConfig};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, Duration};
 use anyhow::Result;
 use std::sync::Arc;
@@ -97,9 +97,6 @@ pub enum StoreRequest {
     },
     InnerTakeSnapshot {
         response: oneshot::Sender<Snapshot>,
-    },
-    InnerGetWriteChannelReceiver {
-        response: oneshot::Sender<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>>,
     },
     CheckRequestsAuthorization {
         client_id: EntityId,
@@ -328,17 +325,6 @@ impl StoreHandle {
         }
     }
 
-    pub async fn get_write_channel_receiver(&self) -> Option<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::InnerGetWriteChannelReceiver {
-            response: response_tx,
-        }).is_ok() {
-            response_rx.await.ok()
-        } else {
-            None
-        }
-    }
-
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = oneshot::channel();
@@ -529,10 +515,6 @@ impl StoreService {
             StoreRequest::InnerTakeSnapshot { response } => {
                 let snapshot = self.store.inner().take_snapshot();
                 let _ = response.send(snapshot);
-            }
-            StoreRequest::InnerGetWriteChannelReceiver { response } => {
-                let receiver = self.store.inner().get_write_channel_receiver();
-                let _ = response.send(receiver);
             }
             StoreRequest::CheckRequestsAuthorization { client_id, requests, response } => {
                 let result = self.check_requests_authorization(&client_id, requests).await;
