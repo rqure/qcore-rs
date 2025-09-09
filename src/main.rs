@@ -76,6 +76,54 @@ pub struct Services {
     pub wal_handle: WalHandle,
 }
 
+impl Services {
+    /// Perform graceful shutdown by taking a final snapshot and writing snapshot marker to WAL
+    pub async fn shutdown(&self, machine_id: String) -> Result<()> {
+        use qlib_rs::now;
+        
+        tracing::info!("Taking final snapshot before shutdown");
+        
+        // Take a snapshot from the store
+        let snapshot = match self.store_handle.take_snapshot().await {
+            Some(snapshot) => snapshot,
+            None => {
+                tracing::error!("Failed to take snapshot during shutdown");
+                return Err(anyhow::anyhow!("Failed to take snapshot during shutdown"));
+            }
+        };
+        
+        // Save the snapshot to disk
+        match self.snapshot_handle.save(snapshot).await {
+            Ok(snapshot_counter) => {
+                tracing::info!(
+                    snapshot_counter = snapshot_counter,
+                    "Final snapshot saved successfully"
+                );
+                
+                // Write a snapshot marker to the WAL to indicate the final snapshot point
+                // This helps during replay to know that the state was snapshotted at shutdown
+                let snapshot_request = qlib_rs::Request::Snapshot {
+                    snapshot_counter,
+                    timestamp: Some(now()),
+                    originator: Some(machine_id),
+                };
+                
+                if let Err(e) = self.wal_handle.write_request(snapshot_request).await {
+                    tracing::error!(error = %e, "Failed to write final snapshot marker to WAL");
+                } else {
+                    tracing::info!("Final snapshot marker written to WAL");
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to save final snapshot");
+                return Err(e);
+            }
+        }
+        
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
@@ -126,7 +174,13 @@ async fn main() -> Result<()> {
 
     // Keep the main task alive
     tokio::signal::ctrl_c().await?;
-    tracing::info!("Received shutdown signal, terminating...");
+    tracing::info!("Received shutdown signal, initiating graceful shutdown");
 
+    // Perform graceful shutdown with final snapshot
+    if let Err(e) = services.shutdown(config.machine.clone()).await {
+        tracing::error!(error = %e, "Error during graceful shutdown");
+    }
+
+    tracing::info!("QCore service shutdown complete");
     Ok(())
 }
