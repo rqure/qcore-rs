@@ -1,6 +1,7 @@
 use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
 use qlib_rs::auth::{AuthorizationScope, get_scope};
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::{interval, Duration};
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -387,97 +388,118 @@ impl StoreService {
             };
 
             let mut receiver = receiver;
-            while let Some(request) = receiver.recv().await {
-                match request {
-                    StoreRequest::GetEntitySchema { entity_type, response } => {
-                        let result = service.store.get_entity_schema(&entity_type).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
+            let mut notification_timer = interval(Duration::from_millis(100)); // Process notifications every 100ms
+
+            loop {
+                tokio::select! {
+                    request = receiver.recv() => {
+                        if let Some(request) = request {
+                            service.handle_request(request).await;
+                        } else {
+                            // Channel closed, exit the loop
+                            break;
+                        }
                     }
-                    StoreRequest::GetCompleteEntitySchema { entity_type, response } => {
-                        let result = service.store.get_complete_entity_schema(&entity_type).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::GetFieldSchema { entity_type, field_type, response } => {
-                        let result = service.store.get_field_schema(&entity_type, &field_type).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::SetFieldSchema { entity_type, field_type, schema, response } => {
-                        let result = service.store.set_field_schema(&entity_type, &field_type, schema).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::EntityExists { entity_id, response } => {
-                        let result = service.store.entity_exists(&entity_id).await;
-                        let _ = response.send(result);
-                    }
-                    StoreRequest::FieldExists { entity_type, field_type, response } => {
-                        let result = service.store.field_exists(&entity_type, &field_type).await;
-                        let _ = response.send(result);
-                    }
-                    StoreRequest::Perform { mut requests, response } => {
-                        let result = service.store.perform(&mut requests).await.map(|_| requests);
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::PerformMut { mut requests, response } => {
-                        let result = service.store.perform_mut(&mut requests).await.map(|_| requests);
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::PerformMap { mut requests, response } => {
-                        let result = service.store.perform_map(&mut requests).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::FindEntitiesPaginated { entity_type, page_opts, filter, response } => {
-                        let result = service.store.find_entities_paginated(&entity_type, page_opts, filter).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::FindEntitiesExact { entity_type, page_opts, filter, response } => {
-                        let result = service.store.find_entities_exact(&entity_type, page_opts, filter).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::GetEntityTypesPaginated { page_opts, response } => {
-                        let result = service.store.get_entity_types_paginated(page_opts).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::RegisterNotification { config, sender, response } => {
-                        let result = service.store.register_notification(config, sender).await;
-                        let _ = response.send(result.map_err(anyhow::Error::from));
-                    }
-                    StoreRequest::UnregisterNotification { config, sender, response } => {
-                        let result = service.store.unregister_notification(&config, &sender).await;
-                        let _ = response.send(result);
-                    }
-                    StoreRequest::InnerDisableNotifications { response } => {
-                        service.store.inner_mut().disable_notifications();
-                        let _ = response.send(());
-                    }
-                    StoreRequest::InnerEnableNotifications { response } => {
-                        service.store.inner_mut().enable_notifications();
-                        let _ = response.send(());
-                    }
-                    StoreRequest::InnerRestoreSnapshot { snapshot, response } => {
-                        service.store.inner_mut().restore_snapshot(snapshot);
-                        let _ = response.send(());
-                    }
-                    StoreRequest::InnerTakeSnapshot { response } => {
-                        let snapshot = service.store.inner().take_snapshot();
-                        let _ = response.send(snapshot);
-                    }
-                    StoreRequest::InnerGetWriteChannelReceiver { response } => {
-                        let receiver = service.store.inner().get_write_channel_receiver();
-                        let _ = response.send(receiver);
-                    }
-                    StoreRequest::CheckRequestsAuthorization { client_id, requests, response } => {
-                        let result = service.check_requests_authorization(&client_id, requests).await;
-                        let _ = response.send(result);
-                    }
-                    StoreRequest::SetServices { services: _, response } => {
-                        // Store service currently doesn't need other services
-                        let _ = response.send(());
+                    _ = notification_timer.tick() => {
+                        // Process cache notifications periodically
+                        if let Some(ref mut cache) = service.permission_cache {
+                            cache.process_notifications();
+                        }
                     }
                 }
             }
         });
 
         StoreHandle { sender }
+    }
+
+    async fn handle_request(&mut self, request: StoreRequest) {
+        match request {
+            StoreRequest::GetEntitySchema { entity_type, response } => {
+                let result = self.store.get_entity_schema(&entity_type).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::GetCompleteEntitySchema { entity_type, response } => {
+                let result = self.store.get_complete_entity_schema(&entity_type).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::GetFieldSchema { entity_type, field_type, response } => {
+                let result = self.store.get_field_schema(&entity_type, &field_type).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::SetFieldSchema { entity_type, field_type, schema, response } => {
+                let result = self.store.set_field_schema(&entity_type, &field_type, schema).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::EntityExists { entity_id, response } => {
+                let result = self.store.entity_exists(&entity_id).await;
+                let _ = response.send(result);
+            }
+            StoreRequest::FieldExists { entity_type, field_type, response } => {
+                let result = self.store.field_exists(&entity_type, &field_type).await;
+                let _ = response.send(result);
+            }
+            StoreRequest::Perform { mut requests, response } => {
+                let result = self.store.perform(&mut requests).await.map(|_| requests);
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::PerformMut { mut requests, response } => {
+                let result = self.store.perform_mut(&mut requests).await.map(|_| requests);
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::PerformMap { mut requests, response } => {
+                let result = self.store.perform_map(&mut requests).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::FindEntitiesPaginated { entity_type, page_opts, filter, response } => {
+                let result = self.store.find_entities_paginated(&entity_type, page_opts, filter).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::FindEntitiesExact { entity_type, page_opts, filter, response } => {
+                let result = self.store.find_entities_exact(&entity_type, page_opts, filter).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::GetEntityTypesPaginated { page_opts, response } => {
+                let result = self.store.get_entity_types_paginated(page_opts).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::RegisterNotification { config, sender, response } => {
+                let result = self.store.register_notification(config, sender).await;
+                let _ = response.send(result.map_err(anyhow::Error::from));
+            }
+            StoreRequest::UnregisterNotification { config, sender, response } => {
+                let result = self.store.unregister_notification(&config, &sender).await;
+                let _ = response.send(result);
+            }
+            StoreRequest::InnerDisableNotifications { response } => {
+                self.store.inner_mut().disable_notifications();
+                let _ = response.send(());
+            }
+            StoreRequest::InnerEnableNotifications { response } => {
+                self.store.inner_mut().enable_notifications();
+                let _ = response.send(());
+            }
+            StoreRequest::InnerRestoreSnapshot { snapshot, response } => {
+                self.store.inner_mut().restore_snapshot(snapshot);
+                let _ = response.send(());
+            }
+            StoreRequest::InnerTakeSnapshot { response } => {
+                let snapshot = self.store.inner().take_snapshot();
+                let _ = response.send(snapshot);
+            }
+            StoreRequest::InnerGetWriteChannelReceiver { response } => {
+                let receiver = self.store.inner().get_write_channel_receiver();
+                let _ = response.send(receiver);
+            }
+            StoreRequest::CheckRequestsAuthorization { client_id, requests, response } => {
+                let result = self.check_requests_authorization(&client_id, requests).await;
+                let _ = response.send(result);
+            }
+            StoreRequest::SetServices { services: _, response } => {
+                // Store service currently doesn't need other services
+                let _ = response.send(());
+            }
+        }
     }
 }
 
