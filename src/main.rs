@@ -144,11 +144,11 @@ async fn main() -> Result<()> {
         machine_id: config.machine.clone(),
     });
     let snapshot_handle = SnapshotService::spawn(SnapshotConfig {
-        snapshots_dir: PathBuf::from(&config.data_dir).join("snapshots"),
+        snapshots_dir: PathBuf::from(&config.data_dir).join(&config.machine).join("snapshots"),
         max_files: config.snapshot_max_files,
     });
     let wal_handle = WalService::spawn(WalConfig {
-        wal_dir: PathBuf::from(&config.data_dir).join("wal"),
+        wal_dir: PathBuf::from(&config.data_dir).join(&config.machine).join("wal"),
         max_file_size: config.wal_max_file_size * 1024 * 1024,
         max_files: config.wal_max_files,
         snapshot_wal_interval: config.snapshot_wal_interval,

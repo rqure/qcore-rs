@@ -636,7 +636,7 @@ impl PeerService {
                 if let Some(services) = &self.services {
                     // Apply the snapshot to the store
                     services.store_handle.disable_notifications().await;
-                    services.store_handle.inner_restore_snapshot(snapshot.clone()).await;
+                    services.store_handle.restore_snapshot(snapshot.clone()).await;
                     services.store_handle.enable_notifications().await;
                     
                     // Save the snapshot to disk for persistence

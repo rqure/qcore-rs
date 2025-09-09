@@ -307,7 +307,7 @@ impl StoreHandle {
         }
     }
 
-    pub async fn inner_restore_snapshot(&self, snapshot: Snapshot) {
+    pub async fn restore_snapshot(&self, snapshot: Snapshot) {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(StoreRequest::InnerRestoreSnapshot {
             snapshot,
@@ -328,7 +328,7 @@ impl StoreHandle {
         }
     }
 
-    pub async fn inner_get_write_channel_receiver(&self) -> Option<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>> {
+    pub async fn get_write_channel_receiver(&self) -> Option<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>> {
         let (response_tx, response_rx) = oneshot::channel();
         if self.sender.send(StoreRequest::InnerGetWriteChannelReceiver {
             response: response_tx,
