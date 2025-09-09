@@ -437,6 +437,8 @@ impl StoreService {
                     }
                 }
             }
+
+            panic!("Store service has stopped unexpectedly");
         });
 
         StoreHandle { sender }

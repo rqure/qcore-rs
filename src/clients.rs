@@ -189,6 +189,8 @@ impl ClientService {
             while let Some(request) = receiver.recv().await {
                 service.handle_request(request).await;
             }
+
+            panic!("Client service has stopped unexpectedly");
         });
 
         // Start the client WebSocket server
@@ -296,7 +298,13 @@ impl ClientService {
                 // Perform authentication via the store service
                 match services.store_handle.authenticate_subject(&subject_name, &credential).await {
                     Ok(subject_id) => {
-                        // Store authentication state
+                        info!(
+                            subject_name = %subject_name,
+                            subject_id = %subject_id,
+                            client_addr = ?client_addr,
+                            "Client authenticated successfully"
+                        );
+                        
                         if let Some(ref addr) = client_addr {
                             self.authenticated_clients.insert(addr.clone(), subject_id.clone());
                         }

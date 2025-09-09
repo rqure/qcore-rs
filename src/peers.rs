@@ -304,6 +304,8 @@ impl PeerService {
                     }
                 }
             }
+
+            panic!("Peer service has stopped unexpectedly")
         });
 
         handle

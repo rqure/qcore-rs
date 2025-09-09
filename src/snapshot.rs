@@ -104,6 +104,8 @@ impl SnapshotService {
                     }
                 }
             }
+
+            panic!("Snapshot service has stopped unexpectedly");
         });
 
         SnapshotHandle { sender }

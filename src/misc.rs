@@ -98,6 +98,8 @@ impl MiscService {
                     }
                 }
             }
+
+            panic!("Misc service has stopped unexpectedly");
         });
 
         MiscHandle { sender }

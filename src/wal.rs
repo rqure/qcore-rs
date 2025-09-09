@@ -98,6 +98,8 @@ impl WalService {
                     }
                 }
             }
+
+            panic!("WAL manager service has stopped unexpectedly");
         });
 
         WalHandle { sender }
