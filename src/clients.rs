@@ -18,12 +18,15 @@ use crate::Services;
 pub struct ClientConfig {
     /// Port for client communication (StoreProxy clients)
     pub client_port: u16,
+    /// Machine ID for request origination
+    pub machine_id: String,
 }
 
 impl From<&crate::Config> for ClientConfig {
     fn from(config: &crate::Config) -> Self {
         Self {
             client_port: config.client_port,
+            machine_id: config.machine.clone(),
         }
     }
 }
@@ -160,6 +163,7 @@ impl ClientHandle {
 }
 
 pub struct ClientService {
+    config: ClientConfig,
     connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
     client_notification_senders: HashMap<String, NotificationSender>,
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
@@ -174,6 +178,7 @@ impl ClientService {
         let config_clone = config.clone();
         tokio::spawn(async move {
             let mut service = ClientService {
+                config,
                 connected_clients: HashMap::new(),
                 client_notification_senders: HashMap::new(),
                 client_notification_configs: HashMap::new(),
@@ -270,7 +275,7 @@ impl ClientService {
     async fn process_store_message(&mut self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
         // Get the services first
         let services = match &self.services {
-            Some(services) => services.clone(),
+            Some(services) => services,
             None => {
                 return StoreMessage::Error {
                     id: "unknown".to_string(),
@@ -417,7 +422,7 @@ impl ClientService {
                                 } else {
                                     // Set originator and writer_id for the requests
                                     requests.iter_mut().for_each(|req| {
-                                        req.try_set_originator(services.machine_id.clone());
+                                        req.try_set_originator(self.config.machine_id.clone());
                                         req.try_set_writer_id(client_id.clone());
                                     });
 
