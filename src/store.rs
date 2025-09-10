@@ -576,17 +576,7 @@ impl StoreService {
             }
         });
 
-        // Write all requests to the WAL file - these requests have already been applied to the store
-        for request in &requests {
-            if let Err(e) = services.wal_handle.write_request(request.clone()).await {
-                tracing::error!(
-                    error = %e,
-                    "Failed to write request to WAL"
-                );
-            }
-        }
-
-        // Send batch of requests to peers for synchronization if we have any
+        // Prepare requests for synchronization first
         let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
             .filter(|request| {
                 if let Some(originator) = request.originator() {
@@ -598,14 +588,31 @@ impl StoreService {
             .cloned()
             .collect();
 
-        if !requests_to_sync.is_empty() {
-            tracing::debug!(
-                count = requests_to_sync.len(),
-                "Sending sync requests to peers"
-            );
-            
-            services.peer_handle.send_sync_message(requests_to_sync).await;
-        }
+        // Run WAL writing and peer synchronization in parallel
+        let wal_task = async {
+            for request in &requests {
+                if let Err(e) = services.wal_handle.write_request(request.clone()).await {
+                    tracing::error!(
+                        error = %e,
+                        "Failed to write request to WAL"
+                    );
+                }
+            }
+        };
+
+        let sync_task = async {
+            if !requests_to_sync.is_empty() {
+                tracing::debug!(
+                    count = requests_to_sync.len(),
+                    "Sending sync requests to peers"
+                );
+                
+                services.peer_handle.send_sync_message(requests_to_sync).await;
+            }
+        };
+
+        // Execute both tasks concurrently
+        tokio::join!(wal_task, sync_task);
     }
 
     async fn check_requests_authorization(
