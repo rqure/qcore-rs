@@ -238,7 +238,7 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
         
         // Check if we need to create a new WAL file
         let should_create_new_file = self.current_wal_file.is_none() || 
-           (!self.current_wal_size + serialized_len > self.wal_config.max_file_size);
+           (self.current_wal_size + serialized_len > self.wal_config.max_file_size);
 
         if should_create_new_file {
             self.rotate_file(store_handle).await?;
