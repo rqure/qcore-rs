@@ -199,6 +199,32 @@
           "default": null
         }
       ]
+    },
+    {
+      "entityType": "PerfTestEntity",
+      "inheritsFrom": ["Object"],
+      "fields": [
+        {
+          "name": "TestValue",
+          "dataType": "Int",
+          "default": 0
+        },
+        {
+          "name": "TestString",
+          "dataType": "String",
+          "default": ""
+        },
+        {
+          "name": "TestFlag",
+          "dataType": "Bool",
+          "default": false
+        },
+        {
+          "name": "TestTimestamp",
+          "dataType": "Timestamp",
+          "default": 0
+        }
+      ]
     }
   ],
   "tree": {
@@ -270,6 +296,25 @@
             "Name": "qei",
             "Secret": "__hashpw__(qei)",
             "Active": true
+          },
+          {
+            "entityType": "User", 
+            "Name": "perftest",
+            "Secret": "__hashpw__(perftest)",
+            "Active": true
+          }
+        ]
+      },
+      {
+        "entityType": "Folder",
+        "Name": "Performance Testing",
+        "Children": [
+          {
+            "entityType": "PerfTestEntity",
+            "Name": "TestEntity",
+            "TestValue": 0,
+            "TestString": "Initial Test Value",
+            "TestFlag": false
           }
         ]
       }
