@@ -197,6 +197,18 @@
           "name": "CurrentLeader",
           "dataType": "EntityReference",
           "default": null
+        },
+        {
+          "name": "FailOver",
+          "dataType": "Choice",
+          "default": "Trigger",
+          "choices": ["Trigger"]
+        },
+        {
+          "name": "FailOverGracePeriod",
+          "dataType": "Int",
+          "default": 1000,
+          "storageScope": "Configuration"
         }
       ]
     },
