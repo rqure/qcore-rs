@@ -15,9 +15,9 @@ use fastrand;
 #[derive(Parser, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Config {
-    /// QCore WebSocket URL
-    #[arg(long, default_value = "ws://localhost:9100")]
-    core_url: String,
+    /// QCore WebSocket URLs (comma-separated for multiple targets)
+    #[arg(long, default_value = "ws://localhost:9100,ws://localhost:9101", value_delimiter = ',')]
+    core_urls: Vec<String>,
 
     /// Username for authentication
     #[arg(long, default_value = "qei")]
@@ -102,9 +102,9 @@ impl TestResult {
 async fn load_existing_entities_from_topology(config: &Config) -> Result<Vec<EntityId>> {
     let mut entities = Vec::new();
     
-    // Connect to load topology data
+    // Connect to load topology data using the first URL
     let store = StoreProxy::connect_and_authenticate(
-        &config.core_url,
+        &config.core_urls[0],
         &config.username,
         &config.password,
     ).await.context("Failed to connect for topology loading")?;
@@ -122,7 +122,7 @@ async fn load_existing_entities_from_topology(config: &Config) -> Result<Vec<Ent
 
 async fn find_test_entity(config: &Config) -> Result<EntityId> {
     let store = StoreProxy::connect_and_authenticate(
-        &config.core_url,
+        &config.core_urls[0],
         &config.username,
         &config.password,
     ).await.context("Failed to connect for finding test entity")?;
@@ -143,15 +143,16 @@ async fn find_test_entity(config: &Config) -> Result<EntityId> {
 async fn run_test_client(
     config: Arc<Config>,
     client_id: usize,
+    core_url: String,
     test_entities: Arc<Vec<EntityId>>,
     test_entity_id: EntityId,
     stats: Arc<Mutex<TestResult>>,
 ) -> Result<()> {
     let mut store = StoreProxy::connect_and_authenticate(
-        &config.core_url,
+        &core_url,
         &config.username,
         &config.password,
-    ).await.with_context(|| format!("Client {} failed to connect", client_id))?;
+    ).await.with_context(|| format!("Client {} failed to connect to {}", client_id, core_url))?;
 
     debug!("Client {} connected successfully", client_id);
 
@@ -305,6 +306,11 @@ async fn setup_test_data(config: &Config) -> Result<Vec<EntityId>> {
 async fn main() -> Result<()> {
     let config = Arc::new(Config::parse());
 
+    // Validate that we have at least one URL
+    if config.core_urls.is_empty() {
+        return Err(anyhow::anyhow!("At least one core URL must be specified"));
+    }
+
     // Initialize tracing
     let log_level = if config.verbose {
         "perf_tool=debug,qlib_rs=info"
@@ -320,6 +326,8 @@ async fn main() -> Result<()> {
     info!("Starting QCore Performance Test");
     info!("Configuration: {} clients for {}s, test type: {:?}", 
           config.clients, config.duration, config.test_type);
+    info!("Target URLs: {:?}", config.core_urls);
+    info!("Clients will be distributed evenly across {} URL(s)", config.core_urls.len());
 
     // Find the test entity that we'll use for write operations
     let test_entity_id = find_test_entity(&config).await
@@ -349,11 +357,13 @@ async fn main() -> Result<()> {
             let test_entities_clone = test_entities.clone();
             let test_entity_id_clone = test_entity_id.clone();
             let warmup_stats_clone = warmup_stats.clone();
+            let core_url = config.core_urls[i % config.core_urls.len()].clone();
             
             let handle = tokio::spawn(async move {
                 if let Err(e) = run_test_client(
                     warmup_config_clone,
                     i,
+                    core_url,
                     test_entities_clone,
                     test_entity_id_clone,
                     warmup_stats_clone,
@@ -382,11 +392,13 @@ async fn main() -> Result<()> {
         let test_entities_clone = test_entities.clone();
         let test_entity_id_clone = test_entity_id.clone();
         let stats_clone = stats.clone();
+        let core_url = config.core_urls[i % config.core_urls.len()].clone();
         
         let handle = tokio::spawn(async move {
             if let Err(e) = run_test_client(
                 config_clone,
                 i,
+                core_url,
                 test_entities_clone,
                 test_entity_id_clone,
                 stats_clone,
