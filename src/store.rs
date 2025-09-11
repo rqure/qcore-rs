@@ -505,6 +505,24 @@ impl StoreService {
             }
             StoreRequest::InnerRestoreSnapshot { snapshot, response } => {
                 self.store.inner_mut().restore_snapshot(snapshot);
+
+                let me_as_candidate = {
+                   let machine = &self.config.machine_id;
+                
+                    match self.store.find_entities_paginated(
+                        &et::candidate(), 
+                        None,
+                        Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))
+                    ).await {
+                        Ok(page) => page.items.iter().find(|id| id.get_type() == &et::candidate()).cloned(),
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to find candidate entity for machine {}", machine);
+                            None
+                        }
+                    }
+                };
+                self.store.inner_mut().default_writer_id = me_as_candidate;
+
                 let _ = response.send(());
             }
             StoreRequest::InnerTakeSnapshot { response } => {
