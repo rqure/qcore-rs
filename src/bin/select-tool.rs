@@ -161,9 +161,12 @@ struct EntityDisplay {
 /// Performance metrics for query execution
 #[derive(Debug, Clone)]
 struct QueryMetrics {
+    initialization_time: Duration,
     connection_time: Duration,
     query_time: Duration,
     field_fetch_time: Duration,
+    display_time: Duration,
+    export_time: Duration,
     total_time: Duration,
     entities_found: usize,
     pages_fetched: usize,
@@ -174,9 +177,12 @@ struct QueryMetrics {
 impl QueryMetrics {
     fn new() -> Self {
         Self {
+            initialization_time: Duration::from_secs(0),
             connection_time: Duration::from_secs(0),
             query_time: Duration::from_secs(0),
             field_fetch_time: Duration::from_secs(0),
+            display_time: Duration::from_secs(0),
+            export_time: Duration::from_secs(0),
             total_time: Duration::from_secs(0),
             entities_found: 0,
             pages_fetched: 0,
@@ -201,10 +207,23 @@ impl QueryMetrics {
 
     fn print_metrics(&self) {
         println!("\n=== Performance Metrics ===");
+        println!("Initialization:  {}", Self::format_duration(&self.initialization_time));
         println!("Connection time: {}", Self::format_duration(&self.connection_time));
         println!("Query execution: {}", Self::format_duration(&self.query_time));
         println!("Field fetching:  {}", Self::format_duration(&self.field_fetch_time));
+        println!("Display time:    {}", Self::format_duration(&self.display_time));
+        if self.export_time.as_nanos() > 0 {
+            println!("Export time:     {}", Self::format_duration(&self.export_time));
+        }
         println!("Total time:      {}", Self::format_duration(&self.total_time));
+        
+        // Calculate unaccounted time
+        let accounted_time = self.initialization_time + self.connection_time + self.query_time + self.field_fetch_time + self.display_time + self.export_time;
+        let unaccounted_time = self.total_time.saturating_sub(accounted_time);
+        if unaccounted_time.as_nanos() > 0 {
+            println!("Unaccounted:     {}", Self::format_duration(&unaccounted_time));
+        }
+        
         println!();
         println!("Entities found:  {}", self.entities_found);
         println!("Pages fetched:   {}", self.pages_fetched);
@@ -284,6 +303,9 @@ async fn main() -> Result<()> {
     let username = std::env::var("QCORE_USERNAME").unwrap_or(config.username.clone());
     let password = std::env::var("QCORE_PASSWORD").unwrap_or(config.password.clone());
 
+    // Mark end of initialization
+    metrics.initialization_time = total_start.elapsed();
+
     info!(core_url = %config.core_url, "Connecting to QCore service");
     
     // Connect to the Core service with authentication
@@ -318,18 +340,23 @@ async fn main() -> Result<()> {
     metrics.fields_fetched = fields_fetched;
     metrics.failed_fields = failed_fields;
 
-    metrics.total_time = total_start.elapsed();
-
     // Display results
+    let display_start = Instant::now();
     display_results(&entities_with_data, &config).await
         .context("Failed to display results")?;
+    metrics.display_time = display_start.elapsed();
 
     // Export if requested
     if let Some(export_path) = &config.export {
+        let export_start = Instant::now();
         export_results(&entities_with_data, export_path).await
             .context("Failed to export results")?;
+        metrics.export_time = export_start.elapsed();
         info!("Results exported to {}", export_path.display());
     }
+
+    // Update total time to include display and export
+    metrics.total_time = total_start.elapsed();
 
     // Show metrics if requested
     if config.metrics {
