@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::mpsc::Sender;
 use tokio::{fs::{create_dir_all, remove_file, File, OpenOptions}, io::{AsyncReadExt, AsyncWriteExt}};
-use crossfire::{mpsc, MAsyncTx};
 use tracing::{info, instrument, warn, error};
 
 use crate::{files::{FileConfig, FileManager, FileManagerTrait}, Services};
@@ -25,7 +25,7 @@ pub trait SnapshotTrait {
 /// Handle for communicating with snapshot manager task
 #[derive(Debug, Clone)]
 pub struct SnapshotHandle {
-    sender: MAsyncTx<SnapshotRequest>,
+    sender: Sender<SnapshotRequest>,
 }
 
 /// Configuration for snapshot manager operations
@@ -42,32 +42,32 @@ pub struct SnapshotConfig {
 pub enum SnapshotRequest {
     Save {
         snapshot: qlib_rs::Snapshot,
-        response: MAsyncTx<Result<u64>>,
+        response: tokio::sync::oneshot::Sender<Result<u64>>,
     },
     SetServices {
         services: Services,
-        response: MAsyncTx<()>,
+        response: tokio::sync::oneshot::Sender<()>,
     },
 }
 
 impl SnapshotHandle {
     pub async fn save(&self, snapshot: qlib_rs::Snapshot) -> Result<u64> {
-        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.sender.send(SnapshotRequest::Save {
             snapshot,
             response: response_tx,
         }).await.map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
-        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
+        response_rx.await.map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
     }
 
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(SnapshotRequest::SetServices {
             services,
             response: response_tx,
         }).await {
-            if let Err(e) = response_rx.recv().await {
+            if let Err(e) = response_rx.await {
                 error!(error = %e, "Snapshot service SetServices response channel closed");
             }
         }
@@ -78,7 +78,7 @@ pub type SnapshotService = SnapshotManagerTrait<FileManager>;
 
 impl SnapshotService {
     pub fn spawn(config: SnapshotConfig) -> SnapshotHandle {
-        let (sender, receiver) = mpsc::bounded_async(1024);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
 
         tokio::spawn(async move {
             let mut service = SnapshotService::new(FileManager, config);
@@ -90,12 +90,12 @@ impl SnapshotService {
                 },
             }
 
-            while let Ok(request) = receiver.recv().await {
+            while let Some(request) = receiver.recv().await {
                 match request {
                     SnapshotRequest::Save { snapshot, response } => {
                         let result = service.save(&snapshot).await;
-                        if let Err(e) = response.send(result).await {
-                            error!(error = %e, "Failed to send snapshot save response");
+                        if let Err(_) = response.send(result) {
+                            error!("Failed to send snapshot save response");
                         }
                     }
                     SnapshotRequest::SetServices { services: _services, response } => {
@@ -105,8 +105,8 @@ impl SnapshotService {
                             }
                             _ => {}
                         }
-                        if let Err(e) = response.send(()).await {
-                            error!(error = %e, "Failed to send SetServices response");
+                        if let Err(_) = response.send(()) {
+                            error!("Failed to send SetServices response");
                         }
                     }
                 }

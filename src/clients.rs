@@ -1,7 +1,7 @@
+use tokio::sync::mpsc::Sender;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
-use crossfire::{mpsc, MAsyncTx};
 use tracing::{info, warn, error, debug, instrument};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -36,7 +36,7 @@ impl From<&crate::Config> for ClientConfig {
 pub enum ClientRequest {
     ClientConnected {
         client_addr: String,
-        sender: MAsyncTx<Message>,
+        sender: Sender<Message>,
         notification_sender: NotificationSender,
     },
     ClientDisconnected {
@@ -49,35 +49,35 @@ pub enum ClientRequest {
     ProcessStoreMessage {
         message: StoreMessage,
         client_addr: Option<String>,
-        response: MAsyncTx<StoreMessage>,
+        response: tokio::sync::oneshot::Sender<StoreMessage>,
     },
     RegisterNotification {
         client_addr: String,
         config: NotifyConfig,
-        response: MAsyncTx<Result<()>>,
+        response: tokio::sync::oneshot::Sender<Result<()>>,
     },
     UnregisterNotification {
         client_addr: String,
         config: NotifyConfig,
-        response: MAsyncTx<bool>,
+        response: tokio::sync::oneshot::Sender<bool>,
     },
     ForceDisconnectAll {
-        response: MAsyncTx<()>,
+        response: tokio::sync::oneshot::Sender<()>,
     },
     SetServices {
         services: Services,
-        response: MAsyncTx<()>,
+        response: tokio::sync::oneshot::Sender<()>,
     },
 }
 
 /// Handle for communicating with client service
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
-    sender: MAsyncTx<ClientRequest>,
+    sender: Sender<ClientRequest>,
 }
 
 impl ClientHandle {
-    pub async fn client_connected(&self, client_addr: String, sender: MAsyncTx<Message>, notification_sender: NotificationSender) {
+    pub async fn client_connected(&self, client_addr: String, sender: Sender<Message>, notification_sender: NotificationSender) {
         if let Err(e) = self.sender.send(ClientRequest::ClientConnected {
             client_addr,
             sender,
@@ -103,13 +103,13 @@ impl ClientHandle {
     }
 
     pub async fn process_store_message(&self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
-        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::ProcessStoreMessage {
             message,
             client_addr,
             response: response_tx,
         }).await {
-            response_rx.recv().await.unwrap_or_else(|_| StoreMessage::Error {
+            response_rx.await.unwrap_or_else(|_| StoreMessage::Error {
                 id: "error".to_string(),
                 error: "Failed to receive response".to_string(),
             })
@@ -122,37 +122,37 @@ impl ClientHandle {
     }
 
     pub async fn register_notification(&self, client_addr: String, config: NotifyConfig) -> Result<()> {
-        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::RegisterNotification {
             client_addr,
             config,
             response: response_tx,
         }).await {
-            response_rx.recv().await.unwrap_or_else(|_| Err(anyhow::anyhow!("Client service unavailable")))
+            response_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("Client service unavailable")))
         } else {
             Err(anyhow::anyhow!("Client service unavailable"))
         }
     }
 
     pub async fn unregister_notification(&self, client_addr: String, config: NotifyConfig) -> bool {
-        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::UnregisterNotification {
             client_addr,
             config,
             response: response_tx,
         }).await {
-            response_rx.recv().await.unwrap_or(false)
+            response_rx.await.unwrap_or(false)
         } else {
             false
         }
     }
 
     pub async fn force_disconnect_all(&self) {
-        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::ForceDisconnectAll {
             response: response_tx,
         }).await {
-            if let Err(e) = response_rx.recv().await {
+            if let Err(e) = response_rx.await {
                 tracing::error!(error = %e, "Failed to receive ForceDisconnectAll response");
             }
         }
@@ -160,12 +160,12 @@ impl ClientHandle {
 
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::SetServices {
             services,
             response: response_tx,
         }).await {
-            if let Err(e) = response_rx.recv().await {
+            if let Err(e) = response_rx.await {
                 tracing::error!(error = %e, "Failed to receive SetServices response");
             }
         }
@@ -174,7 +174,7 @@ impl ClientHandle {
 
 pub struct ClientService {
     config: ClientConfig,
-    connected_clients: HashMap<String, MAsyncTx<Message>>,
+    connected_clients: HashMap<String, Sender<Message>>,
     client_notification_senders: HashMap<String, NotificationSender>,
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
     authenticated_clients: HashMap<String, EntityId>,
@@ -183,7 +183,7 @@ pub struct ClientService {
 
 impl ClientService {
     pub fn spawn(config: ClientConfig) -> ClientHandle {
-        let (sender, receiver) = mpsc::bounded_async(131072);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(131072);
         
         let config_clone = config.clone();
         tokio::spawn(async move {
@@ -196,7 +196,7 @@ impl ClientService {
                 services: None,
             };
 
-            while let Ok(request) = receiver.recv().await {
+            while let Some(request) = receiver.recv().await {
                 service.handle_request(request).await;
             }
 
@@ -224,32 +224,32 @@ impl ClientService {
             }
             ClientRequest::ProcessStoreMessage { message, client_addr, response } => {
                 let result = self.process_store_message(message, client_addr).await;
-                if let Err(e) = response.send(result).await {
-                    tracing::error!(error = %e, "Failed to send ProcessStoreMessage response");
+                if let Err(_) = response.send(result) {
+                    tracing::error!("Failed to send ProcessStoreMessage response");
                 }
             }
             ClientRequest::RegisterNotification { client_addr, config, response } => {
                 let result = self.register_notification_internal(client_addr, config).await;
-                if let Err(e) = response.send(result).await {
-                    tracing::error!(error = %e, "Failed to send RegisterNotification response");
+                if let Err(_) = response.send(result) {
+                    tracing::error!("Failed to send RegisterNotification response");
                 }
             }
             ClientRequest::UnregisterNotification { client_addr, config, response } => {
                 let result = self.unregister_notification_internal(client_addr, config).await;
-                if let Err(e) = response.send(result).await {
-                    tracing::error!(error = %e, "Failed to send UnregisterNotification response");
+                if let Err(_) = response.send(result) {
+                    tracing::error!("Failed to send UnregisterNotification response");
                 }
             }
             ClientRequest::ForceDisconnectAll { response } => {
                 self.force_disconnect_all_clients().await;
-                if let Err(e) = response.send(()).await {
-                    tracing::error!(error = %e, "Failed to send ForceDisconnectAll response");
+                if let Err(_) = response.send(()) {
+                    tracing::error!("Failed to send ForceDisconnectAll response");
                 }
             }
             ClientRequest::SetServices { services, response } => {
                 self.services = Some(services);
-                if let Err(e) = response.send(()).await {
-                    tracing::error!(error = %e, "Failed to send SetServices response");
+                if let Err(_) = response.send(()) {
+                    tracing::error!("Failed to send SetServices response");
                 }
             }
         }
@@ -802,10 +802,10 @@ async fn handle_client_connection(
     info!("Client authenticated successfully");
     
     // Create a channel for sending messages to this client
-    let (tx, rx) = mpsc::bounded_async::<Message>(16384);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(16384);
     
     // Create a notification channel for this client
-    let (notification_sender, notification_receiver) = notification_channel();
+    let (notification_sender, mut notification_receiver) = notification_channel();
     
     // Register client with the service
     handle.client_connected(client_addr.to_string(), tx.clone(), notification_sender).await;
@@ -816,7 +816,7 @@ async fn handle_client_connection(
     let notification_task = tokio::spawn(async move {
         loop {
             match notification_receiver.recv().await {
-                Ok(notification) => {
+                Some(notification) => {
                     let notification_msg = StoreMessage::Notification { notification };
                     if let Ok(notification_text) = serde_json::to_string(&notification_msg) {
                         if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)).await {
@@ -834,10 +834,9 @@ async fn handle_client_connection(
                         );
                     }
                 },
-                Err(e) => {
+                None => {
                     error!(
                         client_addr = %client_addr_clone_notif,
-                        error = %e,
                         "Notification channel closed for client"
                     );
                     break;
@@ -856,9 +855,8 @@ async fn handle_client_connection(
     let handle_clone = handle.clone();
     let outgoing_task = tokio::spawn(async move {
         let mut ws_sender = ws_sender;
-        let rx = rx;
         
-        while let Ok(message) = rx.recv().await {
+        while let Some(message) = rx.recv().await {
             if let Err(e) = ws_sender.send(message).await {
                 error!(
                     client_addr = %client_addr_clone,

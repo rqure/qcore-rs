@@ -1,5 +1,5 @@
+use tokio::sync::mpsc::Sender;
 use qlib_rs::{et, ft, now, schoice, sread, sref, swrite, PushCondition, Value};
-use crossfire::{mpsc, MAsyncTx};
 use tokio::time::Duration;
 use tracing::error;
 use anyhow::Result;
@@ -28,25 +28,25 @@ impl From<&crate::Config> for MiscConfig {
 pub enum MiscRequest {
     SetServices {
         services: Services,
-        response: MAsyncTx<()>,
+        response: tokio::sync::oneshot::Sender<()>,
     },
 }
 
 /// Handle for communicating with misc service
 #[derive(Debug, Clone)]
 pub struct MiscHandle {
-    sender: MAsyncTx<MiscRequest>,
+    sender: Sender<MiscRequest>,
 }
 
 impl MiscHandle {
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(MiscRequest::SetServices {
             services,
             response: response_tx,
         }).await {
-            if let Err(e) = response_rx.recv().await {
+            if let Err(e) = response_rx.await {
                 error!(error = %e, "Failed to receive SetServices response");
             }
         }
@@ -60,7 +60,7 @@ pub struct MiscService {
 
 impl MiscService {
     pub fn spawn(config: MiscConfig) -> MiscHandle {
-        let (sender, receiver) = mpsc::bounded_async(1024);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
         
         tokio::spawn(async move {
             let mut service = Self {
@@ -76,8 +76,8 @@ impl MiscService {
                     // Handle service requests
                     request = receiver.recv() => {
                         match request {
-                            Ok(req) => service.handle_request(req).await,
-                            Err(_) => break, // Channel closed
+                            Some(req) => service.handle_request(req).await,
+                            None => break, // Channel closed
                         }
                     }
                     
@@ -111,8 +111,8 @@ impl MiscService {
         match request {
             MiscRequest::SetServices { services, response } => {
                 self.services = Some(services);
-                if let Err(e) = response.send(()).await {
-                    error!(error = %e, "Failed to send SetServices response");
+                if let Err(_) = response.send(()) {
+                    error!("Failed to send SetServices response");
                 }
             }
         }
