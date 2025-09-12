@@ -183,17 +183,22 @@ impl StoreHandle {
         response_rx.await.unwrap_or(false)
     }
 
-    pub async fn perform(&self, requests: &mut Vec<Request>) -> Result<()> {
+    pub async fn perform(&self, requests: &mut [Request]) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender.send(StoreRequest::Perform {
-            requests: requests.clone(),
+            requests: requests.to_vec(),
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
         match response_rx.await {
             Ok(result) => {
                 match result {
                     Ok(response) => {
-                        *requests = response;
+                        if response.len() != requests.len() {
+                            return Err(anyhow::anyhow!("Response length mismatch"));
+                        }
+                        for (i, request) in response.into_iter().enumerate() {
+                            requests[i] = request;
+                        }
                         Ok(())
                     },
                     Err(e) => Err(anyhow::anyhow!("Store service error: {}", e)),
@@ -203,17 +208,22 @@ impl StoreHandle {
         }
     }
 
-    pub async fn perform_mut(&self, requests: &mut Vec<Request>) -> Result<()> {
+    pub async fn perform_mut(&self, requests: &mut [Request]) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender.send(StoreRequest::PerformMut {
-            requests: requests.clone(),
+            requests: requests.to_vec(),
             response: response_tx,
         }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
         match response_rx.await {
             Ok(result) => {
                 match result {
                     Ok(response) => {
-                        *requests = response;
+                        if response.len() != requests.len() {
+                            return Err(anyhow::anyhow!("Response length mismatch"));
+                        }
+                        for (i, request) in response.into_iter().enumerate() {
+                            requests[i] = request;
+                        }
                         Ok(())
                     },
                     Err(e) => Err(anyhow::anyhow!("Store service error: {}", e)),
