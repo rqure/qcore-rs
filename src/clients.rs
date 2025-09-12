@@ -434,10 +434,10 @@ impl ClientService {
                                         req.try_set_writer_id(client_id.clone());
                                     });
 
-                                    match services.store_handle.perform_mut(&mut requests).await {
-                                        Ok(()) => StoreMessage::PerformResponse {
+                                    match services.store_handle.perform_mut(requests).await {
+                                        Ok(response) => StoreMessage::PerformResponse {
                                             id,
-                                            response: Ok(requests),
+                                            response: Ok(response),
                                         },
                                         Err(e) => StoreMessage::PerformResponse {
                                             id,

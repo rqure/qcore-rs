@@ -591,8 +591,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                     return Ok(false); // Processed but not counted
                 }
 
-                let mut requests = vec![request];
-                if let Err(e) = store_handle.perform_mut(&mut requests).await {
+                if let Err(e) = store_handle.perform_mut(vec![request]).await {
                     return Err(anyhow::anyhow!("Failed to apply request during WAL replay: {}", e));
                 }
                 

@@ -184,24 +184,16 @@ impl StoreHandle {
         }
     }
 
-    pub async fn perform(&self, requests: &mut [Request]) -> Result<()> {
+    pub async fn perform(&self, requests: Vec<Request>) -> Result<Vec<Request>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
         let _ = self.sender.send(StoreRequest::Perform {
-            requests: requests.to_vec(),
+            requests,
             response: response_tx,
         }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
         match response_rx.recv().await {
             Ok(result) => {
                 match result {
-                    Ok(response) => {
-                        if response.len() != requests.len() {
-                            return Err(anyhow::anyhow!("Response length mismatch"));
-                        }
-                        for (i, request) in response.into_iter().enumerate() {
-                            requests[i] = request;
-                        }
-                        Ok(())
-                    },
+                    Ok(response) => Ok(response),
                     Err(e) => Err(anyhow::anyhow!("Store service error: {}", e)),
                 }
             },
@@ -209,24 +201,16 @@ impl StoreHandle {
         }
     }
 
-    pub async fn perform_mut(&self, requests: &mut [Request]) -> Result<()> {
+    pub async fn perform_mut(&self, requests: Vec<Request>) -> Result<Vec<Request>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
         let _ = self.sender.send(StoreRequest::PerformMut {
-            requests: requests.to_vec(),
+            requests,
             response: response_tx,
         }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
         match response_rx.recv().await {
             Ok(result) => {
                 match result {
-                    Ok(response) => {
-                        if response.len() != requests.len() {
-                            return Err(anyhow::anyhow!("Response length mismatch"));
-                        }
-                        for (i, request) in response.into_iter().enumerate() {
-                            requests[i] = request;
-                        }
-                        Ok(())
-                    },
+                    Ok(response) =>  Ok(response),
                     Err(e) => Err(anyhow::anyhow!("Store service error: {}", e)),
                 }
             },

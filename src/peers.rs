@@ -677,7 +677,7 @@ impl PeerService {
                     let our_machine_id = &self.config.machine;
                     
                     // Filter requests to only include those with valid originators (different from our machine)
-                    let mut requests_to_apply: Vec<_> = requests.into_iter()
+                    let requests_to_apply: Vec<_> = requests.into_iter()
                         .filter(|request| {
                             if let Some(originator) = request.originator() {
                                 originator != our_machine_id
@@ -693,16 +693,17 @@ impl PeerService {
                         })
                         .collect();
                     
+                    let req_len = requests_to_apply.len();
                     if !requests_to_apply.is_empty() {
-                        if let Err(e) = services.store_handle.perform_mut(&mut requests_to_apply).await {
+                        if let Err(e) = services.store_handle.perform_mut(requests_to_apply).await {
                             error!(
                                 error = %e,
-                                request_count = requests_to_apply.len(),
+                                request_count = req_len,
                                 "Failed to apply sync requests from peer"
                             );
                         } else {
                             debug!(
-                                request_count = requests_to_apply.len(),
+                                request_count = req_len,
                                 "Successfully applied sync requests from peer"
                             );
                         }

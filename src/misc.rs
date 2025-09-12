@@ -269,7 +269,7 @@ impl MiscService {
                 }
             }
             
-            services.store_handle.perform_mut(&mut requests).await?;
+            services.store_handle.perform_mut(requests).await?;
         }
         
         Ok(())
@@ -289,12 +289,10 @@ impl MiscService {
         ).await?;
         
         if let Some(candidate) = candidates.items.first() {
-            let mut requests = vec![
+            services.store_handle.perform_mut(vec![
                 swrite!(candidate.clone(), ft::heartbeat(), schoice!(0)),
                 swrite!(candidate.clone(), ft::make_me(), schoice!(1), PushCondition::Changes)
-            ];
-            
-            services.store_handle.perform_mut(&mut requests).await?;
+            ]).await?;
         }
         
         Ok(())
