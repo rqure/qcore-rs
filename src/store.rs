@@ -473,16 +473,16 @@ impl StoreService {
                 let result = self.store.field_exists(&entity_type, &field_type).await;
                 let _ = response.send(result);
             }
-            StoreRequest::Perform { mut requests, response } => {
-                let result = self.store.perform(&mut requests).await.map(|_| requests);
+            StoreRequest::Perform { requests, response } => {
+                let result = self.store.perform(requests).await;
                 let _ = response.send(result.map_err(anyhow::Error::from));
             }
-            StoreRequest::PerformMut { mut requests, response } => {
-                let result = self.store.perform_mut(&mut requests).await.map(|_| requests);
+            StoreRequest::PerformMut { requests, response } => {
+                let result = self.store.perform_mut(requests).await;
                 let _ = response.send(result.map_err(anyhow::Error::from));
             }
-            StoreRequest::PerformMap { mut requests, response } => {
-                let result = self.store.perform_map(&mut requests).await;
+            StoreRequest::PerformMap { requests, response } => {
+                let result = self.store.perform_map(requests).await;
                 let _ = response.send(result.map_err(anyhow::Error::from));
             }
             StoreRequest::FindEntitiesPaginated { entity_type, page_opts, filter, response } => {

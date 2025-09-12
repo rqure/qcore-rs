@@ -483,11 +483,10 @@ fn fetch_field_value<'a>(store: &'a mut StoreProxy, entity_id: &'a EntityId, fie
 
         // Regular field access
         let field_type = FieldType::from(field_name);
-        let mut requests = vec![sread!(entity_id.clone(), field_type)];
 
-        match store.perform(&mut requests).await {
-            Ok(_) => {
-                if let Some(request) = requests.first() {
+        match store.perform(vec![sread!(entity_id.clone(), field_type)]).await {
+            Ok(results) => {
+                if let Some(request) = results.first() {
                     DisplayValue::from_value(request.value())
                 } else {
                     DisplayValue::Error("No request returned".to_string())
@@ -519,11 +518,10 @@ fn fetch_indirect_field_value<'a>(store: &'a mut StoreProxy, entity_id: &'a Enti
             } else {
                 // Intermediate part - follow the reference
                 let field_type = FieldType::from(*part);
-                let mut requests = vec![sread!(current_entity_id.clone(), field_type)];
 
-                match store.perform(&mut requests).await {
-                    Ok(_) => {
-                        if let Some(request) = requests.first() {
+                match store.perform(vec![sread!(current_entity_id.clone(), field_type)]).await {
+                    Ok(results) => {
+                        if let Some(request) = results.first() {
                             if let Some(Value::EntityReference(Some(ref_entity_id))) = request.value() {
                                 current_entity_id = ref_entity_id.clone();
                             } else {

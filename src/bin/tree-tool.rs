@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{StoreProxy, EntityId, EntityType, FieldType, Value};
+use qlib_rs::{ft, EntityId, EntityType, StoreProxy, Value};
 use std::pin::Pin;
 use std::boxed::Box;
 use std::future::Future;
@@ -192,10 +192,9 @@ async fn get_entity_type(_store: &mut StoreProxy, entity_id: &EntityId) -> Resul
 
 /// Get the name of an entity
 async fn get_entity_name(store: &mut StoreProxy, entity_id: &EntityId) -> Result<String> {
-    let mut requests = vec![qlib_rs::sread!(entity_id.clone(), FieldType::from("Name"))];
-    store.perform(&mut requests).await?;
+    let results = store.perform(vec![qlib_rs::sread!(entity_id.clone(), ft::name())]).await?;
     
-    if let Some(request) = requests.first() {
+    if let Some(request) = results.first() {
         if let Some(Value::String(name)) = request.value() {
             return Ok(name.clone());
         }
@@ -206,10 +205,9 @@ async fn get_entity_name(store: &mut StoreProxy, entity_id: &EntityId) -> Result
 
 /// Get the children of an entity
 async fn get_entity_children(store: &mut StoreProxy, entity_id: &EntityId) -> Result<Vec<EntityId>> {
-    let mut requests = vec![qlib_rs::sread!(entity_id.clone(), FieldType::from("Children"))];
-    store.perform(&mut requests).await?;
-    
-    if let Some(request) = requests.first() {
+    let results = store.perform(vec![qlib_rs::sread!(entity_id.clone(), ft::children())]).await?;
+
+    if let Some(request) = results.first() {
         if let Some(Value::EntityList(children)) = request.value() {
             return Ok(children.clone());
         }

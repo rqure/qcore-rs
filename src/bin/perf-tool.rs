@@ -229,13 +229,11 @@ async fn perform_test_operation(
         }
         TestType::WriteOnly => {
             // Use the existing TestEntity from the topology for all write operations
-            let mut requests = vec![
+            store.perform(vec![
                 swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
                 swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
                 swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(fastrand::bool()))),
-            ];
-            
-            store.perform(&mut requests).await?;
+            ]).await?;
         }
         TestType::Mixed => {
             if client_id % 3 == 0 {
@@ -246,11 +244,10 @@ async fn perform_test_operation(
                 }
             } else if client_id % 3 == 1 {
                 // Write operation to test entity only
-                let mut requests = vec![
+                store.perform(vec![
                     swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("MixedTest_Client_{}", client_id))),
                     swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(client_id as i64)),
-                ];
-                store.perform(&mut requests).await?;
+                ]).await?;
             } else {
                 // Search operation
                 let entity_type = EntityType::from(config.entity_type.as_str());
@@ -259,12 +256,11 @@ async fn perform_test_operation(
         }
         TestType::Create => {
             // Update the existing test entity instead of creating new ones
-            let mut requests = vec![
+            store.perform(vec![
                 swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
                 swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(fastrand::i64(..))),
                 swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(true))),
-            ];
-            store.perform(&mut requests).await?;
+            ]).await?;
         }
         TestType::Search => {
             let entity_type = EntityType::from(config.entity_type.as_str());
@@ -284,7 +280,7 @@ async fn perform_test_operation(
                     requests.push(swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(i % 4 == 0))));
                 }
             }
-            store.perform(&mut requests).await?;
+            store.perform(requests).await?;
         }
     }
     Ok(())
