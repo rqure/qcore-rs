@@ -1,6 +1,6 @@
 use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
 use qlib_rs::auth::{AuthorizationScope, get_scope, authenticate_subject, AuthConfig};
-use tokio::sync::{mpsc, oneshot};
+use crossfire::{mpsc, MAsyncTx};
 use tokio::time::{interval, Duration};
 use anyhow::Result;
 use std::sync::Arc;
@@ -20,176 +20,178 @@ pub struct StoreConfig {
 pub enum StoreRequest {
     GetEntitySchema {
         entity_type: EntityType,
-        response: oneshot::Sender<Result<EntitySchema<qlib_rs::Single>>>,
+        response: MAsyncTx<Result<EntitySchema<qlib_rs::Single>>>,
     },
     GetCompleteEntitySchema {
         entity_type: EntityType,
-        response: oneshot::Sender<Result<EntitySchema<qlib_rs::Complete>>>,
+        response: MAsyncTx<Result<EntitySchema<qlib_rs::Complete>>>,
     },
     GetFieldSchema {
         entity_type: EntityType,
         field_type: FieldType,
-        response: oneshot::Sender<Result<FieldSchema>>,
+        response: MAsyncTx<Result<FieldSchema>>,
     },
     SetFieldSchema {
         entity_type: EntityType,
         field_type: FieldType,
         schema: FieldSchema,
-        response: oneshot::Sender<Result<()>>,
+        response: MAsyncTx<Result<()>>,
     },
     EntityExists {
         entity_id: EntityId,
-        response: oneshot::Sender<bool>,
+        response: MAsyncTx<bool>,
     },
     FieldExists {
         entity_type: EntityType,
         field_type: FieldType,
-        response: oneshot::Sender<bool>,
+        response: MAsyncTx<bool>,
     },
     Perform {
         requests: Vec<Request>,
-        response: oneshot::Sender<Result<Vec<Request>>>,
+        response: MAsyncTx<Result<Vec<Request>>>,
     },
     PerformMut {
         requests: Vec<Request>,
-        response: oneshot::Sender<Result<Vec<Request>>>,
+        response: MAsyncTx<Result<Vec<Request>>>,
     },
     PerformMap {
         requests: Vec<Request>,
-        response: oneshot::Sender<Result<HashMap<FieldType, Request>>>,
+        response: MAsyncTx<Result<HashMap<FieldType, Request>>>,
     },
     FindEntitiesPaginated {
         entity_type: EntityType,
         page_opts: Option<PageOpts>,
         filter: Option<String>,
-        response: oneshot::Sender<Result<PageResult<EntityId>>>,
+        response: MAsyncTx<Result<PageResult<EntityId>>>,
     },
     FindEntitiesExact {
         entity_type: EntityType,
         page_opts: Option<PageOpts>,
         filter: Option<String>,
-        response: oneshot::Sender<Result<PageResult<EntityId>>>,
+        response: MAsyncTx<Result<PageResult<EntityId>>>,
     },
     GetEntityTypesPaginated {
         page_opts: Option<PageOpts>,
-        response: oneshot::Sender<Result<PageResult<EntityType>>>,
+        response: MAsyncTx<Result<PageResult<EntityType>>>,
     },
     RegisterNotification {
         config: NotifyConfig,
         sender: NotificationSender,
-        response: oneshot::Sender<Result<()>>,
+        response: MAsyncTx<Result<()>>,
     },
     UnregisterNotification {
         config: NotifyConfig,
         sender: NotificationSender,
-        response: oneshot::Sender<bool>,
+        response: MAsyncTx<bool>,
     },
     // Inner store access methods
     InnerDisableNotifications {
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
     InnerEnableNotifications {
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
     InnerRestoreSnapshot {
         snapshot: Snapshot,
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
     InnerTakeSnapshot {
-        response: oneshot::Sender<Snapshot>,
+        response: MAsyncTx<Snapshot>,
     },
     CheckRequestsAuthorization {
         client_id: EntityId,
         requests: Vec<Request>,
-        response: oneshot::Sender<Result<Vec<Request>>>,
+        response: MAsyncTx<Result<Vec<Request>>>,
     },
     AuthenticateSubject {
         subject_name: String,
         credential: String,
-        response: oneshot::Sender<Result<EntityId>>,
+        response: MAsyncTx<Result<EntityId>>,
     },
     SetServices {
         services: Services,
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
 }
 
 /// Handle for communicating with store manager task
 #[derive(Debug, Clone)]
 pub struct StoreHandle {
-    sender: mpsc::UnboundedSender<StoreRequest>,
+    sender: MAsyncTx<StoreRequest>,
 }
 
 impl StoreHandle {
     pub async fn get_entity_schema(&self, entity_type: &EntityType) -> Result<EntitySchema<qlib_rs::Single>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::GetEntitySchema {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::GetEntitySchema {
             entity_type: entity_type.clone(),
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn get_complete_entity_schema(&self, entity_type: &EntityType) -> Result<EntitySchema<qlib_rs::Complete>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::GetCompleteEntitySchema {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::GetCompleteEntitySchema {
             entity_type: entity_type.clone(),
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn get_field_schema(&self, entity_type: &EntityType, field_type: &FieldType) -> Result<FieldSchema> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::GetFieldSchema {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::GetFieldSchema {
             entity_type: entity_type.clone(),
             field_type: field_type.clone(),
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn set_field_schema(&self, entity_type: &EntityType, field_type: &FieldType, schema: FieldSchema) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::SetFieldSchema {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::SetFieldSchema {
             entity_type: entity_type.clone(),
             field_type: field_type.clone(),
             schema,
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn entity_exists(&self, entity_id: &EntityId) -> bool {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::EntityExists {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(StoreRequest::EntityExists {
             entity_id: entity_id.clone(),
             response: response_tx,
-        }).is_err() {
-            return false;
+        }).await {
+            response_rx.recv().await.unwrap_or(false)
+        } else {
+            false
         }
-        response_rx.await.unwrap_or(false)
     }
 
     pub async fn field_exists(&self, entity_type: &EntityType, field_type: &FieldType) -> bool {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::FieldExists {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(StoreRequest::FieldExists {
             entity_type: entity_type.clone(),
             field_type: field_type.clone(),
             response: response_tx,
-        }).is_err() {
-            return false;
+        }).await {
+            response_rx.recv().await.unwrap_or(false)
+        } else {
+            false
         }
-        response_rx.await.unwrap_or(false)
     }
 
     pub async fn perform(&self, requests: &mut [Request]) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::Perform {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::Perform {
             requests: requests.to_vec(),
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        match response_rx.await {
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        match response_rx.recv().await {
             Ok(result) => {
                 match result {
                     Ok(response) => {
@@ -209,12 +211,12 @@ impl StoreHandle {
     }
 
     pub async fn perform_mut(&self, requests: &mut [Request]) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::PerformMut {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::PerformMut {
             requests: requests.to_vec(),
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        match response_rx.await {
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        match response_rx.recv().await {
             Ok(result) => {
                 match result {
                     Ok(response) => {
@@ -234,102 +236,103 @@ impl StoreHandle {
     }
 
     pub async fn perform_map(&self, requests: Vec<Request>) -> Result<HashMap<FieldType, Request>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::PerformMap {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::PerformMap {
             requests,
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn find_entities_paginated(&self, entity_type: &EntityType, page_opts: Option<PageOpts>, filter: Option<String>) -> Result<PageResult<EntityId>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::FindEntitiesPaginated {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::FindEntitiesPaginated {
             entity_type: entity_type.clone(),
             page_opts,
             filter,
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn find_entities_exact(&self, entity_type: &EntityType, page_opts: Option<PageOpts>, filter: Option<String>) -> Result<PageResult<EntityId>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::FindEntitiesExact {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::FindEntitiesExact {
             entity_type: entity_type.clone(),
             page_opts,
             filter,
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn get_entity_types_paginated(&self, page_opts: Option<PageOpts>) -> Result<PageResult<EntityType>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::GetEntityTypesPaginated {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::GetEntityTypesPaginated {
             page_opts,
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn register_notification(&self, config: NotifyConfig, sender: NotificationSender) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::RegisterNotification {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::RegisterNotification {
             config,
             sender,
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     pub async fn unregister_notification(&self, config: &NotifyConfig, sender: &NotificationSender) -> bool {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::UnregisterNotification {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(StoreRequest::UnregisterNotification {
             config: config.clone(),
             sender: sender.clone(),
             response: response_tx,
-        }).is_err() {
-            return false;
+        }).await {
+            response_rx.recv().await.unwrap_or(false)
+        } else {
+            false
         }
-        response_rx.await.unwrap_or(false)
     }
 
     // Inner store access methods
     pub async fn disable_notifications(&self) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::InnerDisableNotifications {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(StoreRequest::InnerDisableNotifications {
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 
     pub async fn enable_notifications(&self) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::InnerEnableNotifications {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(StoreRequest::InnerEnableNotifications {
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 
     pub async fn restore_snapshot(&self, snapshot: Snapshot) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::InnerRestoreSnapshot {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(StoreRequest::InnerRestoreSnapshot {
             snapshot,
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 
     pub async fn take_snapshot(&self) -> Option<Snapshot> {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::InnerTakeSnapshot {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(StoreRequest::InnerTakeSnapshot {
             response: response_tx,
-        }).is_ok() {
-            response_rx.await.ok()
+        }).await {
+            response_rx.recv().await.ok()
         } else {
             None
         }
@@ -337,12 +340,12 @@ impl StoreHandle {
 
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(StoreRequest::SetServices {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(StoreRequest::SetServices {
             services,
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 
@@ -352,13 +355,13 @@ impl StoreHandle {
         client_id: &EntityId,
         requests: Vec<Request>,
     ) -> Result<Vec<Request>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::CheckRequestsAuthorization {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::CheckRequestsAuthorization {
             client_id: client_id.clone(),
             requests,
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 
     /// Authenticate a subject with credentials
@@ -367,13 +370,13 @@ impl StoreHandle {
         subject_name: &str,
         credential: &str,
     ) -> Result<EntityId> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(StoreRequest::AuthenticateSubject {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(StoreRequest::AuthenticateSubject {
             subject_name: subject_name.to_string(),
             credential: credential.to_string(),
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
     }
 }
 
@@ -388,7 +391,7 @@ pub struct StoreService {
 
 impl StoreService {
     pub fn spawn(config: StoreConfig) -> StoreHandle {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = crossfire::mpsc::bounded_async(1000);
         
         tokio::spawn(async move {
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
@@ -419,13 +422,12 @@ impl StoreService {
                 write_channel_task_spawned: false,
             };
 
-            let mut receiver = receiver;
             let mut notification_timer = interval(Duration::from_millis(100)); // Process notifications every 100ms
 
             loop {
                 tokio::select! {
                     request = receiver.recv() => {
-                        if let Some(request) = request {
+                        if let Ok(request) = request {
                             service.handle_request(request).await;
                         } else {
                             // Channel closed, exit the loop

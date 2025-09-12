@@ -2,12 +2,11 @@ use qlib_rs::now;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, oneshot};
+use crossfire::{mpsc, MAsyncTx};
+use tokio::time::Duration;
 use tracing::{info, warn, error, debug, instrument};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::time::Duration;
-use time;
 use serde::{Serialize, Deserialize};
 
 use crate::Services;
@@ -85,17 +84,17 @@ pub struct PeerInfo {
 pub enum PeerRequest {
     SendSyncMessage {
         requests: Vec<qlib_rs::Request>,
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
     GetAvailabilityState {
-        response: oneshot::Sender<AvailabilityState>,
+        response: MAsyncTx<AvailabilityState>,
     },
     GetLeadershipInfo {
-        response: oneshot::Sender<(bool, Option<String>)>, // (is_leader, current_leader)
+        response: MAsyncTx<(bool, Option<String>)>, // (is_leader, current_leader)
     },
     IsOutboundPeerConnected {
         peer_addr: String,
-        response: oneshot::Sender<bool>,
+        response: MAsyncTx<bool>,
     },
     PeerConnected {
         peer_addr: String,
@@ -107,7 +106,7 @@ pub enum PeerRequest {
     },
     OutboundPeerConnected {
         peer_addr: String,
-        sender: mpsc::UnboundedSender<Message>,
+        sender: MAsyncTx<Message>,
     },
     OutboundPeerDisconnected {
         peer_addr: String,
@@ -116,70 +115,70 @@ pub enum PeerRequest {
     ProcessPeerMessage {
         peer_msg: PeerMessage,
         peer_addr: String,
-        response: oneshot::Sender<Option<PeerMessage>>,
+        response: MAsyncTx<Option<PeerMessage>>,
     },
     SetServices {
         services: Services,
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
 }
 
 /// Handle for communicating with peer service
 #[derive(Debug, Clone)]
 pub struct PeerHandle {
-    sender: mpsc::UnboundedSender<PeerRequest>,
+    sender: MAsyncTx<PeerRequest>,
 }
 
 impl PeerHandle {
     pub async fn send_sync_message(&self, requests: Vec<qlib_rs::Request>) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(PeerRequest::SendSyncMessage {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(PeerRequest::SendSyncMessage {
             requests,
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 
     pub async fn get_availability_state(&self) -> AvailabilityState {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(PeerRequest::GetAvailabilityState {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(PeerRequest::GetAvailabilityState {
             response: response_tx,
-        }).is_ok() {
-            response_rx.await.unwrap_or(AvailabilityState::Unavailable)
+        }).await {
+            response_rx.recv().await.unwrap_or(AvailabilityState::Unavailable)
         } else {
             AvailabilityState::Unavailable
         }
     }
 
     pub async fn get_leadership_info(&self) -> (bool, Option<String>) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(PeerRequest::GetLeadershipInfo {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(PeerRequest::GetLeadershipInfo {
             response: response_tx,
-        }).is_ok() {
-            response_rx.await.unwrap_or((false, None))
+        }).await {
+            response_rx.recv().await.unwrap_or((false, None))
         } else {
             (false, None)
         }
     }
 
-    pub fn peer_connected(&self, peer_addr: String, machine_id: String, startup_time: u64) {
+    pub async fn peer_connected(&self, peer_addr: String, machine_id: String, startup_time: u64) {
         let _ = self.sender.send(PeerRequest::PeerConnected {
             peer_addr,
             machine_id,
             startup_time,
-        });
+        }).await;
     }
 
-    pub fn peer_disconnected(&self, peer_addr: String) {
-        let _ = self.sender.send(PeerRequest::PeerDisconnected { peer_addr });
+    pub async fn peer_disconnected(&self, peer_addr: String) {
+        let _ = self.sender.send(PeerRequest::PeerDisconnected { peer_addr }).await;
     }
 
-    pub fn outbound_peer_connected(&self, peer_addr: String, sender: mpsc::UnboundedSender<Message>) {
+    pub async fn outbound_peer_connected(&self, peer_addr: String, sender: MAsyncTx<Message>) {
         let _ = self.sender.send(PeerRequest::OutboundPeerConnected {
             peer_addr,
             sender,
-        });
+        }).await;
     }
 
     pub fn outbound_peer_disconnected(&self, peer_addr: String) {
@@ -191,13 +190,13 @@ impl PeerHandle {
     }
 
     pub async fn process_peer_message(&self, peer_msg: PeerMessage, peer_addr: String) -> Option<PeerMessage> {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(PeerRequest::ProcessPeerMessage {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(PeerRequest::ProcessPeerMessage {
             peer_msg,
             peer_addr,
             response: response_tx,
-        }).is_ok() {
-            response_rx.await.unwrap_or(None)
+        }).await {
+            response_rx.recv().await.unwrap_or(None)
         } else {
             None
         }
@@ -205,12 +204,12 @@ impl PeerHandle {
 
     /// Check if we already have an outbound connection to a peer
     pub async fn is_outbound_peer_connected(&self, peer_addr: &str) -> bool {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(PeerRequest::IsOutboundPeerConnected {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(PeerRequest::IsOutboundPeerConnected {
             peer_addr: peer_addr.to_string(),
             response: response_tx,
-        }).is_ok() {
-            response_rx.await.unwrap_or(false)
+        }).await {
+            response_rx.recv().await.unwrap_or(false)
         } else {
             false
         }
@@ -218,12 +217,12 @@ impl PeerHandle {
 
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(PeerRequest::SetServices {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(PeerRequest::SetServices {
             services,
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 }
@@ -238,7 +237,7 @@ pub struct PeerService {
     became_unavailable_at: Option<u64>,
     full_sync_request_pending: bool,
     peer_info: HashMap<String, PeerInfo>,
-    connected_outbound_peers: HashMap<String, mpsc::UnboundedSender<Message>>,
+    connected_outbound_peers: HashMap<String, MAsyncTx<Message>>,
     services: Option<Services>,
 }
 
@@ -246,7 +245,7 @@ impl PeerService {
     pub fn spawn(
         config: PeerConfig,
     ) -> PeerHandle {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = crossfire::mpsc::bounded_async(500);
         
         let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
         
@@ -298,8 +297,8 @@ impl PeerService {
                     }
                     request = receiver.recv() => {
                         match request {
-                            Some(req) => service.handle_request(req).await,
-                            None => break,
+                            Ok(req) => service.handle_request(req).await,
+                            Err(_) => break,
                         }
                     }
                 }
@@ -541,7 +540,7 @@ impl PeerService {
                 let message = Message::Text(message_json);
                 
                 for (peer_addr, sender) in &self.connected_outbound_peers {
-                    if let Err(e) = sender.send(message.clone()) {
+                    if let Err(e) = sender.send(message.clone()).await {
                         warn!(
                             peer_addr = %peer_addr,
                             error = %e,
@@ -576,7 +575,7 @@ impl PeerService {
             
             let mut sent = false;
             for (peer_addr, sender) in &self.connected_outbound_peers {
-                if let Err(e) = sender.send(message.clone()) {
+                if let Err(e) = sender.send(message.clone()).await {
                     warn!(
                         peer_addr = %peer_addr,
                         error = %e,
@@ -769,7 +768,7 @@ async fn handle_inbound_peer_connection(
         }
     }
     
-    handle.peer_disconnected(peer_addr.to_string());
+    handle.peer_disconnected(peer_addr.to_string()).await;
     info!("Peer connection terminated");
     Ok(())
 }
@@ -788,7 +787,7 @@ async fn handle_peer_message(
                 "Processing startup message from peer"
             );
             
-            handle.peer_connected(peer_addr.to_string(), machine_id, startup_time);
+            handle.peer_connected(peer_addr.to_string(), machine_id, startup_time).await;
         }
         
         other_msg => {
@@ -895,10 +894,10 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     info!(peer_addr = %peer_addr, "Connected to outbound peer");
     
     let (ws_sender, mut ws_receiver) = ws_stream.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, rx) = mpsc::bounded_async::<Message>(1000);
     
     // Notify the service about the connection - it will handle sending the startup message
-    handle.outbound_peer_connected(peer_addr.to_string(), tx.clone());
+    handle.outbound_peer_connected(peer_addr.to_string(), tx.clone()).await;
     
     let peer_addr_clone = peer_addr.to_string();
     let handle_clone = handle.clone();
@@ -906,7 +905,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     // Spawn sender task
     let sender_task = tokio::spawn(async move {
         let mut ws_sender = ws_sender;
-        while let Some(message) = rx.recv().await {
+        while let Ok(message) = rx.recv().await {
             if ws_sender.send(message).await.is_err() {
                 break;
             }

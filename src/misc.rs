@@ -1,8 +1,8 @@
 use qlib_rs::{et, ft, now, schoice, sread, sref, swrite, PushCondition, Value};
-use tokio::sync::{mpsc, oneshot};
+use crossfire::{mpsc, MAsyncTx};
+use tokio::time::Duration;
 use tracing::error;
 use anyhow::Result;
-use std::time::Duration;
 use time;
 
 use crate::Services;
@@ -28,25 +28,25 @@ impl From<&crate::Config> for MiscConfig {
 pub enum MiscRequest {
     SetServices {
         services: Services,
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
 }
 
 /// Handle for communicating with misc service
 #[derive(Debug, Clone)]
 pub struct MiscHandle {
-    sender: mpsc::UnboundedSender<MiscRequest>,
+    sender: MAsyncTx<MiscRequest>,
 }
 
 impl MiscHandle {
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(MiscRequest::SetServices {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(MiscRequest::SetServices {
             services,
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 }
@@ -58,7 +58,7 @@ pub struct MiscService {
 
 impl MiscService {
     pub fn spawn(config: MiscConfig) -> MiscHandle {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::bounded_async(100);
         
         tokio::spawn(async move {
             let mut service = Self {
@@ -74,8 +74,8 @@ impl MiscService {
                     // Handle service requests
                     request = receiver.recv() => {
                         match request {
-                            Some(req) => service.handle_request(req).await,
-                            None => break, // Channel closed
+                            Ok(req) => service.handle_request(req).await,
+                            Err(_) => break, // Channel closed
                         }
                     }
                     

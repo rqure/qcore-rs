@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::vec;
 use tokio::fs::{File, OpenOptions, create_dir_all};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use tokio::sync::{mpsc, oneshot};
+use crossfire::{mpsc, MAsyncTx};
 use std::path::PathBuf;
 use async_trait::async_trait;
 
@@ -33,38 +33,38 @@ pub struct WalConfig {
 pub enum WalRequest {
     WriteRequest {
         request: qlib_rs::Request,
-        response: oneshot::Sender<Result<()>>,
+        response: MAsyncTx<Result<()>>,
     },
     SetServices {
         services: Services,
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
 }
 
 /// Handle for communicating with WAL manager task
 #[derive(Debug, Clone)]
 pub struct WalHandle {
-    sender: mpsc::UnboundedSender<WalRequest>,
+    sender: MAsyncTx<WalRequest>,
 }
 
 impl WalHandle {
     pub async fn write_request(&self, request: qlib_rs::Request) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender.send(WalRequest::WriteRequest {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        let _ = self.sender.send(WalRequest::WriteRequest {
             request,
             response: response_tx,
-        }).map_err(|_| anyhow::anyhow!("WAL manager task has stopped"))?;
-        response_rx.await.map_err(|_| anyhow::anyhow!("WAL manager task response channel closed"))?
+        }).await.map_err(|_| anyhow::anyhow!("WAL manager task has stopped"))?;
+        response_rx.recv().await.map_err(|_| anyhow::anyhow!("WAL manager task response channel closed"))?
     }
 
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(WalRequest::SetServices {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(WalRequest::SetServices {
             services,
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 }
@@ -73,12 +73,12 @@ pub type WalService = WalManagerTrait<FileManager>;
 
 impl WalService {
     pub fn spawn(config: WalConfig) -> WalHandle {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = crossfire::mpsc::bounded_async(1000);
         tokio::spawn(async move {
             let mut service = WalService::new(FileManager, config, None);
             let _ = service.initialize_counter().await;
 
-            while let Some(request) = receiver.recv().await {
+            while let Ok(request) = receiver.recv().await {
                 match request {
                     WalRequest::WriteRequest { request, response } => {
                         // For now, we'll need to wait until services are set

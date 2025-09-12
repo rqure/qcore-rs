@@ -1,7 +1,7 @@
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, oneshot};
+use crossfire::{mpsc, MAsyncTx};
 use tracing::{info, warn, error, debug, instrument};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -36,7 +36,7 @@ impl From<&crate::Config> for ClientConfig {
 pub enum ClientRequest {
     ClientConnected {
         client_addr: String,
-        sender: mpsc::UnboundedSender<Message>,
+        sender: MAsyncTx<Message>,
         notification_sender: NotificationSender,
     },
     ClientDisconnected {
@@ -49,122 +49,122 @@ pub enum ClientRequest {
     ProcessStoreMessage {
         message: StoreMessage,
         client_addr: Option<String>,
-        response: oneshot::Sender<StoreMessage>,
+        response: MAsyncTx<StoreMessage>,
     },
     RegisterNotification {
         client_addr: String,
         config: NotifyConfig,
-        response: oneshot::Sender<Result<()>>,
+        response: MAsyncTx<Result<()>>,
     },
     UnregisterNotification {
         client_addr: String,
         config: NotifyConfig,
-        response: oneshot::Sender<bool>,
+        response: MAsyncTx<bool>,
     },
     ForceDisconnectAll {
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
     SetServices {
         services: Services,
-        response: oneshot::Sender<()>,
+        response: MAsyncTx<()>,
     },
 }
 
 /// Handle for communicating with client service
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
-    sender: mpsc::UnboundedSender<ClientRequest>,
+    sender: MAsyncTx<ClientRequest>,
 }
 
 impl ClientHandle {
-    pub fn client_connected(&self, client_addr: String, sender: mpsc::UnboundedSender<Message>, notification_sender: NotificationSender) {
+    pub async fn client_connected(&self, client_addr: String, sender: MAsyncTx<Message>, notification_sender: NotificationSender) {
         let _ = self.sender.send(ClientRequest::ClientConnected {
             client_addr,
             sender,
             notification_sender,
-        });
+        }).await;
     }
 
-    pub fn client_disconnected(&self, client_addr: String) {
-        let _ = self.sender.send(ClientRequest::ClientDisconnected { client_addr });
+    pub async fn client_disconnected(&self, client_addr: String) {
+        let _ = self.sender.send(ClientRequest::ClientDisconnected { client_addr }).await;
     }
 
-    pub fn client_authenticated(&self, client_addr: String, client_id: EntityId) {
+    pub async fn client_authenticated(&self, client_addr: String, client_id: EntityId) {
         let _ = self.sender.send(ClientRequest::ClientAuthenticated {
             client_addr,
             client_id,
-        });
+        }).await;
     }
 
     pub async fn process_store_message(&self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(ClientRequest::ProcessStoreMessage {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(ClientRequest::ProcessStoreMessage {
             message,
             client_addr,
             response: response_tx,
-        }).is_ok() {
-            response_rx.await.unwrap_or_else(|_| StoreMessage::Error {
-                id: "unknown".to_string(),
-                error: "Client service unavailable".to_string(),
+        }).await {
+                        response_rx.recv().await.unwrap_or_else(|_| StoreMessage::Error {
+                id: "error".to_string(),
+                error: "Failed to receive response".to_string(),
             })
         } else {
             StoreMessage::Error {
-                id: "unknown".to_string(),
+                id: "error".to_string(),
                 error: "Client service unavailable".to_string(),
             }
         }
     }
 
     pub async fn register_notification(&self, client_addr: String, config: NotifyConfig) -> Result<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(ClientRequest::RegisterNotification {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(ClientRequest::RegisterNotification {
             client_addr,
             config,
             response: response_tx,
-        }).is_ok() {
-            response_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("Client service unavailable")))
+        }).await {
+            response_rx.recv().await.unwrap_or_else(|_| Err(anyhow::anyhow!("Client service unavailable")))
         } else {
             Err(anyhow::anyhow!("Client service unavailable"))
         }
     }
 
     pub async fn unregister_notification(&self, client_addr: String, config: NotifyConfig) -> bool {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(ClientRequest::UnregisterNotification {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(ClientRequest::UnregisterNotification {
             client_addr,
             config,
             response: response_tx,
-        }).is_ok() {
-            response_rx.await.unwrap_or(false)
+        }).await {
+            response_rx.recv().await.unwrap_or(false)
         } else {
             false
         }
     }
 
     pub async fn force_disconnect_all(&self) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(ClientRequest::ForceDisconnectAll {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(ClientRequest::ForceDisconnectAll {
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 
     /// Set services for dependencies
     pub async fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = oneshot::channel();
-        if self.sender.send(ClientRequest::SetServices {
+        let (response_tx, response_rx) = mpsc::bounded_async(1);
+        if let Ok(_) = self.sender.send(ClientRequest::SetServices {
             services,
             response: response_tx,
-        }).is_ok() {
-            let _ = response_rx.await;
+        }).await {
+            let _ = response_rx.recv().await;
         }
     }
 }
 
 pub struct ClientService {
     config: ClientConfig,
-    connected_clients: HashMap<String, mpsc::UnboundedSender<Message>>,
+    connected_clients: HashMap<String, MAsyncTx<Message>>,
     client_notification_senders: HashMap<String, NotificationSender>,
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
     authenticated_clients: HashMap<String, EntityId>,
@@ -173,7 +173,7 @@ pub struct ClientService {
 
 impl ClientService {
     pub fn spawn(config: ClientConfig) -> ClientHandle {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::bounded_async(1000);
         
         let config_clone = config.clone();
         tokio::spawn(async move {
@@ -186,7 +186,7 @@ impl ClientService {
                 services: None,
             };
 
-            while let Some(request) = receiver.recv().await {
+            while let Ok(request) = receiver.recv().await {
                 service.handle_request(request).await;
             }
 
@@ -670,7 +670,7 @@ impl ClientService {
         // Send close messages to all connected clients
         let disconnect_message = Message::Close(None);
         for (client_addr, sender) in &self.connected_clients {
-            if let Err(e) = sender.send(disconnect_message.clone()) {
+            if let Err(e) = sender.send(disconnect_message.clone()).await {
                 warn!(
                     client_addr = %client_addr,
                     error = %e,
@@ -772,13 +772,13 @@ async fn handle_client_connection(
     info!("Client authenticated successfully");
     
     // Create a channel for sending messages to this client
-    let (tx, rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, rx) = mpsc::bounded_async::<Message>(1000);
     
     // Create a notification channel for this client
     let (notification_sender, mut notification_receiver) = notification_channel();
     
     // Register client with the service
-    handle.client_connected(client_addr.to_string(), tx.clone(), notification_sender);
+    handle.client_connected(client_addr.to_string(), tx.clone(), notification_sender).await;
     
     // Spawn a task to handle notifications for this client
     let client_addr_clone_notif = client_addr.to_string();
@@ -788,7 +788,7 @@ async fn handle_client_connection(
             // Convert notification to StoreMessage and send to client
             let notification_msg = StoreMessage::Notification { notification };
             if let Ok(notification_text) = serde_json::to_string(&notification_msg) {
-                if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)) {
+                if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)).await {
                     error!(
                         client_addr = %client_addr_clone_notif,
                         error = %e,
@@ -814,9 +814,9 @@ async fn handle_client_connection(
     let handle_clone = handle.clone();
     let outgoing_task = tokio::spawn(async move {
         let mut ws_sender = ws_sender;
-        let mut rx = rx;
+        let rx = rx;
         
-        while let Some(message) = rx.recv().await {
+        while let Ok(message) = rx.recv().await {
             if let Err(e) = ws_sender.send(message).await {
                 error!(
                     client_addr = %client_addr_clone,
@@ -828,7 +828,7 @@ async fn handle_client_connection(
         }
         
         // Notify service that client disconnected
-        handle_clone.client_disconnected(client_addr_clone);
+        handle_clone.client_disconnected(client_addr_clone).await;
     });
     
     // Handle incoming messages from client (after successful authentication)
@@ -855,7 +855,7 @@ async fn handle_client_connection(
                             }
                         };
                         
-                        if let Err(e) = tx.send(Message::Text(response_text)) {
+                        if let Err(e) = tx.send(Message::Text(response_text)).await {
                             error!(error = %e, "Failed to send response to client");
                             break;
                         }
@@ -883,7 +883,7 @@ async fn handle_client_connection(
             }
             Ok(Message::Ping(payload)) => {
                 debug!("Received ping from client");
-                if let Err(e) = tx.send(Message::Pong(payload)) {
+                if let Err(e) = tx.send(Message::Pong(payload)).await {
                     error!(error = %e, "Failed to send pong to client");
                     break;
                 }
@@ -906,7 +906,7 @@ async fn handle_client_connection(
     }
     
     // Notify service that client disconnected
-    handle.client_disconnected(client_addr.to_string());
+    handle.client_disconnected(client_addr.to_string()).await;
     
     // Abort the outgoing task and notification task
     outgoing_task.abort();
