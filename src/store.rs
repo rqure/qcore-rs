@@ -1,6 +1,7 @@
 use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
 use qlib_rs::auth::{AuthorizationScope, get_scope, authenticate_subject, AuthConfig};
 use crossfire::{mpsc, AsyncRx, MAsyncTx};
+use tracing::{error};
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -122,41 +123,41 @@ pub struct StoreHandle {
 impl StoreHandle {
     pub async fn get_entity_schema(&self, entity_type: &EntityType) -> Result<EntitySchema<qlib_rs::Single>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::GetEntitySchema {
+        self.sender.send(StoreRequest::GetEntitySchema {
             entity_type: entity_type.clone(),
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn get_complete_entity_schema(&self, entity_type: &EntityType) -> Result<EntitySchema<qlib_rs::Complete>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::GetCompleteEntitySchema {
+        self.sender.send(StoreRequest::GetCompleteEntitySchema {
             entity_type: entity_type.clone(),
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn get_field_schema(&self, entity_type: &EntityType, field_type: &FieldType) -> Result<FieldSchema> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::GetFieldSchema {
+        self.sender.send(StoreRequest::GetFieldSchema {
             entity_type: entity_type.clone(),
             field_type: field_type.clone(),
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn set_field_schema(&self, entity_type: &EntityType, field_type: &FieldType, schema: FieldSchema) -> Result<()> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::SetFieldSchema {
+        self.sender.send(StoreRequest::SetFieldSchema {
             entity_type: entity_type.clone(),
             field_type: field_type.clone(),
             schema,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn entity_exists(&self, entity_id: &EntityId) -> bool {
@@ -186,10 +187,10 @@ impl StoreHandle {
 
     pub async fn perform(&self, requests: Vec<Request>) -> Result<Vec<Request>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::Perform {
+        self.sender.send(StoreRequest::Perform {
             requests,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
         match response_rx.recv().await {
             Ok(result) => {
                 match result {
@@ -203,10 +204,10 @@ impl StoreHandle {
 
     pub async fn perform_mut(&self, requests: Vec<Request>) -> Result<Vec<Request>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::PerformMut {
+        self.sender.send(StoreRequest::PerformMut {
             requests,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
         match response_rx.recv().await {
             Ok(result) => {
                 match result {
@@ -220,52 +221,52 @@ impl StoreHandle {
 
     pub async fn perform_map(&self, requests: Vec<Request>) -> Result<HashMap<FieldType, Request>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::PerformMap {
+        self.sender.send(StoreRequest::PerformMap {
             requests,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn find_entities_paginated(&self, entity_type: &EntityType, page_opts: Option<PageOpts>, filter: Option<String>) -> Result<PageResult<EntityId>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::FindEntitiesPaginated {
+        self.sender.send(StoreRequest::FindEntitiesPaginated {
             entity_type: entity_type.clone(),
             page_opts,
             filter,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn find_entities_exact(&self, entity_type: &EntityType, page_opts: Option<PageOpts>, filter: Option<String>) -> Result<PageResult<EntityId>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::FindEntitiesExact {
+        self.sender.send(StoreRequest::FindEntitiesExact {
             entity_type: entity_type.clone(),
             page_opts,
             filter,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn get_entity_types_paginated(&self, page_opts: Option<PageOpts>) -> Result<PageResult<EntityType>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::GetEntityTypesPaginated {
+        self.sender.send(StoreRequest::GetEntityTypesPaginated {
             page_opts,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn register_notification(&self, config: NotifyConfig, sender: NotificationSender) -> Result<()> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::RegisterNotification {
+        self.sender.send(StoreRequest::RegisterNotification {
             config,
             sender,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     pub async fn unregister_notification(&self, config: &NotifyConfig, sender: &NotificationSender) -> bool {
@@ -287,7 +288,9 @@ impl StoreHandle {
         if let Ok(_) = self.sender.send(StoreRequest::InnerDisableNotifications {
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "Store service InnerDisableNotifications response channel closed");
+            }
         }
     }
 
@@ -296,7 +299,9 @@ impl StoreHandle {
         if let Ok(_) = self.sender.send(StoreRequest::InnerEnableNotifications {
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "Store service InnerEnableNotifications response channel closed");
+            }
         }
     }
 
@@ -306,7 +311,9 @@ impl StoreHandle {
             snapshot,
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "Store service InnerRestoreSnapshot response channel closed");
+            }
         }
     }
 
@@ -328,7 +335,9 @@ impl StoreHandle {
             services,
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "Store service SetServices response channel closed");
+            }
         }
     }
 
@@ -339,12 +348,12 @@ impl StoreHandle {
         requests: Vec<Request>,
     ) -> Result<Vec<Request>> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::CheckRequestsAuthorization {
+        self.sender.send(StoreRequest::CheckRequestsAuthorization {
             client_id: client_id.clone(),
             requests,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 
     /// Authenticate a subject with credentials
@@ -354,12 +363,12 @@ impl StoreHandle {
         credential: &str,
     ) -> Result<EntityId> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(StoreRequest::AuthenticateSubject {
+        self.sender.send(StoreRequest::AuthenticateSubject {
             subject_name: subject_name.to_string(),
             credential: credential.to_string(),
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Store service has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Store service response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Store service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Store service response channel closed: {}", e))?
     }
 }
 
@@ -436,67 +445,99 @@ impl StoreService {
         match request {
             StoreRequest::GetEntitySchema { entity_type, response } => {
                 let result = self.store.get_entity_schema(&entity_type).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send GetEntitySchema response");
+                }
             }
             StoreRequest::GetCompleteEntitySchema { entity_type, response } => {
                 let result = self.store.get_complete_entity_schema(&entity_type).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send GetCompleteEntitySchema response");
+                }
             }
             StoreRequest::GetFieldSchema { entity_type, field_type, response } => {
                 let result = self.store.get_field_schema(&entity_type, &field_type).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send GetFieldSchema response");
+                }
             }
             StoreRequest::SetFieldSchema { entity_type, field_type, schema, response } => {
                 let result = self.store.set_field_schema(&entity_type, &field_type, schema).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send SetFieldSchema response");
+                }
             }
             StoreRequest::EntityExists { entity_id, response } => {
                 let result = self.store.entity_exists(&entity_id).await;
-                let _ = response.send(result);
+                if let Err(e) = response.send(result).await {
+                    tracing::error!(error = %e, "Failed to send EntityExists response");
+                }
             }
             StoreRequest::FieldExists { entity_type, field_type, response } => {
                 let result = self.store.field_exists(&entity_type, &field_type).await;
-                let _ = response.send(result);
+                if let Err(e) = response.send(result).await {
+                    tracing::error!(error = %e, "Failed to send FieldExists response");
+                }
             }
             StoreRequest::Perform { requests, response } => {
                 let result = self.store.perform(requests).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send Perform response");
+                }
             }
             StoreRequest::PerformMut { requests, response } => {
                 let result = self.store.perform_mut(requests).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send PerformMut response");
+                }
             }
             StoreRequest::PerformMap { requests, response } => {
                 let result = self.store.perform_map(requests).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send PerformMap response");
+                }
             }
             StoreRequest::FindEntitiesPaginated { entity_type, page_opts, filter, response } => {
                 let result = self.store.find_entities_paginated(&entity_type, page_opts, filter).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send FindEntitiesPaginated response");
+                }
             }
             StoreRequest::FindEntitiesExact { entity_type, page_opts, filter, response } => {
                 let result = self.store.find_entities_exact(&entity_type, page_opts, filter).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send FindEntitiesExact response");
+                }
             }
             StoreRequest::GetEntityTypesPaginated { page_opts, response } => {
                 let result = self.store.get_entity_types_paginated(page_opts).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send GetEntityTypesPaginated response");
+                }
             }
             StoreRequest::RegisterNotification { config, sender, response } => {
                 let result = self.store.register_notification(config, sender).await;
-                let _ = response.send(result.map_err(anyhow::Error::from));
+                if let Err(e) = response.send(result.map_err(anyhow::Error::from)).await {
+                    tracing::error!(error = %e, "Failed to send RegisterNotification response");
+                }
             }
             StoreRequest::UnregisterNotification { config, sender, response } => {
                 let result = self.store.unregister_notification(&config, &sender).await;
-                let _ = response.send(result);
+                if let Err(e) = response.send(result).await {
+                    tracing::error!(error = %e, "Failed to send UnregisterNotification response");
+                }
             }
             StoreRequest::InnerDisableNotifications { response } => {
                 self.store.inner_mut().disable_notifications();
-                let _ = response.send(());
+                if let Err(e) = response.send(()).await {
+                    tracing::error!(error = %e, "Failed to send InnerDisableNotifications response");
+                }
             }
             StoreRequest::InnerEnableNotifications { response } => {
                 self.store.inner_mut().enable_notifications();
-                let _ = response.send(());
+                if let Err(e) = response.send(()).await {
+                    tracing::error!(error = %e, "Failed to send InnerEnableNotifications response");
+                }
             }
             StoreRequest::InnerRestoreSnapshot { snapshot, response } => {
                 self.store.inner_mut().restore_snapshot(snapshot);
@@ -518,19 +559,27 @@ impl StoreService {
                 };
                 self.store.inner_mut().default_writer_id = me_as_candidate;
 
-                let _ = response.send(());
+                if let Err(e) = response.send(()).await {
+                    tracing::error!(error = %e, "Failed to send InnerRestoreSnapshot response");
+                }
             }
             StoreRequest::InnerTakeSnapshot { response } => {
                 let snapshot = self.store.inner().take_snapshot();
-                let _ = response.send(snapshot);
+                if let Err(e) = response.send(snapshot).await {
+                    tracing::error!(error = %e, "Failed to send InnerTakeSnapshot response");
+                }
             }
             StoreRequest::CheckRequestsAuthorization { client_id, requests, response } => {
                 let result = self.check_requests_authorization(&client_id, requests).await;
-                let _ = response.send(result);
+                if let Err(e) = response.send(result).await {
+                    tracing::error!(error = %e, "Failed to send CheckRequestsAuthorization response");
+                }
             }
             StoreRequest::AuthenticateSubject { subject_name, credential, response } => {
                 let result = self.authenticate_subject(&subject_name, &credential).await;
-                let _ = response.send(result);
+                if let Err(e) = response.send(result).await {
+                    tracing::error!(error = %e, "Failed to send AuthenticateSubject response");
+                }
             }
             StoreRequest::SetServices { services, response } => {
                 // Spawn the write channel processing task if it hasn't been spawned yet
@@ -544,8 +593,10 @@ impl StoreService {
                     
                     self.write_channel_task_spawned = true;
                 }
-                
-                let _ = response.send(());
+
+                if let Err(e) = response.send(()).await {
+                    tracing::error!(error = %e, "Failed to send SetServices response");
+                }
             }
         }
     }

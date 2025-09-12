@@ -50,11 +50,11 @@ pub struct WalHandle {
 impl WalHandle {
     pub async fn write_request(&self, request: qlib_rs::Request) -> Result<()> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(WalRequest::WriteRequest {
+        self.sender.send(WalRequest::WriteRequest {
             request,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("WAL manager task has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("WAL manager task response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("WAL service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("WAL service response channel closed: {}", e))?
     }
 
     /// Set services for dependencies
@@ -64,7 +64,9 @@ impl WalHandle {
             services,
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "WAL service SetServices response channel closed");
+            }
         }
     }
 }
@@ -76,7 +78,9 @@ impl WalService {
         let (sender, receiver) = crossfire::mpsc::bounded_async(131072);
         tokio::spawn(async move {
             let mut service = WalService::new(FileManager, config, None);
-            let _ = service.initialize_counter().await;
+            if let Err(e) = service.initialize_counter().await {
+                warn!(error = %e, "Failed to initialize WAL counter");
+            }
 
             while let Ok(request) = receiver.recv().await {
                 match request {
@@ -85,16 +89,24 @@ impl WalService {
                         if let Some(services) = &service.services {
                             let store_handle = services.store_handle.clone();
                             let result = service.write_request(&request, &store_handle).await;
-                            let _ = response.send(result);
+                            if let Err(e) = response.send(result).await {
+                                error!(error = %e, "Failed to send WAL write response");
+                            }
                         } else {
-                            let _ = response.send(Err(anyhow::anyhow!("Services not yet initialized")));
+                            if let Err(e) = response.send(Err(anyhow::anyhow!("Services not yet initialized"))).await {
+                                error!(error = %e, "Failed to send WAL write response");
+                            }
                         }
                     }
                     WalRequest::SetServices { services, response } => {
                         service.services = Some(services.clone());
                         // Now that we have services, we can replay from the store
-                        let _ = service.replay(&services.store_handle).await;
-                        let _ = response.send(());
+                        if let Err(e) = service.replay(&services.store_handle).await {
+                            error!(error = %e, "Failed to replay WAL");
+                        }
+                        if let Err(e) = response.send(()).await {
+                            error!(error = %e, "Failed to send SetServices response");
+                        }
                     }
                 }
             }

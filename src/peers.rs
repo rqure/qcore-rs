@@ -135,7 +135,9 @@ impl PeerHandle {
             requests,
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "Failed to receive SendSyncMessage response");
+            }
         }
     }
 
@@ -162,26 +164,34 @@ impl PeerHandle {
     }
 
     pub async fn peer_connected(&self, peer_addr: String, machine_id: String, startup_time: u64) {
-        let _ = self.sender.send(PeerRequest::PeerConnected {
+        if let Err(e) = self.sender.send(PeerRequest::PeerConnected {
             peer_addr,
             machine_id,
             startup_time,
-        }).await;
+        }).await {
+            error!(error = %e, "Failed to send PeerConnected request");
+        }
     }
 
     pub async fn peer_disconnected(&self, peer_addr: String) {
-        let _ = self.sender.send(PeerRequest::PeerDisconnected { peer_addr }).await;
+        if let Err(e) = self.sender.send(PeerRequest::PeerDisconnected { peer_addr }).await {
+            error!(error = %e, "Failed to send PeerDisconnected request");
+        }
     }
 
     pub async fn outbound_peer_connected(&self, peer_addr: String, sender: MAsyncTx<Message>) {
-        let _ = self.sender.send(PeerRequest::OutboundPeerConnected {
+        if let Err(e) = self.sender.send(PeerRequest::OutboundPeerConnected {
             peer_addr,
             sender,
-        }).await;
+        }).await {
+            error!(error = %e, "Failed to send OutboundPeerConnected request");
+        }
     }
 
     pub async fn outbound_peer_disconnected(&self, peer_addr: String) {
-        let _ = self.sender.send(PeerRequest::OutboundPeerDisconnected { peer_addr }).await;
+        if let Err(e) = self.sender.send(PeerRequest::OutboundPeerDisconnected { peer_addr }).await {
+            error!(error = %e, "Failed to send OutboundPeerDisconnected request");
+        }
     }
 
     pub async fn process_peer_message(&self, peer_msg: PeerMessage, peer_addr: String) -> Option<PeerMessage> {
@@ -217,7 +227,9 @@ impl PeerHandle {
             services,
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "Failed to receive SetServices response");
+            }
         }
     }
 }
@@ -309,17 +321,25 @@ impl PeerService {
         match request {
             PeerRequest::SendSyncMessage { requests, response } => {
                 self.send_sync_message_to_peers(requests).await;
-                let _ = response.send(());
+                if let Err(e) = response.send(()).await {
+                    error!(error = %e, "Failed to send SendSyncMessage response");
+                }
             }
             PeerRequest::GetAvailabilityState { response } => {
-                let _ = response.send(self.availability_state.clone());
+                if let Err(e) = response.send(self.availability_state.clone()).await {
+                    error!(error = %e, "Failed to send GetAvailabilityState response");
+                }
             }
             PeerRequest::GetLeadershipInfo { response } => {
-                let _ = response.send((self.is_leader, self.current_leader.clone()));
+                if let Err(e) = response.send((self.is_leader, self.current_leader.clone())).await {
+                    error!(error = %e, "Failed to send GetLeadershipInfo response");
+                }
             }
             PeerRequest::IsOutboundPeerConnected { peer_addr, response } => {
                 let is_connected = self.connected_outbound_peers.contains_key(&peer_addr);
-                let _ = response.send(is_connected);
+                if let Err(e) = response.send(is_connected).await {
+                    error!(error = %e, "Failed to send IsOutboundPeerConnected response");
+                }
             }
             PeerRequest::PeerConnected { peer_addr, machine_id, startup_time } => {
                 self.handle_peer_connected(peer_addr, machine_id, startup_time).await;
@@ -338,7 +358,15 @@ impl PeerService {
                 
                 if let Ok(startup_json) = serde_json::to_string(&startup) {
                     if let Some(sender) = self.connected_outbound_peers.get(&peer_addr) {
-                        let _ = sender.send(Message::Text(startup_json)).await;
+                        if let Err(e) = sender.send(Message::Text(startup_json)).await {
+                            warn!(
+                                peer_addr = %peer_addr,
+                                error = %e,
+                                "Failed to send startup message to peer"
+                            );
+                        } else {
+                            debug!(peer_addr = %peer_addr, "Sent startup message to peer");
+                        }
                     }
                 }
             }
@@ -347,11 +375,15 @@ impl PeerService {
             }
             PeerRequest::ProcessPeerMessage { peer_msg, peer_addr, response } => {
                 let reply = self.process_peer_message_internal(peer_msg, peer_addr).await;
-                let _ = response.send(reply);
+                if let Err(e) = response.send(reply).await {
+                    error!(error = %e, "Failed to send ProcessPeerMessage response");
+                }
             }
             PeerRequest::SetServices { services, response } => {
                 self.services = Some(services);
-                let _ = response.send(());
+                if let Err(e) = response.send(()).await {
+                    error!(error = %e, "Failed to send SetServices response");
+                }
             }
         }
     }
@@ -737,17 +769,30 @@ async fn handle_inbound_peer_connection(
     while let Some(msg) = ws_receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if let Ok(peer_msg) = serde_json::from_str::<PeerMessage>(&text) {
-                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
+                match serde_json::from_str::<PeerMessage>(&text) {
+                    Ok(peer_msg) => {
+                        handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to deserialize text message from peer");
+                    }
                 }
             }
             Ok(Message::Binary(data)) => {
-                if let Ok(peer_msg) = bincode::deserialize::<PeerMessage>(&data) {
-                    handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
+                match bincode::deserialize::<PeerMessage>(&data) {
+                    Ok(peer_msg) => {
+                        handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to deserialize binary message from peer");
+                    }
                 }
             }
             Ok(Message::Ping(payload)) => {
-                let _ = ws_sender.send(Message::Pong(payload)).await;
+                if let Err(e) = ws_sender.send(Message::Pong(payload)).await {
+                    error!(error = %e, "Failed to respond to ping from peer");
+                    break;
+                }
             }
             Ok(Message::Close(_)) => break,
             Err(e) => {

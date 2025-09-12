@@ -78,22 +78,28 @@ pub struct ClientHandle {
 
 impl ClientHandle {
     pub async fn client_connected(&self, client_addr: String, sender: MAsyncTx<Message>, notification_sender: NotificationSender) {
-        let _ = self.sender.send(ClientRequest::ClientConnected {
+        if let Err(e) = self.sender.send(ClientRequest::ClientConnected {
             client_addr,
             sender,
             notification_sender,
-        }).await;
+        }).await {
+            tracing::error!(error = %e, "Failed to send ClientConnected request");
+        }
     }
 
     pub async fn client_disconnected(&self, client_addr: String) {
-        let _ = self.sender.send(ClientRequest::ClientDisconnected { client_addr }).await;
+        if let Err(e) = self.sender.send(ClientRequest::ClientDisconnected { client_addr }).await {
+            tracing::error!(error = %e, "Failed to send ClientDisconnected request");
+        }
     }
 
     pub async fn client_authenticated(&self, client_addr: String, client_id: EntityId) {
-        let _ = self.sender.send(ClientRequest::ClientAuthenticated {
+        if let Err(e) = self.sender.send(ClientRequest::ClientAuthenticated {
             client_addr,
             client_id,
-        }).await;
+        }).await {
+            tracing::error!(error = %e, "Failed to send ClientAuthenticated request");
+        }
     }
 
     pub async fn process_store_message(&self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
@@ -103,7 +109,7 @@ impl ClientHandle {
             client_addr,
             response: response_tx,
         }).await {
-                        response_rx.recv().await.unwrap_or_else(|_| StoreMessage::Error {
+            response_rx.recv().await.unwrap_or_else(|_| StoreMessage::Error {
                 id: "error".to_string(),
                 error: "Failed to receive response".to_string(),
             })
@@ -146,7 +152,9 @@ impl ClientHandle {
         if let Ok(_) = self.sender.send(ClientRequest::ForceDisconnectAll {
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                tracing::error!(error = %e, "Failed to receive ForceDisconnectAll response");
+            }
         }
     }
 
@@ -157,7 +165,9 @@ impl ClientHandle {
             services,
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                tracing::error!(error = %e, "Failed to receive SetServices response");
+            }
         }
     }
 }
@@ -214,23 +224,33 @@ impl ClientService {
             }
             ClientRequest::ProcessStoreMessage { message, client_addr, response } => {
                 let result = self.process_store_message(message, client_addr).await;
-                let _ = response.send(result);
+                if let Err(e) = response.send(result).await {
+                    tracing::error!(error = %e, "Failed to send ProcessStoreMessage response");
+                }
             }
             ClientRequest::RegisterNotification { client_addr, config, response } => {
                 let result = self.register_notification_internal(client_addr, config).await;
-                let _ = response.send(result);
+                if let Err(e) = response.send(result).await {
+                    tracing::error!(error = %e, "Failed to send RegisterNotification response");
+                }
             }
             ClientRequest::UnregisterNotification { client_addr, config, response } => {
                 let result = self.unregister_notification_internal(client_addr, config).await;
-                let _ = response.send(result);
+                if let Err(e) = response.send(result).await {
+                    tracing::error!(error = %e, "Failed to send UnregisterNotification response");
+                }
             }
             ClientRequest::ForceDisconnectAll { response } => {
                 self.force_disconnect_all_clients().await;
-                let _ = response.send(());
+                if let Err(e) = response.send(()).await {
+                    tracing::error!(error = %e, "Failed to send ForceDisconnectAll response");
+                }
             }
             ClientRequest::SetServices { services, response } => {
                 self.services = Some(services);
-                let _ = response.send(());
+                if let Err(e) = response.send(()).await {
+                    tracing::error!(error = %e, "Failed to send SetServices response");
+                }
             }
         }
     }
@@ -720,12 +740,16 @@ async fn handle_client_connection(
         }
         Ok(Some(Ok(_))) => {
             error!("Client sent non-text message during authentication");
-            let _ = ws_sender.close().await;
+            if let Err(e) = ws_sender.close().await {
+                error!(error = %e, "Failed to close WebSocket after invalid auth message");
+            }
             return Ok(());
         }
         Err(_) => {
             info!("Client authentication timeout");
-            let _ = ws_sender.close().await;
+            if let Err(e) = ws_sender.close().await {
+                error!(error = %e, "Failed to close WebSocket after authentication timeout");
+            }
             return Ok(());
         }
     };
@@ -737,7 +761,9 @@ async fn handle_client_connection(
         }
         _ => {
             error!("Client first message was not authentication");
-            let _ = ws_sender.close().await;
+            if let Err(e) = ws_sender.close().await {
+                error!(error = %e, "Failed to close WebSocket after invalid auth message");
+            }
             return Ok(());
         }
     };
@@ -750,7 +776,9 @@ async fn handle_client_connection(
         Ok(text) => text,
         Err(e) => {
             error!(error = %e, "Failed to serialize authentication response");
-            let _ = ws_sender.close().await;
+            if let Err(e) = ws_sender.close().await {
+                error!(error = %e, "Failed to close WebSocket after serialization error");
+            }
             return Ok(());
         }
     };
@@ -765,7 +793,9 @@ async fn handle_client_connection(
     
     if !is_authenticated {
         warn!("Client authentication failed, closing connection");
-        let _ = ws_sender.close().await;
+        if let Err(e) = ws_sender.close().await {
+            error!(error = %e, "Failed to close WebSocket after failed authentication");
+        }
         return Ok(());
     }
     
@@ -884,7 +914,10 @@ async fn handle_client_connection(
                             error: format!("Failed to parse message: {}", e),
                         };
                         if let Ok(error_text) = serde_json::to_string(&error_msg) {
-                            let _ = tx.send(Message::Text(error_text));
+                            if let Err(e) = tx.send(Message::Text(error_text)).await {
+                                error!(error = %e, "Failed to send error response to client");
+                                break;
+                            }
                         }
                     }
                 }

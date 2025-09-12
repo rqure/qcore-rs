@@ -46,7 +46,9 @@ impl MiscHandle {
             services,
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "Failed to receive SetServices response");
+            }
         }
     }
 }
@@ -109,7 +111,9 @@ impl MiscService {
         match request {
             MiscRequest::SetServices { services, response } => {
                 self.services = Some(services);
-                let _ = response.send(());
+                if let Err(e) = response.send(()).await {
+                    error!(error = %e, "Failed to send SetServices response");
+                }
             }
         }
     }

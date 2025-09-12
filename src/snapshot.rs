@@ -53,11 +53,11 @@ pub enum SnapshotRequest {
 impl SnapshotHandle {
     pub async fn save(&self, snapshot: qlib_rs::Snapshot) -> Result<u64> {
         let (response_tx, response_rx) = mpsc::bounded_async(1);
-        let _ = self.sender.send(SnapshotRequest::Save {
+        self.sender.send(SnapshotRequest::Save {
             snapshot,
             response: response_tx,
-        }).await.map_err(|_| anyhow::anyhow!("Snapshot manager task has stopped"))?;
-        response_rx.recv().await.map_err(|_| anyhow::anyhow!("Snapshot manager task response channel closed"))?
+        }).await.map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
+        response_rx.recv().await.map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
     }
 
     /// Set services for dependencies
@@ -67,7 +67,9 @@ impl SnapshotHandle {
             services,
             response: response_tx,
         }).await {
-            let _ = response_rx.recv().await;
+            if let Err(e) = response_rx.recv().await {
+                error!(error = %e, "Snapshot service SetServices response channel closed");
+            }
         }
     }
 }
@@ -92,7 +94,9 @@ impl SnapshotService {
                 match request {
                     SnapshotRequest::Save { snapshot, response } => {
                         let result = service.save(&snapshot).await;
-                        let _ = response.send(result);
+                        if let Err(e) = response.send(result).await {
+                            error!(error = %e, "Failed to send snapshot save response");
+                        }
                     }
                     SnapshotRequest::SetServices { services: _services, response } => {
                         match service.load_latest().await {
@@ -101,7 +105,9 @@ impl SnapshotService {
                             }
                             _ => {}
                         }
-                        let _ = response.send(());
+                        if let Err(e) = response.send(()).await {
+                            error!(error = %e, "Failed to send SetServices response");
+                        }
                     }
                 }
             }
