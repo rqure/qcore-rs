@@ -1,11 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{StoreProxy, EntityType, EntityId, PageOpts, PageResult, Value, FieldType, sread};
+use qlib_rs::{sread, EntityId, EntityType, FieldType, PageOpts, PageResult, StoreProxy, Value};
 use std::collections::HashMap;
 use tracing::{info, debug};
 use serde_json;
 use base64::{Engine as _, engine::general_purpose};
-use std::pin::Pin;
 use std::time::{Instant, Duration};
 
 /// Command-line tool for querying entities from the QCore data store with CEL filter support
@@ -106,7 +105,6 @@ enum DisplayValue {
     Timestamp(String),
     Blob(String), // Base64 encoded
     None,
-    Error(String),
 }
 
 impl DisplayValue {
@@ -121,7 +119,6 @@ impl DisplayValue {
             DisplayValue::Timestamp(s) => s.clone(),
             DisplayValue::Blob(s) => format!("blob({})", s),
             DisplayValue::None => "".to_string(),
-            DisplayValue::Error(e) => format!("ERROR: {}", e),
         }
     }
 
@@ -171,7 +168,6 @@ struct QueryMetrics {
     entities_found: usize,
     pages_fetched: usize,
     fields_fetched: usize,
-    failed_fields: usize,
 }
 
 impl QueryMetrics {
@@ -187,7 +183,6 @@ impl QueryMetrics {
             entities_found: 0,
             pages_fetched: 0,
             fields_fetched: 0,
-            failed_fields: 0,
         }
     }
 
@@ -227,7 +222,7 @@ impl QueryMetrics {
         println!();
         println!("Entities found:  {}", self.entities_found);
         println!("Pages fetched:   {}", self.pages_fetched);
-        println!("Fields fetched:  {} ({} failed)", self.fields_fetched, self.failed_fields);
+        println!("Fields fetched:  {}", self.fields_fetched);
         
         if self.entities_found > 0 {
             let avg_query_nanos = self.query_time.as_nanos() as f64 / self.pages_fetched as f64;
@@ -334,11 +329,10 @@ async fn main() -> Result<()> {
 
     // Fetch field values for the results
     let field_fetch_start = Instant::now();
-    let (entities_with_data, fields_fetched, failed_fields) = fetch_entity_data(&mut store, &results, &fields_to_display).await
+    let (entities_with_data, fields_fetched) = fetch_entity_data(&mut store, &results, &fields_to_display).await
         .context("Failed to fetch entity data")?;
     metrics.field_fetch_time = field_fetch_start.elapsed();
     metrics.fields_fetched = fields_fetched;
-    metrics.failed_fields = failed_fields;
 
     // Display results
     let display_start = Instant::now();
@@ -440,106 +434,41 @@ async fn fetch_entity_data(
     store: &mut StoreProxy,
     entity_ids: &[EntityId],
     fields: &[String],
-) -> Result<(Vec<EntityDisplay>, usize, usize)> {
+) -> Result<(Vec<EntityDisplay>, usize)> {
     let mut results = Vec::new();
     let mut fields_fetched = 0;
-    let mut failed_fields = 0;
+
 
     for entity_id in entity_ids {
         debug!("Fetching data for entity: {}", entity_id);
+        let mut reqs = Vec::new();
 
-        let mut entity_display = EntityDisplay {
-            entity_id: entity_id.clone(),
-            entity_type: entity_id.get_type().as_ref().to_string(),
-            fields: HashMap::new(),
-        };
-
-        // Fetch each requested field
-        for field_name in fields {
-            let display_value = fetch_field_value(store, entity_id, field_name).await;
-            
-            // Count metrics
-            fields_fetched += 1;
-            if matches!(display_value, DisplayValue::Error(_)) {
-                failed_fields += 1;
-            }
-            
-            entity_display.fields.insert(field_name.clone(), display_value);
+        for field in fields {
+            reqs.push(sread!(entity_id.clone(), FieldType::from(field.as_str())));
         }
 
-        results.push(entity_display);
+        match store.perform(reqs).await {
+            Ok(res) => {
+                fields_fetched += fields.len();
+                results.push(EntityDisplay {
+                    entity_id: entity_id.clone(),
+                    entity_type: entity_id.get_type().to_string(),
+                    fields: res.into_iter().enumerate().map(|(i, r)| {
+                        let field_name = fields[i].clone();
+                        let display_value = r.value()
+                            .map(|v| DisplayValue::from_value(Some(&v)))
+                            .unwrap_or(DisplayValue::None);
+                        (field_name, display_value)
+                    }).collect(),
+                });
+            },
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to fetch fields: {}", e));
+            }
+        }
     }
 
-    Ok((results, fields_fetched, failed_fields))
-}
-
-/// Fetch a single field value for an entity
-fn fetch_field_value<'a>(store: &'a mut StoreProxy, entity_id: &'a EntityId, field_name: &'a str) -> Pin<Box<dyn std::future::Future<Output = DisplayValue> + 'a>> {
-    Box::pin(async move {
-        // Handle indirection (e.g., "Department->Name")
-        if field_name.contains("->") {
-            return fetch_indirect_field_value(store, entity_id, field_name).await;
-        }
-
-        // Regular field access
-        let field_type = FieldType::from(field_name);
-
-        match store.perform(vec![sread!(entity_id.clone(), field_type)]).await {
-            Ok(results) => {
-                if let Some(request) = results.first() {
-                    DisplayValue::from_value(request.value())
-                } else {
-                    DisplayValue::Error("No request returned".to_string())
-                }
-            }
-            Err(e) => {
-                debug!("Failed to fetch field '{}' for entity {}: {}", field_name, entity_id, e);
-                DisplayValue::Error(format!("Failed to fetch: {}", e))
-            }
-        }
-    })
-}
-
-/// Fetch an indirect field value (e.g., "Department->Name")
-fn fetch_indirect_field_value<'a>(store: &'a mut StoreProxy, entity_id: &'a EntityId, field_path: &'a str) -> Pin<Box<dyn std::future::Future<Output = DisplayValue> + 'a>> {
-    Box::pin(async move {
-        let parts: Vec<&str> = field_path.split("->").collect();
-        if parts.len() < 2 {
-            return DisplayValue::Error("Invalid indirection syntax".to_string());
-        }
-
-        let mut current_entity_id = entity_id.clone();
-
-        // Follow the chain of references
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                // Last part - fetch the actual field value
-                return fetch_field_value(store, &current_entity_id, part).await;
-            } else {
-                // Intermediate part - follow the reference
-                let field_type = FieldType::from(*part);
-
-                match store.perform(vec![sread!(current_entity_id.clone(), field_type)]).await {
-                    Ok(results) => {
-                        if let Some(request) = results.first() {
-                            if let Some(Value::EntityReference(Some(ref_entity_id))) = request.value() {
-                                current_entity_id = ref_entity_id.clone();
-                            } else {
-                                return DisplayValue::Error(format!("Field '{}' is not an entity reference or is null", part));
-                            }
-                        } else {
-                            return DisplayValue::Error("No request returned".to_string());
-                        }
-                    }
-                    Err(e) => {
-                        return DisplayValue::Error(format!("Failed to follow reference '{}': {}", part, e));
-                    }
-                }
-            }
-        }
-
-        DisplayValue::Error("Unexpected end of indirection path".to_string())
-    })
+    Ok((results, fields_fetched))
 }
 
 /// Display the results according to the configured format
@@ -601,7 +530,6 @@ fn display_json(entities: &[EntityDisplay], config: &Config) -> Result<()> {
                 DisplayValue::Timestamp(s) => serde_json::Value::String(s.clone()),
                 DisplayValue::Blob(s) => serde_json::Value::String(s.clone()),
                 DisplayValue::None => serde_json::Value::Null,
-                DisplayValue::Error(e) => serde_json::Value::String(format!("ERROR: {}", e)),
             };
             json_entity.insert(field_name.clone(), json_value);
         }
@@ -813,7 +741,6 @@ async fn export_results(entities: &[EntityDisplay], export_path: &std::path::Pat
                 DisplayValue::Timestamp(s) => serde_json::Value::String(s.clone()),
                 DisplayValue::Blob(s) => serde_json::Value::String(s.clone()),
                 DisplayValue::None => serde_json::Value::Null,
-                DisplayValue::Error(e) => serde_json::Value::String(format!("ERROR: {}", e)),
             };
             json_entity.insert(field_name.clone(), json_value);
         }
