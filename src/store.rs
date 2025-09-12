@@ -1,7 +1,6 @@
 use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
 use qlib_rs::auth::{AuthorizationScope, get_scope, authenticate_subject, AuthConfig};
 use crossfire::{mpsc, AsyncRx, MAsyncTx};
-use tokio::time::{interval, Duration};
 use anyhow::Result;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -383,29 +382,28 @@ impl StoreHandle {
 pub struct StoreService {
     config: StoreConfig,
     store: AsyncStore,
-    permission_cache: Option<Cache>,
+    permission_cache: Cache,
     cel_executor: CelExecutor,
     write_channel_task_spawned: bool,
 }
 
 impl StoreService {
-    pub fn spawn(config: StoreConfig) -> StoreHandle {        
+    pub fn spawn(config: StoreConfig) -> StoreHandle {
         let (sender, receiver) = crossfire::mpsc::bounded_async(131072);
 
         tokio::spawn(async move {   
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
             
             // Initialize permission cache
-            let permission_cache = match Cache::new(
+            let (permission_cache, permission_notification_receiver) = match Cache::new(
                 &mut store,
                 et::permission(),
                 vec![ft::resource_type(), ft::resource_field()],
                 vec![ft::scope(), ft::condition()]
             ).await {
-                Ok(cache) => Some(cache),
+                Ok((cache, receiver)) => (cache, receiver),
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to create permission cache, authorization will be disabled");
-                    None
+                    panic!("Failed to create permission cache, authorization will be disabled: {}", e);
                 }
             };
             
@@ -418,22 +416,27 @@ impl StoreService {
                 write_channel_task_spawned: false,
             };
 
-            let mut notification_timer = interval(Duration::from_millis(100)); // Process notifications every 100ms
-
             loop {
                 tokio::select! {
                     request = receiver.recv() => {
-                        if let Ok(request) = request {
-                            service.handle_request(request).await;
-                        } else {
-                            // Channel closed, exit the loop
-                            break;
+                        match request {
+                            Ok(request) => {
+                                service.handle_request(request).await;
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Store service request channel closed");
+                                break;
+                            }
                         }
                     }
-                    _ = notification_timer.tick() => {
-                        // Process cache notifications periodically
-                        if let Some(ref mut cache) = service.permission_cache {
-                            cache.process_notifications();
+                    notification = permission_notification_receiver.recv() => {
+                        match notification {
+                            Ok(notification) => {
+                                service.permission_cache.process_notification(notification);
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Store service permission notification channel closed");
+                            }
                         }
                     }
                 }
@@ -648,22 +651,13 @@ impl StoreService {
     ) -> Result<Vec<Request>> {
         let mut authorized_requests = Vec::new();
 
-        // If permission cache is not available, skip authorization checks
-        let permission_cache = match &self.permission_cache {
-            Some(cache) => cache,
-            None => {
-                tracing::warn!("Permission cache not available, skipping authorization checks");
-                return Ok(requests);
-            }
-        };
-
         for request in requests {
             if let Some(entity_id) = request.entity_id() {
                 if let Some(field_type) = request.field_type() {
                     match get_scope(
                         &mut self.store,
                         &mut self.cel_executor,
-                        permission_cache,
+                        &self.permission_cache,
                         client_id,
                         entity_id,
                         field_type,
