@@ -111,7 +111,6 @@ pub enum PeerRequest {
     OutboundPeerDisconnected {
         peer_addr: String,
     },
-    FullSyncCompleted,
     ProcessPeerMessage {
         peer_msg: PeerMessage,
         peer_addr: String,
@@ -181,12 +180,8 @@ impl PeerHandle {
         }).await;
     }
 
-    pub fn outbound_peer_disconnected(&self, peer_addr: String) {
-        let _ = self.sender.send(PeerRequest::OutboundPeerDisconnected { peer_addr });
-    }
-
-    pub fn full_sync_completed(&self) {
-        let _ = self.sender.send(PeerRequest::FullSyncCompleted);
+    pub async fn outbound_peer_disconnected(&self, peer_addr: String) {
+        let _ = self.sender.send(PeerRequest::OutboundPeerDisconnected { peer_addr }).await;
     }
 
     pub async fn process_peer_message(&self, peer_msg: PeerMessage, peer_addr: String) -> Option<PeerMessage> {
@@ -245,7 +240,7 @@ impl PeerService {
     pub fn spawn(
         config: PeerConfig,
     ) -> PeerHandle {
-        let (sender, receiver) = crossfire::mpsc::bounded_async(500);
+        let (sender, receiver) = crossfire::mpsc::bounded_async(131072);
         
         let startup_time = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
         
@@ -343,18 +338,12 @@ impl PeerService {
                 
                 if let Ok(startup_json) = serde_json::to_string(&startup) {
                     if let Some(sender) = self.connected_outbound_peers.get(&peer_addr) {
-                        let _ = sender.send(Message::Text(startup_json));
+                        let _ = sender.send(Message::Text(startup_json)).await;
                     }
                 }
             }
             PeerRequest::OutboundPeerDisconnected { peer_addr } => {
                 self.connected_outbound_peers.remove(&peer_addr);
-            }
-            PeerRequest::FullSyncCompleted => {
-                self.is_fully_synced = true;
-                self.full_sync_request_pending = false;
-                self.availability_state = AvailabilityState::Available;
-                self.became_unavailable_at = None;
             }
             PeerRequest::ProcessPeerMessage { peer_msg, peer_addr, response } => {
                 let reply = self.process_peer_message_internal(peer_msg, peer_addr).await;
@@ -894,7 +883,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     info!(peer_addr = %peer_addr, "Connected to outbound peer");
     
     let (ws_sender, mut ws_receiver) = ws_stream.split();
-    let (tx, rx) = mpsc::bounded_async::<Message>(1000);
+    let (tx, rx) = mpsc::bounded_async::<Message>(65536);
     
     // Notify the service about the connection - it will handle sending the startup message
     handle.outbound_peer_connected(peer_addr.to_string(), tx.clone()).await;
@@ -942,7 +931,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     }
     
     sender_task.abort();
-    handle_clone.outbound_peer_disconnected(peer_addr_clone);
+    handle_clone.outbound_peer_disconnected(peer_addr_clone).await;
     
     Ok(())
 }

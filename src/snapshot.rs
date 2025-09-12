@@ -76,7 +76,7 @@ pub type SnapshotService = SnapshotManagerTrait<FileManager>;
 
 impl SnapshotService {
     pub fn spawn(config: SnapshotConfig) -> SnapshotHandle {
-        let (sender, receiver) = mpsc::bounded_async(50);
+        let (sender, receiver) = mpsc::bounded_async(1024);
 
         tokio::spawn(async move {
             let mut service = SnapshotService::new(FileManager, config);

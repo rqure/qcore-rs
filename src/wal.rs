@@ -73,7 +73,7 @@ pub type WalService = WalManagerTrait<FileManager>;
 
 impl WalService {
     pub fn spawn(config: WalConfig) -> WalHandle {
-        let (sender, receiver) = crossfire::mpsc::bounded_async(1000);
+        let (sender, receiver) = crossfire::mpsc::bounded_async(131072);
         tokio::spawn(async move {
             let mut service = WalService::new(FileManager, config, None);
             let _ = service.initialize_counter().await;

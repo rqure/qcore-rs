@@ -1,6 +1,6 @@
 use qlib_rs::{et, ft, AsyncStore, Cache, CelExecutor, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, NotificationSender, NotifyConfig, PageOpts, PageResult, Request, Snapshot, Snowflake, StoreTrait};
 use qlib_rs::auth::{AuthorizationScope, get_scope, authenticate_subject, AuthConfig};
-use crossfire::{mpsc, MAsyncTx};
+use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use tokio::time::{interval, Duration};
 use anyhow::Result;
 use std::sync::Arc;
@@ -385,13 +385,12 @@ pub struct StoreService {
     store: AsyncStore,
     permission_cache: Option<Cache>,
     cel_executor: CelExecutor,
-    write_channel_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>,
     write_channel_task_spawned: bool,
 }
 
 impl StoreService {
     pub fn spawn(config: StoreConfig) -> StoreHandle {
-        let (sender, receiver) = crossfire::mpsc::bounded_async(1000);
+        let (sender, receiver) = crossfire::mpsc::bounded_async(131072);
         
         tokio::spawn(async move {
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
@@ -410,15 +409,12 @@ impl StoreService {
                 }
             };
             
-            // Get the write channel receiver for consuming write operations
-            let write_channel_receiver = store.inner().get_write_channel_receiver();
-            
+            // Get the write channel receiver for consuming write operations            
             let mut service = StoreService {
                 config: config.clone(),
                 store,
                 permission_cache,
                 cel_executor: CelExecutor::new(),
-                write_channel_receiver,
                 write_channel_task_spawned: false,
             };
 
@@ -552,8 +548,8 @@ impl StoreService {
             StoreRequest::SetServices { services, response } => {
                 // Spawn the write channel processing task if it hasn't been spawned yet
                 if !self.write_channel_task_spawned {
-                    let write_channel_receiver = self.write_channel_receiver.clone();
                     let config = self.config.clone();
+                    let write_channel_receiver = self.store.inner().get_write_channel_receiver();
                     
                     tokio::spawn(async move {
                         Self::process_write_channel_task(write_channel_receiver, config, services).await;
@@ -570,18 +566,18 @@ impl StoreService {
 
 impl StoreService {
     async fn process_write_channel_task(
-        write_channel_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<Request>>>>,
+        write_channel_receiver: Arc<tokio::sync::Mutex<AsyncRx<Vec<Request>>>>,
         config: StoreConfig,
         services: Services,
     ) {
         loop {
             // Wait for write requests from the channel
             let requests = {
-                let mut receiver_guard = write_channel_receiver.lock().await;
+                let receiver_guard = write_channel_receiver.lock().await;
                 match receiver_guard.recv().await {
-                    Some(requests) => requests,
-                    None => {
-                        tracing::info!("Write channel closed, terminating write channel task");
+                    Ok(requests) => requests,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Write channel closed, terminating write channel task");
                         break;
                     }
                 }

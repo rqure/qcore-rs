@@ -58,7 +58,7 @@ pub struct MiscService {
 
 impl MiscService {
     pub fn spawn(config: MiscConfig) -> MiscHandle {
-        let (sender, receiver) = mpsc::bounded_async(100);
+        let (sender, receiver) = mpsc::bounded_async(1024);
         
         tokio::spawn(async move {
             let mut service = Self {

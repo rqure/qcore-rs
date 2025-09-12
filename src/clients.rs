@@ -173,7 +173,7 @@ pub struct ClientService {
 
 impl ClientService {
     pub fn spawn(config: ClientConfig) -> ClientHandle {
-        let (sender, receiver) = mpsc::bounded_async(1000);
+        let (sender, receiver) = mpsc::bounded_async(131072);
         
         let config_clone = config.clone();
         tokio::spawn(async move {
@@ -772,7 +772,7 @@ async fn handle_client_connection(
     info!("Client authenticated successfully");
     
     // Create a channel for sending messages to this client
-    let (tx, rx) = mpsc::bounded_async::<Message>(1000);
+    let (tx, rx) = mpsc::bounded_async::<Message>(16384);
     
     // Create a notification channel for this client
     let (notification_sender, mut notification_receiver) = notification_channel();
