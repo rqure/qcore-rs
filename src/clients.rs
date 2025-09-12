@@ -775,7 +775,7 @@ async fn handle_client_connection(
     let (tx, rx) = mpsc::bounded_async::<Message>(16384);
     
     // Create a notification channel for this client
-    let (notification_sender, mut notification_receiver) = notification_channel();
+    let (notification_sender, notification_receiver) = notification_channel();
     
     // Register client with the service
     handle.client_connected(client_addr.to_string(), tx.clone(), notification_sender).await;
@@ -784,25 +784,37 @@ async fn handle_client_connection(
     let client_addr_clone_notif = client_addr.to_string();
     let tx_clone_notif = tx.clone();
     let notification_task = tokio::spawn(async move {
-        while let Some(notification) = notification_receiver.recv().await {
-            // Convert notification to StoreMessage and send to client
-            let notification_msg = StoreMessage::Notification { notification };
-            if let Ok(notification_text) = serde_json::to_string(&notification_msg) {
-                if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)).await {
+        loop {
+            match notification_receiver.recv().await {
+                Ok(notification) => {
+                    let notification_msg = StoreMessage::Notification { notification };
+                    if let Ok(notification_text) = serde_json::to_string(&notification_msg) {
+                        if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)).await {
+                            error!(
+                                client_addr = %client_addr_clone_notif,
+                                error = %e,
+                                "Failed to send notification to client"
+                            );
+                            break;
+                        }
+                    } else {
+                        error!(
+                            client_addr = %client_addr_clone_notif,
+                            "Failed to serialize notification for client"
+                        );
+                    }
+                },
+                Err(e) => {
                     error!(
                         client_addr = %client_addr_clone_notif,
                         error = %e,
-                        "Failed to send notification to client"
+                        "Notification channel closed for client"
                     );
                     break;
                 }
-            } else {
-                error!(
-                    client_addr = %client_addr_clone_notif,
-                    "Failed to serialize notification for client"
-                );
             }
         }
+
         debug!(
             client_addr = %client_addr_clone_notif,
             "Notification task ended for client"

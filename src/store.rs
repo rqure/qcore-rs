@@ -389,10 +389,10 @@ pub struct StoreService {
 }
 
 impl StoreService {
-    pub fn spawn(config: StoreConfig) -> StoreHandle {
+    pub fn spawn(config: StoreConfig) -> StoreHandle {        
         let (sender, receiver) = crossfire::mpsc::bounded_async(131072);
-        
-        tokio::spawn(async move {
+
+        tokio::spawn(async move {   
             let mut store = AsyncStore::new(Arc::new(Snowflake::new()));
             
             // Initialize permission cache
