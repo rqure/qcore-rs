@@ -4,7 +4,6 @@ use qlib_rs::{StoreProxy, EntityType, EntityId, Value, FieldType, PageOpts, swri
 use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{info, warn, error, debug};
 use tracing_subscriber;
@@ -81,6 +80,25 @@ enum TestType {
 }
 
 #[derive(Debug, Clone)]
+struct ClientResult {
+    total_requests: u64,
+    successful_requests: u64,
+    failed_requests: u64,
+    latencies: Vec<Duration>,
+}
+
+impl ClientResult {
+    fn new() -> Self {
+        Self {
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            latencies: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct TestResult {
     total_requests: u64,
     successful_requests: u64,
@@ -96,6 +114,19 @@ impl TestResult {
             failed_requests: 0,
             latencies: Vec::new(),
         }
+    }
+
+    fn merge_from_clients(client_results: &[ClientResult]) -> Self {
+        let mut result = Self::new();
+        
+        for client_result in client_results {
+            result.total_requests += client_result.total_requests;
+            result.successful_requests += client_result.successful_requests;
+            result.failed_requests += client_result.failed_requests;
+            result.latencies.extend(client_result.latencies.iter().cloned());
+        }
+        
+        result
     }
 }
 
@@ -146,8 +177,7 @@ async fn run_test_client(
     core_url: String,
     test_entities: Arc<Vec<EntityId>>,
     test_entity_id: EntityId,
-    stats: Arc<Mutex<TestResult>>,
-) -> Result<()> {
+) -> Result<ClientResult> {
     let mut store = StoreProxy::connect_and_authenticate(
         &core_url,
         &config.username,
@@ -164,7 +194,7 @@ async fn run_test_client(
         None
     };
 
-    let mut request_count = 0u64;
+    let mut local_stats = ClientResult::new();
     let mut last_request_time = Instant::now();
 
     while start_time.elapsed() < test_duration {
@@ -193,24 +223,20 @@ async fn run_test_client(
             }
         };
 
-        request_count += 1;
         let latency = request_start.elapsed();
 
-        // Update shared statistics
-        {
-            let mut stats_guard = stats.lock().await;
-            stats_guard.total_requests += 1;
-            if success {
-                stats_guard.successful_requests += 1;
-            } else {
-                stats_guard.failed_requests += 1;
-            }
-            stats_guard.latencies.push(latency);
+        // Update local statistics (no locking needed)
+        local_stats.total_requests += 1;
+        if success {
+            local_stats.successful_requests += 1;
+        } else {
+            local_stats.failed_requests += 1;
         }
+        local_stats.latencies.push(latency);
     }
 
-    debug!("Client {} completed {} requests", client_id, request_count);
-    Ok(())
+    debug!("Client {} completed {} requests", client_id, local_stats.total_requests);
+    Ok(local_stats)
 }
 
 async fn perform_test_operation(
@@ -333,9 +359,6 @@ async fn main() -> Result<()> {
     // Load test data
     let test_entities = Arc::new(setup_test_data(&config).await?);
 
-    // Shared statistics
-    let stats = Arc::new(Mutex::new(TestResult::new()));
-
     // Warmup phase
     if config.warmup > 0 {
         info!("Starting warmup phase ({} seconds)...", config.warmup);
@@ -345,26 +368,24 @@ async fn main() -> Result<()> {
             ..(*config).clone()
         });
         
-        let warmup_stats = Arc::new(Mutex::new(TestResult::new()));
         let mut warmup_handles = Vec::new();
         
         for i in 0..warmup_config.clients {
             let warmup_config_clone = warmup_config.clone();
             let test_entities_clone = test_entities.clone();
             let test_entity_id_clone = test_entity_id.clone();
-            let warmup_stats_clone = warmup_stats.clone();
             let core_url = config.core_urls[i % config.core_urls.len()].clone();
             
             let handle = tokio::spawn(async move {
-                if let Err(e) = run_test_client(
+                match run_test_client(
                     warmup_config_clone,
                     i,
                     core_url,
                     test_entities_clone,
                     test_entity_id_clone,
-                    warmup_stats_clone,
                 ).await {
-                    warn!("Warmup client {} failed: {}", i, e);
+                    Ok(_) => {},
+                    Err(e) => warn!("Warmup client {} failed: {}", i, e),
                 }
             });
             warmup_handles.push(handle);
@@ -387,37 +408,38 @@ async fn main() -> Result<()> {
         let config_clone = config.clone();
         let test_entities_clone = test_entities.clone();
         let test_entity_id_clone = test_entity_id.clone();
-        let stats_clone = stats.clone();
         let core_url = config.core_urls[i % config.core_urls.len()].clone();
         
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_test_client(
+            run_test_client(
                 config_clone,
                 i,
                 core_url,
                 test_entities_clone,
                 test_entity_id_clone,
-                stats_clone,
-            ).await {
-                error!("Client {} failed: {}", i, e);
-            }
+            ).await
         });
         handles.push(handle);
     }
 
-    // Wait for all clients to complete
+    // Wait for all clients to complete and collect results
+    let mut client_results = Vec::new();
     for handle in handles {
-        let _ = handle.await;
+        match handle.await {
+            Ok(Ok(result)) => client_results.push(result),
+            Ok(Err(e)) => error!("Client failed: {}", e),
+            Err(e) => error!("Client task panicked: {}", e),
+        }
     }
 
     let test_duration = test_start.elapsed();
     
-    // Calculate and display results
-    let stats_guard = stats.lock().await;
-    let total_requests = stats_guard.total_requests;
-    let successful_requests = stats_guard.successful_requests;
-    let failed_requests = stats_guard.failed_requests;
-    let mut latencies = stats_guard.latencies.clone();
+    // Merge client results into global summary
+    let stats = TestResult::merge_from_clients(&client_results);
+    let total_requests = stats.total_requests;
+    let successful_requests = stats.successful_requests;
+    let failed_requests = stats.failed_requests;
+    let mut latencies = stats.latencies;
 
     latencies.sort();
     let avg_rps = total_requests as f64 / test_duration.as_secs_f64();
