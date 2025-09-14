@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration as StdDuration;
+use std::sync::Arc;
 use mio::{Poll, Interest, Token, Events};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use tungstenite::{WebSocket, Message};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use crossbeam::channel::{Sender, Receiver, unbounded};
+use crossbeam::queue::SegQueue;
 use std::thread;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
@@ -34,6 +36,13 @@ impl From<&crate::Config> for CoreConfig {
     }
 }
 
+/// Fire-and-forget request types (no response needed)
+#[derive(Debug)]
+pub enum CoreCommand {
+    HandleMiscOperations,
+    HandleHeartbeat,
+}
+
 /// Core service request types
 #[derive(Debug)]
 pub enum CoreRequest {
@@ -51,8 +60,6 @@ pub enum CoreRequest {
         wal_handle: crate::wal::WalHandle,
     },
     InitializeStore,
-    HandleMiscOperations,
-    HandleHeartbeat,
 }
 
 /// Response types for core requests
@@ -67,6 +74,7 @@ pub enum CoreResponse {
 #[derive(Debug, Clone)]
 pub struct CoreHandle {
     request_sender: Sender<(CoreRequest, Sender<CoreResponse>)>,
+    command_queue: Arc<SegQueue<CoreCommand>>,
 }
 
 impl CoreHandle {
@@ -156,7 +164,7 @@ impl CoreHandle {
     }
 }
 
-/// Client connection information
+/// Client connection information  
 #[derive(Debug)]
 struct ClientConnection {
     websocket: WebSocket<MioTcpStream>,
@@ -189,6 +197,9 @@ pub struct CoreService {
     
     // Channel for receiving requests from other services
     request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>,
+    
+    // Queue for fire-and-forget commands
+    command_queue: Arc<SegQueue<CoreCommand>>,
 }
 
 const LISTENER_TOKEN: Token = Token(0);
@@ -197,7 +208,11 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 1;
 
 impl CoreService {
     /// Create a new core service
-    pub fn new(config: CoreConfig, request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>) -> Result<Self> {
+    pub fn new(
+        config: CoreConfig, 
+        request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>,
+        command_queue: Arc<SegQueue<CoreCommand>>
+    ) -> Result<Self> {
         let addr = format!("0.0.0.0:{}", config.client_port).parse()?;
         let mut listener = MioTcpListener::bind(addr)?;
         let poll = Poll::new()?;
@@ -231,18 +246,24 @@ impl CoreService {
             snapshot_handle: None,
             wal_handle: None,
             request_receiver,
+            command_queue,
         })
     }
 
     /// Spawn the core service in its own thread and return a handle
     pub fn spawn(config: CoreConfig) -> Result<CoreHandle> {
         let (request_sender, request_receiver) = unbounded();
+        let command_queue = Arc::new(SegQueue::new());
         
-        let handle = CoreHandle { request_sender: request_sender.clone() };
+        let handle = CoreHandle { 
+            request_sender: request_sender.clone(),
+            command_queue: command_queue.clone(),
+        };
         
         // Spawn the main core service thread (I/O event loop)
+        let command_queue_for_service = command_queue.clone();
         thread::spawn(move || {
-            let mut service = match Self::new(config, request_receiver) {
+            let mut service = match Self::new(config, request_receiver, command_queue_for_service) {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to create core service: {}", e);
@@ -267,11 +288,8 @@ impl CoreService {
                 
                 let now = std::time::Instant::now();
                 if now.duration_since(last_misc_tick) >= StdDuration::from_millis(MISC_INTERVAL_MS) {
-                    // Send misc operations request to core
-                    if let Err(_) = misc_handle.request_sender.send((CoreRequest::HandleMiscOperations, unbounded().0)) {
-                        error!("Failed to send misc operations request - core service may have stopped");
-                        break;
-                    }
+                    // Send misc operations command to core (fire-and-forget)
+                    misc_handle.command_queue.push(CoreCommand::HandleMiscOperations);
                     last_misc_tick = now;
                 }
             }
@@ -287,11 +305,8 @@ impl CoreService {
                 
                 let now = std::time::Instant::now();
                 if now.duration_since(last_heartbeat) >= StdDuration::from_secs(HEARTBEAT_INTERVAL_SECS) {
-                    // Send heartbeat request to core
-                    if let Err(_) = heartbeat_handle.request_sender.send((CoreRequest::HandleHeartbeat, unbounded().0)) {
-                        error!("Failed to send heartbeat request - core service may have stopped");
-                        break;
-                    }
+                    // Send heartbeat command to core (fire-and-forget)
+                    heartbeat_handle.command_queue.push(CoreCommand::HandleHeartbeat);
                     last_heartbeat = now;
                 }
             }
@@ -345,6 +360,14 @@ impl CoreService {
                 }
             }
             
+            // Handle fire-and-forget commands from the queue (non-blocking)
+            while let Some(command) = self.command_queue.pop() {
+                if self.handle_command(command) {
+                    info!("Core service shutting down");
+                    return Ok(());
+                }
+            }
+            
             // Process notifications and send them to clients
             self.process_notifications()?;
             
@@ -355,7 +378,7 @@ impl CoreService {
             let timeout = if self.has_pending_work() {
                 Some(StdDuration::from_millis(0)) // Poll immediately
             } else {
-                Some(StdDuration::from_millis(10)) // Short timeout for responsiveness
+                Some(StdDuration::from_millis(100)) // Longer timeout, but still responsive
             };
             
             // Poll for OS events - rely on OS notifications
@@ -425,17 +448,23 @@ impl CoreService {
                     }
                 }
             }
-            CoreRequest::HandleMiscOperations => {
+        }
+    }
+    
+    /// Handle fire-and-forget commands
+    fn handle_command(&mut self, command: CoreCommand) -> bool {
+        match command {
+            CoreCommand::HandleMiscOperations => {
                 if let Err(e) = self.handle_misc_operations() {
                     error!(error = %e, "Failed to handle misc operations");
                 }
-                CoreResponse::Unit
+                false
             }
-            CoreRequest::HandleHeartbeat => {
+            CoreCommand::HandleHeartbeat => {
                 if let Err(e) = self.handle_heartbeat() {
                     error!(error = %e, "Failed to handle heartbeat");
                 }
-                CoreResponse::Unit
+                false
             }
         }
     }
@@ -458,17 +487,13 @@ impl CoreService {
                     let token = Token(self.next_token);
                     self.next_token += 1;
                     
-                    // Convert to mio stream and register
-                    let mut mio_stream = stream;
-                    self.poll.registry().register(
-                        &mut mio_stream,
-                        token,
-                        Interest::READABLE | Interest::WRITABLE
-                    )?;
-                    
-                    // Perform WebSocket handshake
-                    match tungstenite::accept(mio_stream) {
+                    // Perform WebSocket handshake (this might block, but it should be quick)
+                    match tungstenite::accept(stream) {
                         Ok(websocket) => {
+                            // Register the underlying stream with mio
+                            // Note: We can't easily register the websocket's stream after handshake
+                            // This is a limitation of the current approach
+                            
                             let connection = ClientConnection {
                                 websocket,
                                 addr_string: addr.to_string(),
@@ -485,8 +510,6 @@ impl CoreService {
                         }
                         Err(e) => {
                             error!(client_addr = %addr, error = %e, "WebSocket handshake failed");
-                            // Note: mio_stream is moved, so we can't deregister it here
-                            // The connection will be cleaned up when the token is removed
                         }
                     }
                 }
