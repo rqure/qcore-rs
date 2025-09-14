@@ -82,18 +82,9 @@ pub struct PeerInfo {
 /// Result of an asynchronous connection attempt
 #[derive(Debug)]
 enum ConnectionResult {
-    InboundSuccess {
-        addr: SocketAddr,
-        websocket: WebSocket<MioTcpStream>,
-    },
     OutboundSuccess {
         peer_addr: String,
-        addr: SocketAddr,
         websocket: WebSocket<MioTcpStream>,
-    },
-    InboundFailure {
-        addr: SocketAddr,
-        error: String,
     },
     OutboundFailure {
         peer_addr: String,
@@ -123,6 +114,13 @@ pub enum PeerRequest {
     SetCoreHandle {
         handle: crate::core::CoreHandle,
     },
+    ProcessPeerMessage {
+        peer_msg: PeerMessage,
+        peer_addr: String,
+    },
+    IsOutboundPeerConnected {
+        peer_addr: String,
+    },
 }
 
 /// Response types for peer requests
@@ -131,6 +129,8 @@ pub enum PeerResponse {
     Unit,
     AvailabilityState(AvailabilityState),
     LeadershipInfo(bool, Option<String>), // (is_leader, current_leader)
+    PeerMessage(Option<PeerMessage>),
+    IsConnected(bool),
 }
 
 /// Handle for communicating with peer service
@@ -194,23 +194,54 @@ impl PeerHandle {
             error!(error = %e, "Failed to send set core handle request to peer service");
         }
     }
+
+    /// Process a peer message and get potential response
+    pub fn process_peer_message(&self, peer_msg: PeerMessage, peer_addr: String) -> Option<PeerMessage> {
+        let (response_tx, response_rx) = unbounded();
+        if let Err(e) = self.request_sender.send((PeerRequest::ProcessPeerMessage { peer_msg, peer_addr }, response_tx)) {
+            error!(error = %e, "Failed to send process peer message request to peer service");
+            return None;
+        }
+        
+        match response_rx.recv() {
+            Ok(PeerResponse::PeerMessage(response)) => response,
+            _ => {
+                error!("Failed to receive peer message response from peer service");
+                None
+            }
+        }
+    }
+
+    /// Check if we already have an outbound connection to a peer
+    pub fn is_outbound_peer_connected(&self, peer_addr: &str) -> bool {
+        let (response_tx, response_rx) = unbounded();
+        if let Err(e) = self.request_sender.send((PeerRequest::IsOutboundPeerConnected { peer_addr: peer_addr.to_string() }, response_tx)) {
+            error!(error = %e, "Failed to send is outbound peer connected request to peer service");
+            return false;
+        }
+        
+        match response_rx.recv() {
+            Ok(PeerResponse::IsConnected(is_connected)) => is_connected,
+            _ => {
+                error!("Failed to receive is outbound peer connected response from peer service");
+                false
+            }
+        }
+    }
 }
 
 /// Connection state for peer connections
 #[derive(Debug)]
 enum PeerConnectionState {
     Connected(WebSocket<MioTcpStream>),
-    Failed,
 }
 
 /// Information about a peer connection
 #[derive(Debug)]
 struct PeerConnection {
-    addr: SocketAddr,
     addr_string: String,
     state: PeerConnectionState,
     outbound_messages: VecDeque<String>,
-    is_outbound: bool,
 }
 
 pub struct PeerService {
@@ -277,7 +308,6 @@ fn connection_worker(
                                     info!(peer_addr = %peer_addr, "Outbound peer connection established");
                                     let _ = connection_result_sender.send(ConnectionResult::OutboundSuccess {
                                         peer_addr,
-                                        addr,
                                         websocket,
                                     });
                                 }
@@ -426,14 +456,13 @@ impl PeerService {
         }
     }
     
-    fn handle_new_peer_connection(&mut self, connection_result_sender: &Sender<ConnectionResult>) -> Result<()> {
+    fn handle_new_peer_connection(&mut self, _connection_result_sender: &Sender<ConnectionResult>) -> Result<()> {
         loop {
             match self.listener.accept() {
                 Ok((stream, addr)) => {
                     info!(peer_addr = %addr, "Accepting inbound peer connection");
                     
-                    // For now, we'll handle the handshake directly but quickly
-                    // In a production system, you'd want a more sophisticated approach
+                    // Complete WebSocket handshake directly - this may block briefly but should be fast
                     match tungstenite::accept(stream) {
                         Ok(mut websocket) => {
                             let token = Token(self.next_token);
@@ -450,11 +479,9 @@ impl PeerService {
                             }
                             
                             let connection = PeerConnection {
-                                addr,
                                 addr_string: addr.to_string(),
                                 state: PeerConnectionState::Connected(websocket),
                                 outbound_messages: VecDeque::new(),
-                                is_outbound: false,
                             };
                             
                             self.connections.insert(token, connection);
@@ -463,7 +490,7 @@ impl PeerService {
                             self.send_startup_message_to_peer(&addr.to_string());
                         }
                         Err(e) => {
-                            error!(peer_addr = %addr, error = %e, "Failed to complete WebSocket handshake for inbound connection");
+                            debug!(peer_addr = %addr, error = %e, "Failed to complete WebSocket handshake for inbound connection");
                         }
                     }
                 }
@@ -521,58 +548,57 @@ impl PeerService {
     fn handle_peer_read(&mut self, token: Token) -> Result<bool> {
         let mut messages_to_process = Vec::new();
         let peer_addr_string = if let Some(connection) = self.connections.get_mut(&token) {
-            if let PeerConnectionState::Connected(websocket) = &mut connection.state {
-                loop {
-                    match websocket.read() {
-                        Ok(Message::Text(text)) => {
-                            // Check if this is a binary wrapper message
-                            if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if let Some(base64_data) = wrapper.get("binary_message").and_then(|v| v.as_str()) {
-                                    // Decode binary message
-                                    use base64::Engine;
-                                    if let Ok(binary_data) = base64::engine::general_purpose::STANDARD.decode(base64_data) {
-                                        if let Ok(peer_message) = bincode::deserialize::<PeerMessage>(&binary_data) {
-                                            messages_to_process.push(peer_message);
-                                        } else {
-                                            warn!(peer_addr = %connection.addr_string, "Failed to deserialize binary peer message");
-                                        }
-                                    } else {
-                                        warn!(peer_addr = %connection.addr_string, "Failed to decode base64 binary message");
-                                    }
-                                } else {
-                                    // Regular JSON message
-                                    if let Ok(peer_message) = serde_json::from_str::<PeerMessage>(&text) {
+            let PeerConnectionState::Connected(websocket) = &mut connection.state;
+            loop {
+                match websocket.read() {
+                    Ok(Message::Text(text)) => {
+                        // Check if this is a binary wrapper message
+                        if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(base64_data) = wrapper.get("binary_message").and_then(|v| v.as_str()) {
+                                // Decode binary message
+                                use base64::Engine;
+                                if let Ok(binary_data) = base64::engine::general_purpose::STANDARD.decode(base64_data) {
+                                    if let Ok(peer_message) = bincode::deserialize::<PeerMessage>(&binary_data) {
                                         messages_to_process.push(peer_message);
                                     } else {
-                                        warn!(peer_addr = %connection.addr_string, "Received invalid JSON from peer");
+                                        warn!(peer_addr = %connection.addr_string, "Failed to deserialize binary peer message");
                                     }
+                                } else {
+                                    warn!(peer_addr = %connection.addr_string, "Failed to decode base64 binary message");
                                 }
                             } else {
-                                // Try to parse as regular peer message
+                                // Regular JSON message
                                 if let Ok(peer_message) = serde_json::from_str::<PeerMessage>(&text) {
                                     messages_to_process.push(peer_message);
                                 } else {
                                     warn!(peer_addr = %connection.addr_string, "Received invalid JSON from peer");
                                 }
                             }
+                        } else {
+                            // Try to parse as regular peer message
+                            if let Ok(peer_message) = serde_json::from_str::<PeerMessage>(&text) {
+                                messages_to_process.push(peer_message);
+                            } else {
+                                warn!(peer_addr = %connection.addr_string, "Received invalid JSON from peer");
+                            }
                         }
-                        Ok(Message::Binary(_)) => {
-                            warn!(peer_addr = %connection.addr_string, "Received unexpected binary message from peer");
-                        }
-                        Ok(Message::Close(_)) => {
-                            info!(peer_addr = %connection.addr_string, "Peer closed connection");
-                            return Ok(false); // Should remove connection
-                        }
-                        Ok(_) => {
-                            // Ping/Pong frames, ignore
-                        }
-                        Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            break; // No more messages to read
-                        }
-                        Err(e) => {
-                            error!(peer_addr = %connection.addr_string, error = %e, "Error reading from peer WebSocket");
-                            return Ok(false); // Should remove connection
-                        }
+                    }
+                    Ok(Message::Binary(_)) => {
+                        warn!(peer_addr = %connection.addr_string, "Received unexpected binary message from peer");
+                    }
+                    Ok(Message::Close(_)) => {
+                        info!(peer_addr = %connection.addr_string, "Peer closed connection");
+                        return Ok(false); // Should remove connection
+                    }
+                    Ok(_) => {
+                        // Ping/Pong frames, ignore
+                    }
+                    Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        break; // No more messages to read
+                    }
+                    Err(e) => {
+                        error!(peer_addr = %connection.addr_string, error = %e, "Error reading from peer WebSocket");
+                        return Ok(false); // Should remove connection
                     }
                 }
             }
@@ -591,22 +617,21 @@ impl PeerService {
     
     fn handle_peer_write(&mut self, token: Token) -> Result<()> {
         if let Some(connection) = self.connections.get_mut(&token) {
-            if let PeerConnectionState::Connected(websocket) = &mut connection.state {
-                // Send any pending outbound messages
-                while let Some(message) = connection.outbound_messages.pop_front() {
-                    match websocket.send(Message::Text(message.clone())) {
-                        Ok(()) => {
-                            // Message sent successfully
-                        }
-                        Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // Put the message back and try again later
-                            connection.outbound_messages.push_front(message);
-                            break;
-                        }
-                        Err(e) => {
-                            error!(peer_addr = %connection.addr_string, error = %e, "Error writing to peer WebSocket");
-                            return Err(e.into());
-                        }
+            let PeerConnectionState::Connected(websocket) = &mut connection.state;
+            // Send any pending outbound messages
+            while let Some(message) = connection.outbound_messages.pop_front() {
+                match websocket.send(Message::Text(message.clone())) {
+                    Ok(()) => {
+                        // Message sent successfully
+                    }
+                    Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Put the message back and try again later
+                        connection.outbound_messages.push_front(message);
+                        break;
+                    }
+                    Err(e) => {
+                        error!(peer_addr = %connection.addr_string, error = %e, "Error writing to peer WebSocket");
+                        return Err(e.into());
                     }
                 }
             }
@@ -669,35 +694,7 @@ impl PeerService {
     
     fn handle_connection_result(&mut self, result: ConnectionResult, _connection_result_sender: &Sender<ConnectionResult>) -> Result<()> {
         match result {
-            ConnectionResult::InboundSuccess { addr, mut websocket } => {
-                let token = Token(self.next_token);
-                self.next_token += 1;
-                
-                // Register the websocket stream for read/write events
-                if let Err(e) = self.poll.registry().register(
-                    websocket.get_mut(), 
-                    token, 
-                    Interest::READABLE | Interest::WRITABLE
-                ) {
-                    error!(peer_addr = %addr, error = %e, "Failed to register inbound websocket with poll");
-                    return Ok(());
-                }
-                
-                let connection = PeerConnection {
-                    addr,
-                    addr_string: addr.to_string(),
-                    state: PeerConnectionState::Connected(websocket),
-                    outbound_messages: VecDeque::new(),
-                    is_outbound: false,
-                };
-                
-                self.connections.insert(token, connection);
-                info!(peer_addr = %addr, "Inbound peer connection registered");
-                
-                // Send our startup message to the new peer
-                self.send_startup_message_to_peer(&addr.to_string());
-            }
-            ConnectionResult::OutboundSuccess { peer_addr, addr, mut websocket } => {
+            ConnectionResult::OutboundSuccess { peer_addr, mut websocket } => {
                 let token = Token(self.next_token);
                 self.next_token += 1;
                 
@@ -712,11 +709,9 @@ impl PeerService {
                 }
                 
                 let connection = PeerConnection {
-                    addr,
                     addr_string: peer_addr.clone(),
                     state: PeerConnectionState::Connected(websocket),
                     outbound_messages: VecDeque::new(),
-                    is_outbound: true,
                 };
                 
                 self.connections.insert(token, connection);
@@ -724,9 +719,6 @@ impl PeerService {
                 
                 // Send our startup message to the new peer
                 self.send_startup_message_to_peer(&peer_addr);
-            }
-            ConnectionResult::InboundFailure { addr, error } => {
-                debug!(peer_addr = %addr, error = %error, "Inbound connection failed");
             }
             ConnectionResult::OutboundFailure { peer_addr, error } => {
                 debug!(peer_addr = %peer_addr, error = %error, "Outbound connection failed");
@@ -762,6 +754,18 @@ impl PeerService {
             PeerRequest::SetCoreHandle { handle } => {
                 self.core_handle = Some(handle);
                 PeerResponse::Unit
+            }
+            PeerRequest::ProcessPeerMessage { peer_msg, peer_addr } => {
+                // Since we're already inside the service, we can handle this directly
+                // This is mainly for external processing of peer messages
+                self.handle_peer_message_internal(peer_msg, &peer_addr);
+                PeerResponse::PeerMessage(None)
+            }
+            PeerRequest::IsOutboundPeerConnected { peer_addr } => {
+                // Check if we have any connection with this peer address (both inbound and outbound)
+                let is_connected = self.connections.values()
+                    .any(|conn| conn.addr_string == peer_addr);
+                PeerResponse::IsConnected(is_connected)
             }
         }
     }
@@ -965,14 +969,13 @@ impl PeerService {
             if let Ok(json) = serde_json::to_string(&message) {
                 // Send to all connected peers
                 for connection in self.connections.values_mut() {
-                    if let PeerConnectionState::Connected(_) = connection.state {
-                        connection.outbound_messages.push_back(json.clone());
-                        debug!(
-                            peer_addr = %connection.addr_string,
-                            count = requests_to_sync.len(),
-                            "Sent sync requests to peer"
-                        );
-                    }
+                    let PeerConnectionState::Connected(_) = connection.state;
+                    connection.outbound_messages.push_back(json.clone());
+                    debug!(
+                        peer_addr = %connection.addr_string,
+                        count = requests_to_sync.len(),
+                        "Sent sync requests to peer"
+                    );
                 }
             }
         }
