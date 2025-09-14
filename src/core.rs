@@ -51,6 +51,8 @@ pub enum CoreRequest {
         wal_handle: crate::wal::WalHandle,
     },
     InitializeStore,
+    HandleMiscOperations,
+    HandleHeartbeat,
 }
 
 /// Response types for core requests
@@ -187,10 +189,6 @@ pub struct CoreService {
     
     // Channel for receiving requests from other services
     request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>,
-    
-    // Timing for misc operations
-    last_misc_tick: std::time::Instant,
-    last_heartbeat: std::time::Instant,
 }
 
 const LISTENER_TOKEN: Token = Token(0);
@@ -220,8 +218,6 @@ impl CoreService {
         ).map_err(|e| anyhow::anyhow!("Failed to create permission cache: {}", e))?;
         let cel_executor = CelExecutor::new();
         
-        let now = std::time::Instant::now();
-        
         Ok(Self {
             config,
             listener,
@@ -235,8 +231,6 @@ impl CoreService {
             snapshot_handle: None,
             wal_handle: None,
             request_receiver,
-            last_misc_tick: now,
-            last_heartbeat: now,
         })
     }
 
@@ -244,8 +238,9 @@ impl CoreService {
     pub fn spawn(config: CoreConfig) -> Result<CoreHandle> {
         let (request_sender, request_receiver) = unbounded();
         
-        let handle = CoreHandle { request_sender };
+        let handle = CoreHandle { request_sender: request_sender.clone() };
         
+        // Spawn the main core service thread (I/O event loop)
         thread::spawn(move || {
             let mut service = match Self::new(config, request_receiver) {
                 Ok(s) => s,
@@ -260,6 +255,46 @@ impl CoreService {
             }
             
             error!("Core service has stopped unexpectedly");
+        });
+        
+        // Spawn background scheduler thread for misc operations
+        let misc_handle = handle.clone();
+        thread::spawn(move || {
+            let mut last_misc_tick = std::time::Instant::now();
+            
+            loop {
+                thread::sleep(StdDuration::from_millis(MISC_INTERVAL_MS));
+                
+                let now = std::time::Instant::now();
+                if now.duration_since(last_misc_tick) >= StdDuration::from_millis(MISC_INTERVAL_MS) {
+                    // Send misc operations request to core
+                    if let Err(_) = misc_handle.request_sender.send((CoreRequest::HandleMiscOperations, unbounded().0)) {
+                        error!("Failed to send misc operations request - core service may have stopped");
+                        break;
+                    }
+                    last_misc_tick = now;
+                }
+            }
+        });
+        
+        // Spawn background scheduler thread for heartbeat
+        let heartbeat_handle = handle.clone();
+        thread::spawn(move || {
+            let mut last_heartbeat = std::time::Instant::now();
+            
+            loop {
+                thread::sleep(StdDuration::from_secs(HEARTBEAT_INTERVAL_SECS));
+                
+                let now = std::time::Instant::now();
+                if now.duration_since(last_heartbeat) >= StdDuration::from_secs(HEARTBEAT_INTERVAL_SECS) {
+                    // Send heartbeat request to core
+                    if let Err(_) = heartbeat_handle.request_sender.send((CoreRequest::HandleHeartbeat, unbounded().0)) {
+                        error!("Failed to send heartbeat request - core service may have stopped");
+                        break;
+                    }
+                    last_heartbeat = now;
+                }
+            }
         });
         
         Ok(handle)
@@ -297,7 +332,7 @@ impl CoreService {
         Ok(())
     }
     
-    /// Run the main event loop
+    /// Run the main event loop (pure I/O event handling)
     pub fn run(&mut self) -> Result<()> {
         let mut events = Events::with_capacity(1024);
         
@@ -310,20 +345,23 @@ impl CoreService {
                 }
             }
             
-            // Calculate timeout for next operation
-            let now = std::time::Instant::now();
-            let next_misc = self.last_misc_tick + StdDuration::from_millis(MISC_INTERVAL_MS);
-            let next_heartbeat = self.last_heartbeat + StdDuration::from_secs(HEARTBEAT_INTERVAL_SECS);
+            // Process notifications and send them to clients
+            self.process_notifications()?;
             
-            let timeout = std::cmp::min(
-                next_misc.saturating_duration_since(now),
-                next_heartbeat.saturating_duration_since(now)
-            );
+            // Process any pending write requests from the store
+            self.process_write_requests()?;
             
-            // Poll for events with timeout
-            self.poll.poll(&mut events, Some(timeout))?;
+            // Calculate timeout - use immediate poll if we have pending work
+            let timeout = if self.has_pending_work() {
+                Some(StdDuration::from_millis(0)) // Poll immediately
+            } else {
+                Some(StdDuration::from_millis(10)) // Short timeout for responsiveness
+            };
             
-            // Handle mio events
+            // Poll for OS events - rely on OS notifications
+            self.poll.poll(&mut events, timeout)?;
+            
+            // Handle all mio events
             for event in events.iter() {
                 match event.token() {
                     LISTENER_TOKEN => {
@@ -336,28 +374,15 @@ impl CoreService {
                     }
                 }
             }
-            
-            let now = std::time::Instant::now();
-            
-            // Handle misc operations
-            if now >= next_misc {
-                self.handle_misc_operations()?;
-                self.check_availability_state()?;
-                self.last_misc_tick = now;
-            }
-            
-            // Handle heartbeat
-            if now >= next_heartbeat {
-                self.handle_heartbeat()?;
-                self.last_heartbeat = now;
-            }
-            
-            // Process notifications and send them to clients
-            self.process_notifications()?;
-            
-            // Process any pending write requests from the store
-            self.process_write_requests()?;
         }
+    }
+    
+    /// Check if there's any pending work that requires immediate attention
+    fn has_pending_work(&self) -> bool {
+        // Check for pending outbound messages
+        self.connections.values().any(|conn| !conn.outbound_messages.is_empty()) ||
+        // Check for pending requests
+        !self.request_receiver.is_empty()
     }
     
     /// Handle requests from other services
@@ -399,6 +424,18 @@ impl CoreService {
                         CoreResponse::Unit // Still return unit, but log the error
                     }
                 }
+            }
+            CoreRequest::HandleMiscOperations => {
+                if let Err(e) = self.handle_misc_operations() {
+                    error!(error = %e, "Failed to handle misc operations");
+                }
+                CoreResponse::Unit
+            }
+            CoreRequest::HandleHeartbeat => {
+                if let Err(e) = self.handle_heartbeat() {
+                    error!(error = %e, "Failed to handle heartbeat");
+                }
+                CoreResponse::Unit
             }
         }
     }
@@ -471,6 +508,7 @@ impl CoreService {
         }
         
         let mut should_remove = false;
+        let mut messages_processed = false;
         
         if readable {
             match self.handle_client_read(token) {
@@ -485,11 +523,14 @@ impl CoreService {
                     }
                     should_remove = true;
                 }
-                Ok(true) => {}
+                Ok(true) => {
+                    messages_processed = true;
+                }
             }
         }
         
-        if writable && !should_remove {
+        // If we processed messages or if writable event occurred, try to write
+        if (writable || messages_processed) && !should_remove {
             if let Err(e) = self.handle_client_write(token) {
                 if let Some(connection) = self.connections.get(&token) {
                     error!(
@@ -1270,30 +1311,5 @@ impl CoreService {
         } else {
             false
         }
-    }
-    
-    /// Force disconnect all clients (used when transitioning to unavailable state)
-    pub fn force_disconnect_all_clients(&mut self) {
-        info!("Force disconnecting all clients");
-        
-        let tokens_to_remove: Vec<Token> = self.connections.keys().cloned().collect();
-        
-        for token in tokens_to_remove {
-            self.remove_client(token);
-        }
-    }
-    
-    /// Check if we should force disconnect clients based on availability state
-    fn check_availability_state(&mut self) -> Result<()> {
-        if let Some(peer_handle) = &self.peer_handle {
-            let availability_state = peer_handle.get_availability_state();
-            
-            if availability_state == AvailabilityState::Unavailable {
-                // Force disconnect all clients when unavailable
-                self.force_disconnect_all_clients();
-            }
-        }
-        
-        Ok(())
     }
 }
