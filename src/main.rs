@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
+use tracing::error;
 
 use crate::{
     core::{CoreConfig, CoreService},
@@ -75,24 +76,21 @@ fn main() -> Result<()> {
     // Initialize tracing with better structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "qcore_rs=debug,qlib_rs=debug".to_string())
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("qcore_rs=debug".parse().unwrap())
+                .add_directive("info".parse().unwrap())
         )
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(cfg!(debug_assertions))
-        .with_line_number(cfg!(debug_assertions))
         .init();
 
     // Create service handles (each runs in its own thread)
     let snapshot_handle = SnapshotService::spawn(SnapshotConfig {
-        snapshots_dir: PathBuf::from(&config.data_dir).join(&config.machine).join("snapshots"),
+        snapshots_dir: PathBuf::from(&config.data_dir).join("snapshots"),
         max_files: config.snapshot_max_files,
     });
     
     let wal_handle = WalService::spawn(WalConfig {
-        wal_dir: PathBuf::from(&config.data_dir).join(&config.machine).join("wal"),
-        max_file_size: config.wal_max_file_size * 1024 * 1024,
+        wal_dir: PathBuf::from(&config.data_dir).join("wal"),
+        max_file_size: config.wal_max_file_size * 1024 * 1024, // Convert MB to bytes
         max_files: config.wal_max_files,
         snapshot_wal_interval: config.snapshot_wal_interval,
         machine_id: config.machine.clone(),
@@ -100,34 +98,42 @@ fn main() -> Result<()> {
     
     let peer_handle = PeerService::spawn(PeerConfig::from(&config));
     
+    // Create the core service (runs in its own thread)
+    let core_handle = CoreService::spawn(CoreConfig::from(&config))?;
+    
     // Set up dependencies
     wal_handle.set_snapshot_handle(snapshot_handle.clone());
+    wal_handle.set_core_handle(core_handle.clone());
     peer_handle.set_snapshot_handle(snapshot_handle.clone());
+    peer_handle.set_core_handle(core_handle.clone());
     
-    // Create the core service (runs in main thread)
-    let mut core_service = CoreService::new(CoreConfig::from(&config))?;
-    core_service.set_handles(peer_handle, snapshot_handle, wal_handle);
+    // Set handles for the core service
+    core_handle.set_handles(peer_handle, snapshot_handle.clone(), wal_handle)?;
+    
+    // Initialize store from snapshots and WAL replay
+    core_handle.initialize_store()?;
     
     // Set up signal handling for graceful shutdown
     let (shutdown_tx, shutdown_rx) = crossbeam::channel::bounded(1);
     std::thread::spawn(move || {
         if let Err(e) = wait_for_signal() {
-            tracing::error!(error = %e, "Error waiting for signal");
+            error!("Error waiting for signal: {}", e);
         }
         let _ = shutdown_tx.send(());
     });
     
-    // Run the core service in the main thread (it uses mio for non-blocking I/O)
-    if let Err(e) = core_service.run() {
-        tracing::error!(error = %e, "Core service failed");
-    }
-    
-    // Check for shutdown signal (non-blocking)
-    if let Ok(_) = shutdown_rx.try_recv() {
+    // Keep the main thread alive and wait for shutdown signal
+    if let Ok(_) = shutdown_rx.recv() {
         tracing::info!("Received shutdown signal, initiating graceful shutdown");
+        
+        // Trigger a final snapshot before shutdown
+        if let Ok(snapshot) = core_handle.take_snapshot() {
+            if let Err(e) = snapshot_handle.save(snapshot) {
+                error!("Failed to save final snapshot: {}", e);
+            }
+        }
     }
     
-    // TODO: Implement graceful shutdown by taking final snapshot
     tracing::info!("QCore service shutdown complete");
     Ok(())
 }

@@ -6,6 +6,8 @@ use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use tungstenite::{WebSocket, Message};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
+use crossbeam::channel::{Sender, Receiver, unbounded};
+use std::thread;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
     AuthenticationResult, Notification, Store, Cache, CelExecutor,
@@ -29,6 +31,159 @@ impl From<&crate::Config> for CoreConfig {
         Self {
             client_port: config.client_port,
             machine_id: config.machine.clone(),
+        }
+    }
+}
+
+/// Core service request types
+#[derive(Debug)]
+pub enum CoreRequest {
+    ProcessStoreMessage {
+        message: StoreMessage,
+        client_token: Option<Token>,
+    },
+    WriteRequest {
+        request: Request,
+    },
+    TakeSnapshot,
+    RestoreSnapshot {
+        snapshot: Snapshot,
+    },
+    GetAvailabilityState,
+    ForceDisconnectAllClients,
+    SetHandles {
+        peer_handle: crate::peers::PeerHandle,
+        snapshot_handle: crate::snapshot::SnapshotHandle,
+        wal_handle: crate::wal::WalHandle,
+    },
+    InitializeStore,
+}
+
+/// Response types for core requests
+#[derive(Debug)]
+pub enum CoreResponse {
+    StoreMessage(StoreMessage),
+    WriteResult(Result<()>),
+    Snapshot(Snapshot),
+    Unit,
+    AvailabilityState(AvailabilityState),
+}
+
+/// Handle for communicating with core service
+#[derive(Debug, Clone)]
+pub struct CoreHandle {
+    request_sender: Sender<(CoreRequest, Sender<CoreResponse>)>,
+}
+
+impl CoreHandle {
+    pub fn process_store_message(&self, message: StoreMessage, client_token: Option<Token>) -> Result<StoreMessage> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((CoreRequest::ProcessStoreMessage { message, client_token }, response_tx))
+            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
+        {
+            CoreResponse::StoreMessage(msg) => Ok(msg),
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
+    }
+
+    pub fn write_request(&self, request: Request) -> Result<()> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((CoreRequest::WriteRequest { request }, response_tx))
+            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
+        {
+            CoreResponse::WriteResult(result) => result,
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
+    }
+
+    pub fn take_snapshot(&self) -> Result<Snapshot> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((CoreRequest::TakeSnapshot, response_tx))
+            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
+        {
+            CoreResponse::Snapshot(snapshot) => Ok(snapshot),
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
+    }
+
+    pub fn restore_snapshot(&self, snapshot: Snapshot) -> Result<()> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((CoreRequest::RestoreSnapshot { snapshot }, response_tx))
+            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
+        {
+            CoreResponse::Unit => Ok(()),
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
+    }
+
+    pub fn get_availability_state(&self) -> Result<AvailabilityState> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((CoreRequest::GetAvailabilityState, response_tx))
+            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
+        {
+            CoreResponse::AvailabilityState(state) => Ok(state),
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
+    }
+
+    pub fn force_disconnect_all_clients(&self) -> Result<()> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((CoreRequest::ForceDisconnectAllClients, response_tx))
+            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
+        {
+            CoreResponse::Unit => Ok(()),
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
+    }
+
+    /// Set handles to other services (called from main)
+    pub fn set_handles(
+        &self,
+        peer_handle: crate::peers::PeerHandle,
+        snapshot_handle: crate::snapshot::SnapshotHandle,
+        wal_handle: crate::wal::WalHandle,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((CoreRequest::SetHandles { peer_handle, snapshot_handle, wal_handle }, response_tx))
+            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
+        {
+            CoreResponse::Unit => Ok(()),
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
+    }
+
+    /// Initialize store from snapshots and WAL replay
+    pub fn initialize_store(&self) -> Result<()> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((CoreRequest::InitializeStore, response_tx))
+            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
+        {
+            CoreResponse::Unit => Ok(()),
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
         }
     }
 }
@@ -65,6 +220,9 @@ pub struct CoreService {
     snapshot_handle: Option<crate::snapshot::SnapshotHandle>,
     wal_handle: Option<crate::wal::WalHandle>,
     
+    // Channel for receiving requests from other services
+    request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>,
+    
     // Timing for misc operations
     last_misc_tick: std::time::Instant,
     last_heartbeat: std::time::Instant,
@@ -76,7 +234,7 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 1;
 
 impl CoreService {
     /// Create a new core service
-    pub fn new(config: CoreConfig) -> Result<Self> {
+    pub fn new(config: CoreConfig, request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>) -> Result<Self> {
         let addr = format!("0.0.0.0:{}", config.client_port).parse()?;
         let mut listener = MioTcpListener::bind(addr)?;
         let poll = Poll::new()?;
@@ -111,9 +269,67 @@ impl CoreService {
             peer_handle: None,
             snapshot_handle: None,
             wal_handle: None,
+            request_receiver,
             last_misc_tick: now,
             last_heartbeat: now,
         })
+    }
+
+    /// Spawn the core service in its own thread and return a handle
+    pub fn spawn(config: CoreConfig) -> Result<CoreHandle> {
+        let (request_sender, request_receiver) = unbounded();
+        
+        let handle = CoreHandle { request_sender };
+        
+        thread::spawn(move || {
+            let mut service = match Self::new(config, request_receiver) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to create core service: {}", e);
+                    return;
+                }
+            };
+            
+            if let Err(e) = service.run() {
+                error!("Core service error: {}", e);
+            }
+            
+            error!("Core service has stopped unexpectedly");
+        });
+        
+        Ok(handle)
+    }
+    
+    /// Initialize the store from snapshots and WAL replay
+    pub fn initialize_store_internal(&mut self) -> Result<()> {
+        info!("Initializing store from persistent storage");
+        
+        // Try to load latest snapshot first
+        if let Some(snapshot_handle) = &self.snapshot_handle {
+            if let Ok(Some((snapshot, snapshot_counter))) = snapshot_handle.load_latest() {
+                info!(snapshot_counter = %snapshot_counter, "Restoring from snapshot");
+                self.store.restore_snapshot(snapshot);
+            } else {
+                info!("No snapshots found, starting with empty store");
+            }
+        }
+        
+        // Replay WAL entries to bring store up to date
+        if let Some(wal_handle) = &self.wal_handle {
+            if let Ok(requests) = wal_handle.replay() {
+                info!(request_count = %requests.len(), "Replaying WAL entries");
+                for request in requests {
+                    if let Err(e) = self.store.perform_mut(vec![request]) {
+                        error!(error = %e, "Failed to replay WAL entry");
+                    }
+                }
+            } else {
+                warn!("Failed to replay WAL entries");
+            }
+        }
+        
+        info!("Store initialization complete");
+        Ok(())
     }
     
     /// Set handles to other services
@@ -133,6 +349,14 @@ impl CoreService {
         let mut events = Events::with_capacity(1024);
         
         loop {
+            // Handle incoming requests from other services (non-blocking)
+            while let Ok((request, response_sender)) = self.request_receiver.try_recv() {
+                let response = self.handle_request(request);
+                if let Err(_) = response_sender.send(response) {
+                    warn!("Failed to send response to requesting service");
+                }
+            }
+            
             // Calculate timeout for next operation
             let now = std::time::Instant::now();
             let next_misc = self.last_misc_tick + StdDuration::from_millis(MISC_INTERVAL_MS);
@@ -180,6 +404,78 @@ impl CoreService {
             
             // Process any pending write requests from the store
             self.process_write_requests()?;
+        }
+    }
+    
+    /// Handle requests from other services
+    fn handle_request(&mut self, request: CoreRequest) -> CoreResponse {
+        match request {
+            CoreRequest::ProcessStoreMessage { message, client_token } => {
+                match self.process_store_message(message, client_token.unwrap_or(Token(0))) {
+                    Ok(response_msg) => CoreResponse::StoreMessage(response_msg),
+                    Err(e) => {
+                        error!("Error processing store message: {}", e);
+                        // Return an error message
+                        CoreResponse::StoreMessage(StoreMessage::Error {
+                            id: "unknown".to_string(),
+                            error: format!("Error processing request: {}", e),
+                        })
+                    }
+                }
+            }
+            CoreRequest::WriteRequest { request } => {
+                match self.wal_handle.as_ref() {
+                    Some(wal_handle) => {
+                        CoreResponse::WriteResult(wal_handle.write_request(request))
+                    }
+                    None => {
+                        CoreResponse::WriteResult(Err(anyhow::anyhow!("WAL service not available")))
+                    }
+                }
+            }
+            CoreRequest::TakeSnapshot => {
+                let snapshot = self.store.take_snapshot();
+                CoreResponse::Snapshot(snapshot)
+            }
+            CoreRequest::RestoreSnapshot { snapshot } => {
+                self.store.restore_snapshot(snapshot);
+                CoreResponse::Unit
+            }
+            CoreRequest::GetAvailabilityState => {
+                let state = match self.peer_handle.as_ref() {
+                    Some(peer_handle) => peer_handle.get_availability_state(),
+                    None => AvailabilityState::Unavailable,
+                };
+                CoreResponse::AvailabilityState(state)
+            }
+            CoreRequest::ForceDisconnectAllClients => {
+                self.disconnect_all_clients();
+                CoreResponse::Unit
+            }
+            CoreRequest::SetHandles { peer_handle, snapshot_handle, wal_handle } => {
+                self.peer_handle = Some(peer_handle);
+                self.snapshot_handle = Some(snapshot_handle);
+                self.wal_handle = Some(wal_handle);
+                CoreResponse::Unit
+            }
+            CoreRequest::InitializeStore => {
+                match self.initialize_store_internal() {
+                    Ok(()) => CoreResponse::Unit,
+                    Err(e) => {
+                        error!("Failed to initialize store: {}", e);
+                        CoreResponse::Unit // Still return unit, but log the error
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Force disconnect all clients
+    fn disconnect_all_clients(&mut self) {
+        let tokens_to_remove: Vec<Token> = self.connections.keys().cloned().collect();
+        for token in tokens_to_remove {
+            info!(token = ?token, "Force disconnecting client");
+            self.remove_client(token);
         }
     }
     
@@ -709,7 +1005,7 @@ impl CoreService {
     fn process_write_requests(&mut self) -> Result<()> {
         let mut requests_to_write = Vec::new();
         
-        // Drain the write queue
+        // Drain the write queue from the store
         while let Some(request) = self.store.write_queue.pop() {
             requests_to_write.push(request);
         }
@@ -717,11 +1013,16 @@ impl CoreService {
         // Write to WAL if we have requests
         if !requests_to_write.is_empty() {
             if let Some(wal_handle) = &self.wal_handle {
-                for request in requests_to_write {
-                    if let Err(e) = wal_handle.write_request(request) {
+                for request in &requests_to_write {
+                    if let Err(e) = wal_handle.write_request(request.clone()) {
                         error!(error = %e, "Failed to write request to WAL");
                     }
                 }
+            }
+            
+            // Send to peers for synchronization
+            if let Some(peer_handle) = &self.peer_handle {
+                peer_handle.send_sync_message(requests_to_write);
             }
         }
         
@@ -738,6 +1039,74 @@ impl CoreService {
             }
         }
         
+        Ok(())
+    }
+    
+    /// Manually trigger a snapshot (useful for graceful shutdown or periodic snapshots)
+    pub fn trigger_snapshot(&mut self) -> Result<()> {
+        if let Some(snapshot_handle) = &self.snapshot_handle {
+            let snapshot = self.store.take_snapshot();
+            if let Err(e) = snapshot_handle.save(snapshot) {
+                error!(error = %e, "Failed to save snapshot");
+                return Err(anyhow::anyhow!("Failed to save snapshot: {}", e));
+            }
+            info!("Snapshot successfully created");
+        }
+        Ok(())
+    }
+    
+    /// Handle incoming peer synchronization requests
+    pub fn handle_peer_sync_requests(&mut self, requests: Vec<Request>) -> Result<()> {
+        if !requests.is_empty() {
+            info!(request_count = %requests.len(), "Processing peer synchronization requests");
+            
+            // Temporarily disable notifications during peer sync to avoid feedback loops
+            self.store.disable_notifications();
+            
+            // Apply the synchronized requests to the store
+            if let Err(e) = self.store.perform_mut(requests) {
+                error!(error = %e, "Failed to apply peer synchronization requests");
+                self.store.enable_notifications();
+                return Err(e.into());
+            }
+            
+            // Re-enable notifications
+            self.store.enable_notifications();
+            
+            info!("Peer synchronization requests applied successfully");
+        }
+        Ok(())
+    }
+    
+    /// Handle full sync request from peer (send snapshot)
+    pub fn handle_full_sync_request(&mut self, requesting_machine_id: &str) -> Result<()> {
+        if let Some(peer_handle) = &self.peer_handle {
+            let (is_leader, _) = peer_handle.get_leadership_info();
+            if is_leader {
+                info!(machine_id = %requesting_machine_id, "Handling full sync request");
+                let _snapshot = self.store.take_snapshot();
+                // Note: In a complete implementation, we'd need a way to send this back to the requesting peer
+                // For now, we'll log that we have the snapshot ready
+                info!(machine_id = %requesting_machine_id, "Snapshot prepared for full sync");
+            }
+        }
+        Ok(())
+    }
+    
+    /// Handle full sync response from peer (restore snapshot)
+    pub fn handle_full_sync_response(&mut self, snapshot: Snapshot) -> Result<()> {
+        info!("Applying full sync snapshot");
+        
+        // Temporarily disable notifications during snapshot restoration
+        self.store.disable_notifications();
+        
+        // Restore from the received snapshot
+        self.store.restore_snapshot(snapshot);
+        
+        // Re-enable notifications
+        self.store.enable_notifications();
+        
+        info!("Full sync snapshot applied successfully");
         Ok(())
     }
     

@@ -111,6 +111,9 @@ pub enum PeerRequest {
     SetSnapshotHandle {
         handle: crate::snapshot::SnapshotHandle,
     },
+    SetCoreHandle {
+        handle: crate::core::CoreHandle,
+    },
 }
 
 /// Response types for peer requests
@@ -226,6 +229,14 @@ impl PeerHandle {
             error!(error = %e, "Failed to send set snapshot handle request to peer service");
         }
     }
+
+    /// Set core handle for dependencies
+    pub fn set_core_handle(&self, handle: crate::core::CoreHandle) {
+        let (response_tx, _response_rx) = unbounded();
+        if let Err(e) = self.request_sender.send((PeerRequest::SetCoreHandle { handle }, response_tx)) {
+            error!(error = %e, "Failed to send set core handle request to peer service");
+        }
+    }
 }
 
 /// Connection state for peer connections
@@ -257,6 +268,7 @@ pub struct PeerService {
     peer_info: HashMap<String, PeerInfo>,
     connected_outbound_peers: HashMap<String, Sender<Message>>,
     snapshot_handle: Option<crate::snapshot::SnapshotHandle>,
+    core_handle: Option<crate::core::CoreHandle>,
     
     // Mio-based networking
     poll: Poll,
@@ -315,6 +327,7 @@ impl PeerService {
             peer_info: HashMap::new(),
             connected_outbound_peers: HashMap::new(),
             snapshot_handle: None,
+            core_handle: None,
             poll,
             listener,
             connections: HashMap::new(),
@@ -647,6 +660,10 @@ impl PeerService {
             }
             PeerRequest::SetSnapshotHandle { handle } => {
                 self.snapshot_handle = Some(handle);
+                PeerResponse::Unit
+            }
+            PeerRequest::SetCoreHandle { handle } => {
+                self.core_handle = Some(handle);
                 PeerResponse::Unit
             }
         }

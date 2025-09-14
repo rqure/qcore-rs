@@ -1,7 +1,7 @@
 use std::path::PathBuf;
-use crossbeam::channel::{Sender, Receiver, bounded, unbounded};
+use crossbeam::channel::{Sender, bounded, unbounded};
 use std::thread;
-use std::fs::{create_dir_all, remove_file, File, OpenOptions};
+use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{Read, Write};
 use tracing::{info, warn, error};
 use anyhow::Result;

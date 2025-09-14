@@ -1,5 +1,4 @@
-use crossbeam::channel::{Sender, Receiver, bounded, unbounded};
-use qlib_rs::now;
+use crossbeam::channel::{Sender, bounded, unbounded};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::thread;
@@ -33,6 +32,9 @@ pub enum WalRequest {
     Replay,
     SetSnapshotHandle {
         handle: crate::snapshot::SnapshotHandle,
+    },
+    SetCoreHandle {
+        handle: crate::core::CoreHandle,
     },
 }
 
@@ -163,6 +165,14 @@ impl WalHandle {
             error!(error = %e, "Failed to send SetSnapshotHandle request");
         }
     }
+
+    /// Set core handle for dependencies
+    pub fn set_core_handle(&self, handle: crate::core::CoreHandle) {
+        let (response_tx, _response_rx) = unbounded();
+        if let Err(e) = self.request_sender.send((WalRequest::SetCoreHandle { handle }, response_tx)) {
+            error!(error = %e, "Failed to send SetCoreHandle request");
+        }
+    }
 }
 
 pub type WalService = WalManagerTrait<FileManager>;
@@ -195,6 +205,10 @@ impl WalService {
                         service.snapshot_handle = Some(handle);
                         WalResponse::Unit
                     }
+                    WalRequest::SetCoreHandle { handle } => {
+                        service.core_handle = Some(handle);
+                        WalResponse::Unit
+                    }
                 };
                 
                 if let Err(_) = response_sender.send(response) {
@@ -222,6 +236,8 @@ pub struct WalManagerTrait<F: FileManagerTrait> {
     wal_files_since_snapshot: u64,
     /// Handle to communicate with snapshot manager
     snapshot_handle: Option<crate::snapshot::SnapshotHandle>,
+    /// Handle to communicate with core service
+    core_handle: Option<crate::core::CoreHandle>,
 }
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {
@@ -238,6 +254,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             current_wal_size: 0,
             wal_files_since_snapshot: 0,
             snapshot_handle,
+            core_handle: None,
         }
     }
 }
