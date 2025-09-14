@@ -119,14 +119,12 @@ pub enum PeerCommand {
 /// Peer service request types that require responses
 #[derive(Debug)]
 pub enum PeerRequest {
-    GetAvailabilityState,
     GetLeadershipInfo,
 }
 
 /// Response types for peer requests
 #[derive(Debug)]
 pub enum PeerResponse {
-    AvailabilityState(AvailabilityState),
     LeadershipInfo(bool, Option<String>), // (is_leader, current_leader)
 }
 
@@ -140,22 +138,6 @@ pub struct PeerHandle {
 impl PeerHandle {
     pub fn send_sync_message(&self, requests: Vec<qlib_rs::Request>) {
         self.command_queue.push(PeerCommand::SendSyncMessage { requests });
-    }
-
-    pub fn get_availability_state(&self) -> AvailabilityState {
-        let (response_tx, response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::GetAvailabilityState, response_tx)) {
-            error!(error = %e, "Failed to send availability state request to peer service");
-            return AvailabilityState::Unavailable;
-        }
-        
-        match response_rx.recv() {
-            Ok(PeerResponse::AvailabilityState(state)) => state,
-            _ => {
-                error!("Failed to receive availability state response from peer service");
-                AvailabilityState::Unavailable
-            }
-        }
     }
 
     pub fn get_leadership_info(&self) -> (bool, Option<String>) {
@@ -708,9 +690,6 @@ impl PeerService {
     
     fn handle_request(&mut self, request: PeerRequest) -> PeerResponse {
         match request {
-            PeerRequest::GetAvailabilityState => {
-                PeerResponse::AvailabilityState(self.availability_state.clone())
-            }
             PeerRequest::GetLeadershipInfo => {
                 PeerResponse::LeadershipInfo(self.is_leader, self.current_leader.clone())
             }
