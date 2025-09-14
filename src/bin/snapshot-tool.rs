@@ -9,7 +9,7 @@ use serde_json;
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::fs::{read_to_string, write};
+use std::fs::{read_to_string, write};
 use tracing::{info, warn, error, debug};
 
 /// Command-line tool for taking and restoring JSON snapshots from QCore service
@@ -137,7 +137,6 @@ impl Progress {
     }
 }
 
-#[tokio::main]
 fn main() -> Result<()> {
     // Initialize tracing for CLI tools
     tracing_subscriber::fmt()
@@ -429,7 +428,7 @@ fn report_snapshot_diff(
     };
 
     if let Some(output) = output_path {
-        tokio::fs::write(&output, report_content.as_bytes())
+        std::fs::write(&output, report_content.as_bytes())
             .with_context(|| format!("Failed to write report to {}", output.display()))?;
         Progress::success(&format!("Report written to {}", output.display()));
     } else {

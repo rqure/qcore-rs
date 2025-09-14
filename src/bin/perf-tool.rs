@@ -4,7 +4,7 @@ use qlib_rs::{StoreProxy, EntityType, EntityId, Value, FieldType, PageOpts, swri
 use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use std::thread;
 use tracing::{info, warn, error, debug};
 use tracing_subscriber;
 use chrono;
@@ -204,7 +204,7 @@ fn run_test_client(
         if let Some(interval) = rps_limit {
             let elapsed_since_last = last_request_time.elapsed();
             if elapsed_since_last < interval {
-                sleep(interval - elapsed_since_last);
+                thread::sleep(interval - elapsed_since_last);
             }
             last_request_time = Instant::now();
         }
@@ -324,7 +324,6 @@ fn setup_test_data(config: &Config) -> Result<Vec<EntityId>> {
     Ok(entities)
 }
 
-#[tokio::main]
 fn main() -> Result<()> {
     let config = Arc::new(Config::parse());
 
@@ -376,7 +375,7 @@ fn main() -> Result<()> {
             let test_entity_id_clone = test_entity_id.clone();
             let core_url = config.core_urls[i % config.core_urls.len()].clone();
             
-            let handle = tokio::spawn(async move {
+            let handle = thread::spawn(move || {
                 match run_test_client(
                     warmup_config_clone,
                     i,
@@ -392,7 +391,7 @@ fn main() -> Result<()> {
         }
         
         for handle in warmup_handles {
-            let _ = handle;
+            let _ = handle.join();
         }
         
         info!("Warmup phase completed");
@@ -410,7 +409,7 @@ fn main() -> Result<()> {
         let test_entity_id_clone = test_entity_id.clone();
         let core_url = config.core_urls[i % config.core_urls.len()].clone();
         
-        let handle = tokio::spawn(async move {
+        let handle = thread::spawn(move || {
             run_test_client(
                 config_clone,
                 i,
@@ -425,10 +424,10 @@ fn main() -> Result<()> {
     // Wait for all clients to complete and collect results
     let mut client_results = Vec::new();
     for handle in handles {
-        match handle {
+        match handle.join() {
             Ok(Ok(result)) => client_results.push(result),
             Ok(Err(e)) => error!("Client failed: {}", e),
-            Err(e) => error!("Client task panicked: {}", e),
+            Err(_) => error!("Client thread panicked"),
         }
     }
 

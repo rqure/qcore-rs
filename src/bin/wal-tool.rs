@@ -3,8 +3,8 @@ use clap::Parser;
 use qlib_rs::Request;
 use std::path::PathBuf;
 use tabled::{Table, Tabled};
-use tokio::fs::{File, read_dir};
-use tokio::io::AsyncReadExt;
+use std::fs::{File, read_dir};
+use std::io::Read;
 use time::OffsetDateTime;
 use tracing::{info, warn, error};
 use serde_json;
@@ -140,7 +140,6 @@ struct WalSystemEntry {
     location: String,
 }
 
-#[tokio::main]
 fn main() -> Result<()> {
     // Initialize tracing for CLI tools
     tracing_subscriber::fmt()
@@ -284,10 +283,11 @@ impl WalReader {
     }
 
     fn find_wal_files(&self) -> Result<Vec<(PathBuf, u64)>> {
-        let mut entries = read_dir(&self.wal_dir)?;
+        let entries = read_dir(&self.wal_dir)?;
         let mut wal_files = Vec::new();
 
-        while let Some(entry) = entries.next_entry()? {
+        for entry in entries {
+            let entry = entry?;
             let path = entry.path();
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                 if filename.starts_with("wal_") && filename.ends_with(".log") {
@@ -730,7 +730,7 @@ impl WalReader {
         // Initialize positions for existing files
         let initial_files = self.find_wal_files()?;
         for (file_path, _counter) in &initial_files {
-            if let Ok(metadata) = tokio::fs::metadata(file_path) {
+            if let Ok(metadata) = std::fs::metadata(file_path) {
                 file_positions.insert(file_path.clone(), metadata.len());
             }
         }
@@ -738,7 +738,7 @@ impl WalReader {
         info!("Following {} WAL files for new entries", file_positions.len());
         
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(500));
             
             let current_files = self.find_wal_files()?;
             
@@ -749,7 +749,7 @@ impl WalReader {
                     self.process_wal_file(file_path, start_time, end_time)?;
                     
                     // Track this new file
-                    if let Ok(metadata) = tokio::fs::metadata(file_path) {
+                    if let Ok(metadata) = std::fs::metadata(file_path) {
                         file_positions.insert(file_path.clone(), metadata.len());
                     }
                 }
@@ -757,7 +757,7 @@ impl WalReader {
             
             // Check existing files for new content
             for (file_path, last_size) in file_positions.clone().iter() {
-                if let Ok(metadata) = tokio::fs::metadata(file_path) {
+                if let Ok(metadata) = std::fs::metadata(file_path) {
                     let current_size = metadata.len();
                     if current_size > *last_size {
                         // File has grown, process new content

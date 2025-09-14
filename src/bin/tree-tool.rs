@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use qlib_rs::{ft, EntityId, EntityType, StoreProxy, Value};
-use std::pin::Pin;
-use std::boxed::Box;
-use std::future::Future;
 use tracing::{info, warn};
 
 /// Command-line tool for displaying the tree structure of the QCore data store
@@ -52,7 +49,6 @@ struct TreeNode {
     children: Vec<TreeNode>,
 }
 
-#[tokio::main]
 fn main() -> Result<()> {
     // Initialize tracing for CLI tools
     tracing_subscriber::fmt()
@@ -134,53 +130,51 @@ fn build_tree(
     entity_id: EntityId, 
     max_depth: usize, 
     current_depth: usize
-) -> Pin<Box<dyn Future<Output = Result<TreeNode>> + '_>> {
-    Box::pin(async move {
-        // Check depth limit
-        if max_depth > 0 && current_depth >= max_depth {
-            return Ok(TreeNode {
-                entity_id: entity_id.clone(),
-                entity_type: "...".to_string(),
-                name: "...".to_string(),
-                children: vec![],
-            });
-        }
+) -> Result<TreeNode> {
+    // Check depth limit
+    if max_depth > 0 && current_depth >= max_depth {
+        return Ok(TreeNode {
+            entity_id: entity_id.clone(),
+            entity_type: "...".to_string(),
+            name: "...".to_string(),
+            children: vec![],
+        });
+    }
 
-        // Get entity type
-        let entity_type = get_entity_type(store, &entity_id)
-            .with_context(|| format!("Failed to get entity type for {}", entity_id.get_id()))?;
+    // Get entity type
+    let entity_type = get_entity_type(store, &entity_id)
+        .with_context(|| format!("Failed to get entity type for {}", entity_id.get_id()))?;
 
-        // Get entity name
-        let name = get_entity_name(store, &entity_id)
-            .with_context(|| format!("Failed to get entity name for {}", entity_id.get_id()))?;
+    // Get entity name
+    let name = get_entity_name(store, &entity_id)
+        .with_context(|| format!("Failed to get entity name for {}", entity_id.get_id()))?;
 
-        // Get children
-        let children_ids = get_entity_children(store, &entity_id)
-            .with_context(|| format!("Failed to get children for {}", entity_id.get_id()))?;
+    // Get children
+    let children_ids = get_entity_children(store, &entity_id)
+        .with_context(|| format!("Failed to get children for {}", entity_id.get_id()))?;
 
-        // Recursively build child nodes
-        let mut children = Vec::new();
-        for child_id in children_ids {
-            let child_id_str = child_id.get_id().to_string();
-            match build_tree(store, child_id, max_depth, current_depth + 1) {
-                Ok(child_node) => children.push(child_node),
-                Err(e) => {
-                    warn!(
-                        child_id = %child_id_str,
-                        error = %e,
-                        "Failed to build tree for child entity"
-                    );
-                    // Continue with other children instead of failing completely
-                }
+    // Recursively build child nodes
+    let mut children = Vec::new();
+    for child_id in children_ids {
+        let child_id_str = child_id.get_id().to_string();
+        match build_tree(store, child_id, max_depth, current_depth + 1) {
+            Ok(child_node) => children.push(child_node),
+            Err(e) => {
+                warn!(
+                    child_id = %child_id_str,
+                    error = %e,
+                    "Failed to build tree for child entity"
+                );
+                // Continue with other children instead of failing completely
             }
         }
+    }
 
-        Ok(TreeNode {
-            entity_id,
-            entity_type,
-            name,
-            children,
-        })
+    Ok(TreeNode {
+        entity_id,
+        entity_type,
+        name,
+        children,
     })
 }
 

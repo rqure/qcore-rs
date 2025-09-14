@@ -262,7 +262,6 @@ impl QueryMetrics {
     }
 }
 
-#[tokio::main]
 fn main() -> Result<()> {
     let total_start = Instant::now();
     let mut metrics = QueryMetrics::new();
@@ -751,7 +750,7 @@ fn export_results(entities: &[EntityDisplay], export_path: &std::path::PathBuf) 
     let output = serde_json::to_string_pretty(&json_entities)
         .context("Failed to serialize results to JSON")?;
 
-    tokio::fs::write(export_path, output)
+    std::fs::write(export_path, output)
         .with_context(|| format!("Failed to write to {}", export_path.display()))?;
 
     Ok(())
