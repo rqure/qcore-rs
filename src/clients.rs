@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use qlib_rs::{
-    notification_channel, StoreMessage, EntityId, NotificationSender, NotifyConfig,
+    notification_channel, StoreMessage, EntityId, NotificationQueue, NotifyConfig,
     AuthenticationResult
 };
 
@@ -37,7 +37,7 @@ pub enum ClientRequest {
     ClientConnected {
         client_addr: String,
         sender: Sender<Message>,
-        notification_sender: NotificationSender,
+        notification_sender: NotificationQueue,
     },
     ClientDisconnected {
         client_addr: String,
@@ -77,39 +77,39 @@ pub struct ClientHandle {
 }
 
 impl ClientHandle {
-    pub async fn client_connected(&self, client_addr: String, sender: Sender<Message>, notification_sender: NotificationSender) {
+    pub fn client_connected(&self, client_addr: String, sender: Sender<Message>, notification_sender: NotificationQueue) {
         if let Err(e) = self.sender.send(ClientRequest::ClientConnected {
             client_addr,
             sender,
             notification_sender,
-        }).await {
+        }) {
             tracing::error!(error = %e, "Failed to send ClientConnected request");
         }
     }
 
-    pub async fn client_disconnected(&self, client_addr: String) {
-        if let Err(e) = self.sender.send(ClientRequest::ClientDisconnected { client_addr }).await {
+    pub fn client_disconnected(&self, client_addr: String) {
+        if let Err(e) = self.sender.send(ClientRequest::ClientDisconnected { client_addr }) {
             tracing::error!(error = %e, "Failed to send ClientDisconnected request");
         }
     }
 
-    pub async fn client_authenticated(&self, client_addr: String, client_id: EntityId) {
+    pub fn client_authenticated(&self, client_addr: String, client_id: EntityId) {
         if let Err(e) = self.sender.send(ClientRequest::ClientAuthenticated {
             client_addr,
             client_id,
-        }).await {
+        }) {
             tracing::error!(error = %e, "Failed to send ClientAuthenticated request");
         }
     }
 
-    pub async fn process_store_message(&self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
+    pub fn process_store_message(&self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::ProcessStoreMessage {
             message,
             client_addr,
             response: response_tx,
-        }).await {
-            response_rx.await.unwrap_or_else(|_| StoreMessage::Error {
+        }) {
+            response_rx.unwrap_or_else(|_| StoreMessage::Error {
                 id: "error".to_string(),
                 error: "Failed to receive response".to_string(),
             })
@@ -121,51 +121,51 @@ impl ClientHandle {
         }
     }
 
-    pub async fn register_notification(&self, client_addr: String, config: NotifyConfig) -> Result<()> {
+    pub fn register_notification(&self, client_addr: String, config: NotifyConfig) -> Result<()> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::RegisterNotification {
             client_addr,
             config,
             response: response_tx,
-        }).await {
-            response_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("Client service unavailable")))
+        }) {
+            response_rx.unwrap_or_else(|_| Err(anyhow::anyhow!("Client service unavailable")))
         } else {
             Err(anyhow::anyhow!("Client service unavailable"))
         }
     }
 
-    pub async fn unregister_notification(&self, client_addr: String, config: NotifyConfig) -> bool {
+    pub fn unregister_notification(&self, client_addr: String, config: NotifyConfig) -> bool {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::UnregisterNotification {
             client_addr,
             config,
             response: response_tx,
-        }).await {
-            response_rx.await.unwrap_or(false)
+        }) {
+            response_rx.unwrap_or(false)
         } else {
             false
         }
     }
 
-    pub async fn force_disconnect_all(&self) {
+    pub fn force_disconnect_all(&self) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::ForceDisconnectAll {
             response: response_tx,
-        }).await {
-            if let Err(e) = response_rx.await {
+        }) {
+            if let Err(e) = response_rx {
                 tracing::error!(error = %e, "Failed to receive ForceDisconnectAll response");
             }
         }
     }
 
     /// Set services for dependencies
-    pub async fn set_services(&self, services: Services) {
+    pub fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(ClientRequest::SetServices {
             services,
             response: response_tx,
-        }).await {
-            if let Err(e) = response_rx.await {
+        }) {
+            if let Err(e) = response_rx {
                 tracing::error!(error = %e, "Failed to receive SetServices response");
             }
         }
@@ -175,7 +175,7 @@ impl ClientHandle {
 pub struct ClientService {
     config: ClientConfig,
     connected_clients: HashMap<String, Sender<Message>>,
-    client_notification_senders: HashMap<String, NotificationSender>,
+    client_notification_senders: HashMap<String, NotificationQueue>,
     client_notification_configs: HashMap<String, HashSet<NotifyConfig>>,
     authenticated_clients: HashMap<String, EntityId>,
     services: Option<Services>,
@@ -196,8 +196,8 @@ impl ClientService {
                 services: None,
             };
 
-            while let Some(request) = receiver.recv().await {
-                service.handle_request(request).await;
+            while let Some(request) = receiver.recv() {
+                service.handle_request(request);
             }
 
             panic!("Client service has stopped unexpectedly");
@@ -210,38 +210,38 @@ impl ClientService {
         ClientHandle { sender }
     }
     
-    async fn handle_request(&mut self, request: ClientRequest) {
+    fn handle_request(&mut self, request: ClientRequest) {
         match request {
             ClientRequest::ClientConnected { client_addr, sender, notification_sender } => {
                 self.connected_clients.insert(client_addr.clone(), sender);
                 self.client_notification_senders.insert(client_addr, notification_sender);
             }
             ClientRequest::ClientDisconnected { client_addr } => {
-                self.handle_client_disconnected(client_addr).await;
+                self.handle_client_disconnected(client_addr);
             }
             ClientRequest::ClientAuthenticated { client_addr, client_id } => {
                 self.authenticated_clients.insert(client_addr, client_id);
             }
             ClientRequest::ProcessStoreMessage { message, client_addr, response } => {
-                let result = self.process_store_message(message, client_addr).await;
+                let result = self.process_store_message(message, client_addr);
                 if let Err(_) = response.send(result) {
                     tracing::error!("Failed to send ProcessStoreMessage response");
                 }
             }
             ClientRequest::RegisterNotification { client_addr, config, response } => {
-                let result = self.register_notification_internal(client_addr, config).await;
+                let result = self.register_notification_internal(client_addr, config);
                 if let Err(_) = response.send(result) {
                     tracing::error!("Failed to send RegisterNotification response");
                 }
             }
             ClientRequest::UnregisterNotification { client_addr, config, response } => {
-                let result = self.unregister_notification_internal(client_addr, config).await;
+                let result = self.unregister_notification_internal(client_addr, config);
                 if let Err(_) = response.send(result) {
                     tracing::error!("Failed to send UnregisterNotification response");
                 }
             }
             ClientRequest::ForceDisconnectAll { response } => {
-                self.force_disconnect_all_clients().await;
+                self.force_disconnect_all_clients();
                 if let Err(_) = response.send(()) {
                     tracing::error!("Failed to send ForceDisconnectAll response");
                 }
@@ -255,7 +255,7 @@ impl ClientService {
         }
     }
     
-    async fn handle_client_disconnected(&mut self, client_addr: String) {
+    fn handle_client_disconnected(&mut self, client_addr: String) {
         // Remove client from all tracking structures
         self.connected_clients.remove(&client_addr);
         
@@ -270,7 +270,7 @@ impl ClientService {
         if let Some(configs) = client_configs {
             if let Some(sender) = notification_sender {
                 for config in configs {
-                    let removed = self.services.as_ref().unwrap().store_handle.unregister_notification(&config, &sender).await;
+                    let removed = self.services.as_ref().unwrap().store_handle.unregister_notification(&config, &sender);
                     if removed {
                         debug!(
                             client_addr = %client_addr,
@@ -294,7 +294,7 @@ impl ClientService {
         }
     }
     
-    async fn process_store_message(&mut self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
+    fn process_store_message(&mut self, message: StoreMessage, client_addr: Option<String>) -> StoreMessage {
         // Get the services first
         let services = match &self.services {
             Some(services) => services,
@@ -316,7 +316,7 @@ impl ClientService {
         match message {
             StoreMessage::Authenticate { id, subject_name, credential } => {
                 // Perform authentication via the store service
-                match services.store_handle.authenticate_subject(&subject_name, &credential).await {
+                match services.store_handle.authenticate_subject(&subject_name, &credential) {
                     Ok(subject_id) => {
                         info!(
                             subject_name = %subject_name,
@@ -384,7 +384,7 @@ impl ClientService {
                     }
             
                     StoreMessage::GetEntitySchema { id, entity_type } => {
-                        match services.store_handle.get_entity_schema(&entity_type).await {
+                        match services.store_handle.get_entity_schema(&entity_type) {
                             Ok(schema) => StoreMessage::GetEntitySchemaResponse {
                                 id,
                                 response: Ok(Some(schema)),
@@ -397,7 +397,7 @@ impl ClientService {
                     }
                     
                     StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
-                        match services.store_handle.get_complete_entity_schema(&entity_type).await {
+                        match services.store_handle.get_complete_entity_schema(&entity_type) {
                             Ok(schema) => StoreMessage::GetCompleteEntitySchemaResponse {
                                 id,
                                 response: Ok(schema),
@@ -410,7 +410,7 @@ impl ClientService {
                     }
                     
                     StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
-                        match services.store_handle.get_field_schema(&entity_type, &field_type).await {
+                        match services.store_handle.get_field_schema(&entity_type, &field_type) {
                             Ok(schema) => StoreMessage::GetFieldSchemaResponse {
                                 id,
                                 response: Ok(Some(schema)),
@@ -423,7 +423,7 @@ impl ClientService {
                     }
                     
                     StoreMessage::EntityExists { id, entity_id } => {
-                        let exists = services.store_handle.entity_exists(&entity_id).await;
+                        let exists = services.store_handle.entity_exists(&entity_id);
                         StoreMessage::EntityExistsResponse {
                             id,
                             response: exists,
@@ -431,7 +431,7 @@ impl ClientService {
                     }
                     
                     StoreMessage::FieldExists { id, entity_type, field_type } => {
-                        let exists = services.store_handle.field_exists(&entity_type, &field_type).await;
+                        let exists = services.store_handle.field_exists(&entity_type, &field_type);
                         StoreMessage::FieldExistsResponse {
                             id,
                             response: exists,
@@ -440,7 +440,7 @@ impl ClientService {
                     
                     StoreMessage::Perform { id, mut requests } => {
                         // Check authorization for requests
-                        match services.store_handle.check_requests_authorization(&client_id, requests.clone()).await {
+                        match services.store_handle.check_requests_authorization(&client_id, requests.clone()) {
                             Ok(authorized_requests) => {
                                 if authorized_requests.len() != requests.len() {
                                     StoreMessage::PerformResponse {
@@ -454,7 +454,7 @@ impl ClientService {
                                         req.try_set_writer_id(client_id.clone());
                                     });
 
-                                    match services.store_handle.perform_mut(requests).await {
+                                    match services.store_handle.perform_mut(requests) {
                                         Ok(response) => StoreMessage::PerformResponse {
                                             id,
                                             response: Ok(response),
@@ -474,7 +474,7 @@ impl ClientService {
                     }
                     
                     StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
-                        match services.store_handle.find_entities_paginated(&entity_type, page_opts, filter).await {
+                        match services.store_handle.find_entities_paginated(&entity_type, page_opts, filter) {
                             Ok(result) => StoreMessage::FindEntitiesResponse {
                                 id,
                                 response: Ok(result),
@@ -487,7 +487,7 @@ impl ClientService {
                     }
                     
                     StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
-                        match services.store_handle.find_entities_exact(&entity_type, page_opts, filter).await {
+                        match services.store_handle.find_entities_exact(&entity_type, page_opts, filter) {
                             Ok(result) => StoreMessage::FindEntitiesExactResponse {
                                 id,
                                 response: Ok(result),
@@ -500,7 +500,7 @@ impl ClientService {
                     }
                     
                     StoreMessage::GetEntityTypes { id, page_opts } => {
-                        match services.store_handle.get_entity_types_paginated(page_opts).await {
+                        match services.store_handle.get_entity_types_paginated(page_opts) {
                             Ok(result) => StoreMessage::GetEntityTypesResponse {
                                 id,
                                 response: Ok(result),
@@ -516,7 +516,7 @@ impl ClientService {
                         // Register notification for this client
                         if let Some(client_addr) = &client_addr {
                             if let Some(ref notification_sender) = client_notification_sender {
-                                match services.store_handle.register_notification(config.clone(), notification_sender.clone()).await {
+                                match services.store_handle.register_notification(config.clone(), notification_sender.clone()) {
                                     Ok(()) => {
                                         self.client_notification_configs
                                             .entry(client_addr.clone())
@@ -567,7 +567,7 @@ impl ClientService {
                         // Unregister notification for this client
                         if let Some(client_addr) = &client_addr {
                             if let Some(ref notification_sender) = client_notification_sender {
-                                let removed = services.store_handle.unregister_notification(&config, notification_sender).await;
+                                let removed = services.store_handle.unregister_notification(&config, notification_sender);
                                 
                                 // Remove from client's tracked configs if successfully unregistered
                                 if removed {
@@ -645,9 +645,9 @@ impl ClientService {
         }
     }
     
-    async fn register_notification_internal(&mut self, client_addr: String, config: NotifyConfig) -> Result<()> {
+    fn register_notification_internal(&mut self, client_addr: String, config: NotifyConfig) -> Result<()> {
         if let Some(notification_sender) = self.client_notification_senders.get(&client_addr) {
-            self.services.as_ref().unwrap().store_handle.register_notification(config.clone(), notification_sender.clone()).await?;
+            self.services.as_ref().unwrap().store_handle.register_notification(config.clone(), notification_sender.clone())?;
             
             // Track this config for cleanup on disconnect
             self.client_notification_configs
@@ -661,9 +661,9 @@ impl ClientService {
         }
     }
     
-    async fn unregister_notification_internal(&mut self, client_addr: String, config: NotifyConfig) -> bool {
+    fn unregister_notification_internal(&mut self, client_addr: String, config: NotifyConfig) -> bool {
         if let Some(notification_sender) = self.client_notification_senders.get(&client_addr) {
-            let removed = self.services.as_ref().unwrap().store_handle.unregister_notification(&config, notification_sender).await;
+            let removed = self.services.as_ref().unwrap().store_handle.unregister_notification(&config, notification_sender);
             if removed {
                 // Remove from our tracking
                 if let Some(configs) = self.client_notification_configs.get_mut(&client_addr) {
@@ -676,7 +676,7 @@ impl ClientService {
         }
     }
     
-    async fn force_disconnect_all_clients(&mut self) {
+    fn force_disconnect_all_clients(&mut self) {
         if self.connected_clients.is_empty() {
             return;
         }
@@ -690,7 +690,7 @@ impl ClientService {
         // Send close messages to all connected clients
         let disconnect_message = Message::Close(None);
         for (client_addr, sender) in &self.connected_clients {
-            if let Err(e) = sender.send(disconnect_message.clone()).await {
+            if let Err(e) = sender.send(disconnect_message.clone()) {
                 warn!(
                     client_addr = %client_addr,
                     error = %e,
@@ -709,20 +709,20 @@ impl ClientService {
 
 /// Handle a single client WebSocket connection
 #[instrument(skip(stream, handle), fields(client_addr = %client_addr))]
-async fn handle_client_connection(
+fn handle_client_connection(
     stream: TcpStream,
     client_addr: std::net::SocketAddr,
     handle: ClientHandle,
 ) -> Result<()> {
     info!("Accepting client connection");
     
-    let ws_stream = accept_async(stream).await?;
+    let ws_stream = accept_async(stream)?;
     debug!("WebSocket handshake completed");
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
     // Wait for authentication message as the first message
-    let auth_timeout = tokio::time::timeout(Duration::from_secs(10), ws_receiver.next()).await;
+    let auth_timeout = tokio::time::timeout(Duration::from_secs(10), ws_receiver.next());
     
     let first_message = match auth_timeout {
         Ok(Some(Ok(Message::Text(text)))) => text,
@@ -740,14 +740,14 @@ async fn handle_client_connection(
         }
         Ok(Some(Ok(_))) => {
             error!("Client sent non-text message during authentication");
-            if let Err(e) = ws_sender.close().await {
+            if let Err(e) = ws_sender.close() {
                 error!(error = %e, "Failed to close WebSocket after invalid auth message");
             }
             return Ok(());
         }
         Err(_) => {
             info!("Client authentication timeout");
-            if let Err(e) = ws_sender.close().await {
+            if let Err(e) = ws_sender.close() {
                 error!(error = %e, "Failed to close WebSocket after authentication timeout");
             }
             return Ok(());
@@ -761,7 +761,7 @@ async fn handle_client_connection(
         }
         _ => {
             error!("Client first message was not authentication");
-            if let Err(e) = ws_sender.close().await {
+            if let Err(e) = ws_sender.close() {
                 error!(error = %e, "Failed to close WebSocket after invalid auth message");
             }
             return Ok(());
@@ -769,21 +769,21 @@ async fn handle_client_connection(
     };
     
     // Process authentication
-    let auth_response = handle.process_store_message(auth_message, Some(client_addr.to_string())).await;
+    let auth_response = handle.process_store_message(auth_message, Some(client_addr.to_string()));
     
     // Send authentication response
     let auth_response_text = match serde_json::to_string(&auth_response) {
         Ok(text) => text,
         Err(e) => {
             error!(error = %e, "Failed to serialize authentication response");
-            if let Err(e) = ws_sender.close().await {
+            if let Err(e) = ws_sender.close() {
                 error!(error = %e, "Failed to close WebSocket after serialization error");
             }
             return Ok(());
         }
     };
     
-    if let Err(e) = ws_sender.send(Message::Text(auth_response_text)).await {
+    if let Err(e) = ws_sender.send(Message::Text(auth_response_text)) {
         error!(error = %e, "Failed to send authentication response to client");
         return Ok(());
     }
@@ -793,7 +793,7 @@ async fn handle_client_connection(
     
     if !is_authenticated {
         warn!("Client authentication failed, closing connection");
-        if let Err(e) = ws_sender.close().await {
+        if let Err(e) = ws_sender.close() {
             error!(error = %e, "Failed to close WebSocket after failed authentication");
         }
         return Ok(());
@@ -808,18 +808,18 @@ async fn handle_client_connection(
     let (notification_sender, mut notification_receiver) = notification_channel();
     
     // Register client with the service
-    handle.client_connected(client_addr.to_string(), tx.clone(), notification_sender).await;
+    handle.client_connected(client_addr.to_string(), tx.clone(), notification_sender);
     
     // Spawn a task to handle notifications for this client
     let client_addr_clone_notif = client_addr.to_string();
     let tx_clone_notif = tx.clone();
     let notification_task = tokio::spawn(async move {
         loop {
-            match notification_receiver.recv().await {
+            match notification_receiver.recv() {
                 Some(notification) => {
                     let notification_msg = StoreMessage::Notification { notification };
                     if let Ok(notification_text) = serde_json::to_string(&notification_msg) {
-                        if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)).await {
+                        if let Err(e) = tx_clone_notif.send(Message::Text(notification_text)) {
                             error!(
                                 client_addr = %client_addr_clone_notif,
                                 error = %e,
@@ -856,8 +856,8 @@ async fn handle_client_connection(
     let outgoing_task = tokio::spawn(async move {
         let mut ws_sender = ws_sender;
         
-        while let Some(message) = rx.recv().await {
-            if let Err(e) = ws_sender.send(message).await {
+        while let Some(message) = rx.recv() {
+            if let Err(e) = ws_sender.send(message) {
                 error!(
                     client_addr = %client_addr_clone,
                     error = %e,
@@ -868,11 +868,11 @@ async fn handle_client_connection(
         }
         
         // Notify service that client disconnected
-        handle_clone.client_disconnected(client_addr_clone).await;
+        handle_clone.client_disconnected(client_addr_clone);
     });
     
     // Handle incoming messages from client (after successful authentication)
-    while let Some(msg) = ws_receiver.next().await {
+    while let Some(msg) = ws_receiver.next() {
         match msg {
             Ok(Message::Text(text)) => {
                 debug!(
@@ -884,7 +884,7 @@ async fn handle_client_connection(
                 match serde_json::from_str::<StoreMessage>(&text) {
                     Ok(store_msg) => {
                         // Process the message and generate response
-                        let response_msg = handle.process_store_message(store_msg, Some(client_addr.to_string())).await;
+                        let response_msg = handle.process_store_message(store_msg, Some(client_addr.to_string()));
                         
                         // Send response back to client using the channel
                         let response_text = match serde_json::to_string(&response_msg) {
@@ -895,7 +895,7 @@ async fn handle_client_connection(
                             }
                         };
                         
-                        if let Err(e) = tx.send(Message::Text(response_text)).await {
+                        if let Err(e) = tx.send(Message::Text(response_text)) {
                             error!(error = %e, "Failed to send response to client");
                             break;
                         }
@@ -912,7 +912,7 @@ async fn handle_client_connection(
                             error: format!("Failed to parse message: {}", e),
                         };
                         if let Ok(error_text) = serde_json::to_string(&error_msg) {
-                            if let Err(e) = tx.send(Message::Text(error_text)).await {
+                            if let Err(e) = tx.send(Message::Text(error_text)) {
                                 error!(error = %e, "Failed to send error response to client");
                                 break;
                             }
@@ -926,7 +926,7 @@ async fn handle_client_connection(
             }
             Ok(Message::Ping(payload)) => {
                 debug!("Received ping from client");
-                if let Err(e) = tx.send(Message::Pong(payload)).await {
+                if let Err(e) = tx.send(Message::Pong(payload)) {
                     error!(error = %e, "Failed to send pong to client");
                     break;
                 }
@@ -949,7 +949,7 @@ async fn handle_client_connection(
     }
     
     // Notify service that client disconnected
-    handle.client_disconnected(client_addr.to_string()).await;
+    handle.client_disconnected(client_addr.to_string());
     
     // Abort the outgoing task and notification task
     outgoing_task.abort();
@@ -960,19 +960,19 @@ async fn handle_client_connection(
 }
 
 /// Start the client WebSocket server
-async fn start_client_server(config: ClientConfig, handle: ClientHandle) -> Result<()> {
+fn start_client_server(config: ClientConfig, handle: ClientHandle) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.client_port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr)?;
     info!(bind_address = %addr, "Client WebSocket server started");
     
     loop {
-        match listener.accept().await {
+        match listener.accept() {
             Ok((stream, client_addr)) => {
                 debug!(client_addr = %client_addr, "Accepted new client connection");
                 
                 let handle_clone = handle.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client_connection(stream, client_addr, handle_clone).await {
+                    if let Err(e) = handle_client_connection(stream, client_addr, handle_clone) {
                         error!(
                             error = %e,
                             client_addr = %client_addr,

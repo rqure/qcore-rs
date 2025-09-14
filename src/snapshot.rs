@@ -12,13 +12,13 @@ use crate::{files::{FileConfig, FileManager, FileManagerTrait}, Services};
 #[async_trait]
 pub trait SnapshotTrait {
     /// Save a snapshot to disk and return the snapshot counter
-    async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64>;
+    fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64>;
     
     /// Load the latest snapshot from disk
-    async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>>;
+    fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>>;
     
     /// Initialize snapshot counter from existing files
-    async fn initialize_counter(&mut self) -> Result<()>;
+    fn initialize_counter(&mut self) -> Result<()>;
 }
 
 
@@ -51,23 +51,23 @@ pub enum SnapshotRequest {
 }
 
 impl SnapshotHandle {
-    pub async fn save(&self, snapshot: qlib_rs::Snapshot) -> Result<u64> {
+    pub fn save(&self, snapshot: qlib_rs::Snapshot) -> Result<u64> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.sender.send(SnapshotRequest::Save {
             snapshot,
             response: response_tx,
-        }).await.map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
-        response_rx.await.map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
+        }).map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
+        response_rx.map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
     }
 
     /// Set services for dependencies
-    pub async fn set_services(&self, services: Services) {
+    pub fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(SnapshotRequest::SetServices {
             services,
             response: response_tx,
-        }).await {
-            if let Err(e) = response_rx.await {
+        }) {
+            if let Err(e) = response_rx {
                 error!(error = %e, "Snapshot service SetServices response channel closed");
             }
         }
@@ -82,7 +82,7 @@ impl SnapshotService {
 
         tokio::spawn(async move {
             let mut service = SnapshotService::new(FileManager, config);
-            match service.initialize_counter().await {
+            match service.initialize_counter() {
                 Ok(_) => info!("Snapshot service initialized successfully"),
                 Err(e) => {
                     error!(error = %e, "Failed to initialize snapshot service");
@@ -90,18 +90,18 @@ impl SnapshotService {
                 },
             }
 
-            while let Some(request) = receiver.recv().await {
+            while let Some(request) = receiver.recv() {
                 match request {
                     SnapshotRequest::Save { snapshot, response } => {
-                        let result = service.save(&snapshot).await;
+                        let result = service.save(&snapshot);
                         if let Err(_) = response.send(result) {
                             error!("Failed to send snapshot save response");
                         }
                     }
                     SnapshotRequest::SetServices { services: _services, response } => {
-                        match service.load_latest().await {
+                        match service.load_latest() {
                             Ok(Some((snapshot, _))) => {
-                                _services.store_handle.restore_snapshot(snapshot).await;
+                                _services.store_handle.restore_snapshot(snapshot);
                             }
                             _ => {}
                         }
@@ -145,10 +145,10 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
 impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
     /// Save a snapshot to disk and return the snapshot counter
     #[instrument(skip(self, snapshot))]
-    async fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64> {
-        create_dir_all(&self.config.snapshots_dir).await?;
+    fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64> {
+        create_dir_all(&self.config.snapshots_dir)?;
         
-        let current_snapshot_counter = self.file_manager.get_next_counter(&self.config.snapshots_dir, &self.snapshot_config).await?;
+        let current_snapshot_counter = self.file_manager.get_next_counter(&self.config.snapshots_dir, &self.snapshot_config)?;
 
         let snapshot_filename = format!("snapshot_{:010}.bin", current_snapshot_counter);
         let snapshot_path = self.config.snapshots_dir.join(&snapshot_filename);
@@ -166,10 +166,10 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
             .write(true)
             .truncate(true)
             .open(&snapshot_path)
-            .await?;
+            ?;
         
-        file.write_all(&serialized).await?;
-        file.flush().await?;
+        file.write_all(&serialized)?;
+        file.flush()?;
         
         info!(
             snapshot_size_bytes = serialized.len(),
@@ -178,7 +178,7 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
         );
         
         // Clean up old snapshots
-        if let Err(e) = self.file_manager.cleanup_old_files(&self.config.snapshots_dir, &self.snapshot_config).await {
+        if let Err(e) = self.file_manager.cleanup_old_files(&self.config.snapshots_dir, &self.snapshot_config) {
             error!(error = %e, "Failed to clean up old snapshots");
         }
         
@@ -186,8 +186,8 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
     }
     
     /// Load the latest snapshot from disk
-    async fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
-        let snapshot_files = self.file_manager.scan_files(&self.config.snapshots_dir, &self.snapshot_config).await?;
+    fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
+        let snapshot_files = self.file_manager.scan_files(&self.config.snapshots_dir, &self.snapshot_config)?;
         
         if snapshot_files.is_empty() {
             info!("No snapshot files found, starting with empty store");
@@ -202,7 +202,7 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
                 "Attempting to load snapshot"
             );
             
-            match self.try_load_snapshot(&file_info.path).await {
+            match self.try_load_snapshot(&file_info.path) {
                 Ok(Some(snapshot)) => {
                     info!(
                         snapshot_file = %file_info.path.display(),
@@ -231,8 +231,8 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
     }
     
     /// Initialize snapshot counter from existing files
-    async fn initialize_counter(&mut self) -> Result<()> {
-        let next_snapshot_counter = self.file_manager.get_next_counter(&self.config.snapshots_dir, &self.snapshot_config).await?;
+    fn initialize_counter(&mut self) -> Result<()> {
+        let next_snapshot_counter = self.file_manager.get_next_counter(&self.config.snapshots_dir, &self.snapshot_config)?;
         
         info!(
             snapshot_dir = %self.config.snapshots_dir.display(),
@@ -246,11 +246,11 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
 
 impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
     /// Try to load a single snapshot file
-    async fn try_load_snapshot(&self, snapshot_path: &PathBuf) -> Result<Option<qlib_rs::Snapshot>> {
-        match File::open(snapshot_path).await {
+    fn try_load_snapshot(&self, snapshot_path: &PathBuf) -> Result<Option<qlib_rs::Snapshot>> {
+        match File::open(snapshot_path) {
             Ok(mut file) => {
                 let mut buffer = Vec::new();
-                match file.read_to_end(&mut buffer).await {
+                match file.read_to_end(&mut buffer) {
                     Ok(_) => {
                         match bincode::deserialize(&buffer) {
                             Ok(snapshot) => Ok(Some(snapshot)),
@@ -261,7 +261,7 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
                                     "Failed to deserialize snapshot, marking for cleanup"
                                 );
                                 // Defensive: Mark corrupted snapshot for cleanup
-                                if let Err(cleanup_err) = remove_file(snapshot_path).await {
+                                if let Err(cleanup_err) = remove_file(snapshot_path) {
                                     warn!(
                                         error = %cleanup_err,
                                         snapshot_file = %snapshot_path.display(),

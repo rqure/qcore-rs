@@ -141,7 +141,7 @@ struct WalSystemEntry {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize tracing for CLI tools
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
     );
 
     let mut wal_reader = WalReader::new(config)?;
-    wal_reader.read_wal_files(start_time, end_time).await?;
+    wal_reader.read_wal_files(start_time, end_time)?;
 
     Ok(())
 }
@@ -246,13 +246,13 @@ impl WalReader {
         })
     }
 
-    async fn read_wal_files(&mut self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+    fn read_wal_files(&mut self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
         if !self.wal_dir.exists() {
             return Err(anyhow::anyhow!("WAL directory does not exist: {}", self.wal_dir.display()));
         }
 
         // Find all WAL files
-        let wal_files = self.find_wal_files().await?;
+        let wal_files = self.find_wal_files()?;
         
         if wal_files.is_empty() {
             info!("No WAL files found in {}", self.wal_dir.display());
@@ -263,7 +263,7 @@ impl WalReader {
 
         // Process each WAL file in order
         for (wal_file, _counter) in &wal_files {
-            self.process_wal_file(wal_file, start_time, end_time).await?;
+            self.process_wal_file(wal_file, start_time, end_time)?;
         }
 
         // Print collected entries as tables (if not in follow mode)
@@ -277,17 +277,17 @@ impl WalReader {
 
         // If follow mode is enabled, continue monitoring for new files
         if self.config.follow {
-            self.follow_mode(start_time, end_time).await?;
+            self.follow_mode(start_time, end_time)?;
         }
 
         Ok(())
     }
 
-    async fn find_wal_files(&self) -> Result<Vec<(PathBuf, u64)>> {
-        let mut entries = read_dir(&self.wal_dir).await?;
+    fn find_wal_files(&self) -> Result<Vec<(PathBuf, u64)>> {
+        let mut entries = read_dir(&self.wal_dir)?;
         let mut wal_files = Vec::new();
 
-        while let Some(entry) = entries.next_entry().await? {
+        while let Some(entry) = entries.next_entry()? {
             let path = entry.path();
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                 if filename.starts_with("wal_") && filename.ends_with(".log") {
@@ -306,12 +306,12 @@ impl WalReader {
         Ok(wal_files)
     }
 
-    async fn process_wal_file(&mut self, wal_path: &PathBuf, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+    fn process_wal_file(&mut self, wal_path: &PathBuf, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
         info!("Processing WAL file: {}", wal_path.display());
 
-        let mut file = File::open(wal_path).await?;
+        let mut file = File::open(wal_path)?;
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).await?;
+        file.read_to_end(&mut buffer)?;
 
         let mut offset = 0;
         let mut entries_processed = 0;
@@ -721,16 +721,16 @@ impl WalReader {
         }
     }
 
-    async fn follow_mode(&mut self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+    fn follow_mode(&mut self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
         info!("Entering follow mode - monitoring for new WAL entries...");
         
         // Keep track of file sizes to detect new content
         let mut file_positions: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
         
         // Initialize positions for existing files
-        let initial_files = self.find_wal_files().await?;
+        let initial_files = self.find_wal_files()?;
         for (file_path, _counter) in &initial_files {
-            if let Ok(metadata) = tokio::fs::metadata(file_path).await {
+            if let Ok(metadata) = tokio::fs::metadata(file_path) {
                 file_positions.insert(file_path.clone(), metadata.len());
             }
         }
@@ -738,18 +738,18 @@ impl WalReader {
         info!("Following {} WAL files for new entries", file_positions.len());
         
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500));
             
-            let current_files = self.find_wal_files().await?;
+            let current_files = self.find_wal_files()?;
             
             // Check for new files
             for (file_path, _counter) in &current_files {
                 if !file_positions.contains_key(file_path) {
                     info!("New WAL file detected: {}", file_path.display());
-                    self.process_wal_file(file_path, start_time, end_time).await?;
+                    self.process_wal_file(file_path, start_time, end_time)?;
                     
                     // Track this new file
-                    if let Ok(metadata) = tokio::fs::metadata(file_path).await {
+                    if let Ok(metadata) = tokio::fs::metadata(file_path) {
                         file_positions.insert(file_path.clone(), metadata.len());
                     }
                 }
@@ -757,11 +757,11 @@ impl WalReader {
             
             // Check existing files for new content
             for (file_path, last_size) in file_positions.clone().iter() {
-                if let Ok(metadata) = tokio::fs::metadata(file_path).await {
+                if let Ok(metadata) = tokio::fs::metadata(file_path) {
                     let current_size = metadata.len();
                     if current_size > *last_size {
                         // File has grown, process new content
-                        if let Err(e) = self.process_wal_file_from_offset(file_path, *last_size as usize, start_time, end_time).await {
+                        if let Err(e) = self.process_wal_file_from_offset(file_path, *last_size as usize, start_time, end_time) {
                             warn!("Failed to process new content in {}: {}", file_path.display(), e);
                         } else {
                             file_positions.insert(file_path.clone(), current_size);
@@ -785,10 +785,10 @@ impl WalReader {
         Ok(())
     }
 
-    async fn process_wal_file_from_offset(&mut self, wal_path: &PathBuf, start_offset: usize, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
-        let mut file = File::open(wal_path).await?;
+    fn process_wal_file_from_offset(&mut self, wal_path: &PathBuf, start_offset: usize, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
+        let mut file = File::open(wal_path)?;
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).await?;
+        file.read_to_end(&mut buffer)?;
 
         if start_offset >= buffer.len() {
             return Ok(()); // Nothing new to process

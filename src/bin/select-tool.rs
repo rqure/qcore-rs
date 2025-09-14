@@ -263,7 +263,7 @@ impl QueryMetrics {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let total_start = Instant::now();
     let mut metrics = QueryMetrics::new();
 
@@ -305,7 +305,7 @@ async fn main() -> Result<()> {
     
     // Connect to the Core service with authentication
     let connection_start = Instant::now();
-    let mut store = StoreProxy::connect_and_authenticate(&config.core_url, &username, &password).await
+    let mut store = StoreProxy::connect_and_authenticate(&config.core_url, &username, &password)
         .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
     metrics.connection_time = connection_start.elapsed();
 
@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
 
     // Execute the query
     let query_start = Instant::now();
-    let (results, pages_fetched) = execute_query(&mut store, &entity_type, config.filter.as_deref(), config.exact, config.limit, config.page_size).await
+    let (results, pages_fetched) = execute_query(&mut store, &entity_type, config.filter.as_deref(), config.exact, config.limit, config.page_size)
         .context("Failed to execute query")?;
     metrics.query_time = query_start.elapsed();
     metrics.entities_found = results.len();
@@ -329,21 +329,21 @@ async fn main() -> Result<()> {
 
     // Fetch field values for the results
     let field_fetch_start = Instant::now();
-    let (entities_with_data, fields_fetched) = fetch_entity_data(&mut store, &results, &fields_to_display).await
+    let (entities_with_data, fields_fetched) = fetch_entity_data(&mut store, &results, &fields_to_display)
         .context("Failed to fetch entity data")?;
     metrics.field_fetch_time = field_fetch_start.elapsed();
     metrics.fields_fetched = fields_fetched;
 
     // Display results
     let display_start = Instant::now();
-    display_results(&entities_with_data, &config).await
+    display_results(&entities_with_data, &config)
         .context("Failed to display results")?;
     metrics.display_time = display_start.elapsed();
 
     // Export if requested
     if let Some(export_path) = &config.export {
         let export_start = Instant::now();
-        export_results(&entities_with_data, export_path).await
+        export_results(&entities_with_data, export_path)
             .context("Failed to export results")?;
         metrics.export_time = export_start.elapsed();
         info!("Results exported to {}", export_path.display());
@@ -361,7 +361,7 @@ async fn main() -> Result<()> {
 }
 
 /// Execute the query against the store
-async fn execute_query(
+fn execute_query(
     store: &mut StoreProxy,
     entity_type: &EntityType,
     filter: Option<&str>,
@@ -383,9 +383,9 @@ async fn execute_query(
 
     loop {
         let page_result: PageResult<EntityId> = if exact {
-            store.find_entities_exact(entity_type, page_opts.clone(), filter.map(|s| s.to_string())).await?
+            store.find_entities_exact(entity_type, page_opts.clone(), filter.map(|s| s.to_string()))?
         } else {
-            store.find_entities_paginated(entity_type, page_opts.clone(), filter.map(|s| s.to_string())).await?
+            store.find_entities_paginated(entity_type, page_opts.clone(), filter.map(|s| s.to_string()))?
         };
 
         pages_fetched += 1;
@@ -430,7 +430,7 @@ fn parse_fields(fields: &Option<String>) -> Vec<String> {
 }
 
 /// Fetch field data for the given entities
-async fn fetch_entity_data(
+fn fetch_entity_data(
     store: &mut StoreProxy,
     entity_ids: &[EntityId],
     fields: &[String],
@@ -447,7 +447,7 @@ async fn fetch_entity_data(
             reqs.push(sread!(entity_id.clone(), FieldType::from(field.as_str())));
         }
 
-        match store.perform(reqs).await {
+        match store.perform(reqs) {
             Ok(res) => {
                 fields_fetched += fields.len();
                 results.push(EntityDisplay {
@@ -472,7 +472,7 @@ async fn fetch_entity_data(
 }
 
 /// Display the results according to the configured format
-async fn display_results(entities: &[EntityDisplay], config: &Config) -> Result<()> {
+fn display_results(entities: &[EntityDisplay], config: &Config) -> Result<()> {
     match config.format {
         OutputFormat::Count => {
             println!("{}", entities.len());
@@ -713,7 +713,7 @@ fn display_table(entities: &[EntityDisplay], config: &Config) -> Result<()> {
 }
 
 /// Export results to a JSON file
-async fn export_results(entities: &[EntityDisplay], export_path: &std::path::PathBuf) -> Result<()> {
+fn export_results(entities: &[EntityDisplay], export_path: &std::path::PathBuf) -> Result<()> {
     let mut json_entities = Vec::new();
 
     for entity in entities {
@@ -751,7 +751,7 @@ async fn export_results(entities: &[EntityDisplay], export_path: &std::path::Pat
     let output = serde_json::to_string_pretty(&json_entities)
         .context("Failed to serialize results to JSON")?;
 
-    tokio::fs::write(export_path, output).await
+    tokio::fs::write(export_path, output)
         .with_context(|| format!("Failed to write to {}", export_path.display()))?;
 
     Ok(())

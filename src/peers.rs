@@ -129,105 +129,105 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
-    pub async fn send_sync_message(&self, requests: Vec<qlib_rs::Request>) {
+    pub fn send_sync_message(&self, requests: Vec<qlib_rs::Request>) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(PeerRequest::SendSyncMessage {
             requests,
             response: response_tx,
-        }).await {
-            if let Err(_) = response_rx.await {
+        }) {
+            if let Err(_) = response_rx {
                 error!("Failed to receive SendSyncMessage response");
             }
         }
     }
 
-    pub async fn get_availability_state(&self) -> AvailabilityState {
+    pub fn get_availability_state(&self) -> AvailabilityState {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(PeerRequest::GetAvailabilityState {
             response: response_tx,
-        }).await {
-            response_rx.await.unwrap_or(AvailabilityState::Unavailable)
+        }) {
+            response_rx.unwrap_or(AvailabilityState::Unavailable)
         } else {
             AvailabilityState::Unavailable
         }
     }
 
-    pub async fn get_leadership_info(&self) -> (bool, Option<String>) {
+    pub fn get_leadership_info(&self) -> (bool, Option<String>) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(PeerRequest::GetLeadershipInfo {
             response: response_tx,
-        }).await {
-            response_rx.await.unwrap_or((false, None))
+        }) {
+            response_rx.unwrap_or((false, None))
         } else {
             (false, None)
         }
     }
 
-    pub async fn peer_connected(&self, peer_addr: String, machine_id: String, startup_time: u64) {
+    pub fn peer_connected(&self, peer_addr: String, machine_id: String, startup_time: u64) {
         if let Err(e) = self.sender.send(PeerRequest::PeerConnected {
             peer_addr,
             machine_id,
             startup_time,
-        }).await {
+        }) {
             error!(error = %e, "Failed to send PeerConnected request");
         }
     }
 
-    pub async fn peer_disconnected(&self, peer_addr: String) {
-        if let Err(e) = self.sender.send(PeerRequest::PeerDisconnected { peer_addr }).await {
+    pub fn peer_disconnected(&self, peer_addr: String) {
+        if let Err(e) = self.sender.send(PeerRequest::PeerDisconnected { peer_addr }) {
             error!(error = %e, "Failed to send PeerDisconnected request");
         }
     }
 
-    pub async fn outbound_peer_connected(&self, peer_addr: String, sender: Sender<Message>) {
+    pub fn outbound_peer_connected(&self, peer_addr: String, sender: Sender<Message>) {
         if let Err(e) = self.sender.send(PeerRequest::OutboundPeerConnected {
             peer_addr,
             sender,
-        }).await {
+        }) {
             error!(error = %e, "Failed to send OutboundPeerConnected request");
         }
     }
 
-    pub async fn outbound_peer_disconnected(&self, peer_addr: String) {
-        if let Err(e) = self.sender.send(PeerRequest::OutboundPeerDisconnected { peer_addr }).await {
+    pub fn outbound_peer_disconnected(&self, peer_addr: String) {
+        if let Err(e) = self.sender.send(PeerRequest::OutboundPeerDisconnected { peer_addr }) {
             error!(error = %e, "Failed to send OutboundPeerDisconnected request");
         }
     }
 
-    pub async fn process_peer_message(&self, peer_msg: PeerMessage, peer_addr: String) -> Option<PeerMessage> {
+    pub fn process_peer_message(&self, peer_msg: PeerMessage, peer_addr: String) -> Option<PeerMessage> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(PeerRequest::ProcessPeerMessage {
             peer_msg,
             peer_addr,
             response: response_tx,
-        }).await {
-            response_rx.await.unwrap_or(None)
+        }) {
+            response_rx.unwrap_or(None)
         } else {
             None
         }
     }
 
     /// Check if we already have an outbound connection to a peer
-    pub async fn is_outbound_peer_connected(&self, peer_addr: &str) -> bool {
+    pub fn is_outbound_peer_connected(&self, peer_addr: &str) -> bool {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(PeerRequest::IsOutboundPeerConnected {
             peer_addr: peer_addr.to_string(),
             response: response_tx,
-        }).await {
-            response_rx.await.unwrap_or(false)
+        }) {
+            response_rx.unwrap_or(false)
         } else {
             false
         }
     }
 
     /// Set services for dependencies
-    pub async fn set_services(&self, services: Services) {
+    pub fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(PeerRequest::SetServices {
             services,
             response: response_tx,
-        }).await {
-            if let Err(_) = response_rx.await {
+        }) {
+            if let Err(_) = response_rx {
                 error!("Failed to receive SetServices response");
             }
         }
@@ -277,7 +277,7 @@ impl PeerService {
             let handle_clone = handle.clone();
             let config_clone = config.clone();
             tokio::spawn(async move {
-                if let Err(e) = start_inbound_peer_server(config_clone, handle_clone).await {
+                if let Err(e) = start_inbound_peer_server(config_clone, handle_clone) {
                     error!(error = %e, "Inbound peer server failed");
                 }
             });
@@ -287,7 +287,7 @@ impl PeerService {
             let handle_clone = handle.clone();
             let config_clone = config.clone();
             tokio::spawn(async move {
-                if let Err(e) = manage_outbound_peer_connections(config_clone, handle_clone).await {
+                if let Err(e) = manage_outbound_peer_connections(config_clone, handle_clone) {
                     error!(error = %e, "Outbound peer connection manager failed");
                 }
             });
@@ -300,11 +300,11 @@ impl PeerService {
             loop {
                 tokio::select! {
                     _ = check_interval.tick() => {
-                        service.check_leader_election_and_sync().await;
+                        service.check_leader_election_and_sync();
                     }
                     request = receiver.recv() => {
                         match request {
-                            Some(req) => service.handle_request(req).await,
+                            Some(req) => service.handle_request(req),
                             None => break,
                         }
                     }
@@ -317,10 +317,10 @@ impl PeerService {
         handle
     }
     
-    async fn handle_request(&mut self, request: PeerRequest) {
+    fn handle_request(&mut self, request: PeerRequest) {
         match request {
             PeerRequest::SendSyncMessage { requests, response } => {
-                self.send_sync_message_to_peers(requests).await;
+                self.send_sync_message_to_peers(requests);
                 if let Err(_) = response.send(()) {
                     error!("Failed to send SendSyncMessage response");
                 }
@@ -342,10 +342,10 @@ impl PeerService {
                 }
             }
             PeerRequest::PeerConnected { peer_addr, machine_id, startup_time } => {
-                self.handle_peer_connected(peer_addr, machine_id, startup_time).await;
+                self.handle_peer_connected(peer_addr, machine_id, startup_time);
             }
             PeerRequest::PeerDisconnected { peer_addr } => {
-                self.handle_peer_disconnected(peer_addr).await;
+                self.handle_peer_disconnected(peer_addr);
             }
             PeerRequest::OutboundPeerConnected { peer_addr, sender } => {
                 self.connected_outbound_peers.insert(peer_addr.clone(), sender);
@@ -358,7 +358,7 @@ impl PeerService {
                 
                 if let Ok(startup_json) = serde_json::to_string(&startup) {
                     if let Some(sender) = self.connected_outbound_peers.get(&peer_addr) {
-                        if let Err(e) = sender.send(Message::Text(startup_json)).await {
+                        if let Err(e) = sender.send(Message::Text(startup_json)) {
                             warn!(
                                 peer_addr = %peer_addr,
                                 error = %e,
@@ -374,7 +374,7 @@ impl PeerService {
                 self.connected_outbound_peers.remove(&peer_addr);
             }
             PeerRequest::ProcessPeerMessage { peer_msg, peer_addr, response } => {
-                let reply = self.process_peer_message_internal(peer_msg, peer_addr).await;
+                let reply = self.process_peer_message_internal(peer_msg, peer_addr);
                 if let Err(_) = response.send(reply) {
                     error!("Failed to send ProcessPeerMessage response");
                 }
@@ -388,7 +388,7 @@ impl PeerService {
         }
     }
     
-    async fn check_leader_election_and_sync(&mut self) {
+    fn check_leader_election_and_sync(&mut self) {
         // Self-promotion logic
         if !self.is_leader && 
            (self.config.peer_addresses.is_empty() || self.connected_outbound_peers.is_empty()) &&
@@ -418,14 +418,14 @@ impl PeerService {
                 
                 if elapsed >= self.config.full_sync_grace_period_secs {
                     if let Some(leader_machine_id) = &self.current_leader {
-                        self.send_full_sync_request(leader_machine_id.clone()).await;
+                        self.send_full_sync_request(leader_machine_id.clone());
                     }
                 }
             }
         }
     }
     
-    async fn handle_peer_connected(&mut self, peer_addr: String, machine_id: String, startup_time: u64) {
+    fn handle_peer_connected(&mut self, peer_addr: String, machine_id: String, startup_time: u64) {
         info!(
             peer_addr = %peer_addr,
             machine_id = %machine_id,
@@ -438,10 +438,10 @@ impl PeerService {
             startup_time,
         });
         
-        self.determine_leadership().await;
+        self.determine_leadership();
     }
     
-    async fn handle_peer_disconnected(&mut self, peer_addr: String) {
+    fn handle_peer_disconnected(&mut self, peer_addr: String) {
         let disconnected_machine_id = self.peer_info.get(&peer_addr)
             .map(|info| info.machine_id.clone());
         
@@ -455,13 +455,13 @@ impl PeerService {
                         disconnected_machine = %disconnected_machine_id,
                         "Current leader disconnected, retriggering leader election"
                     );
-                    self.determine_leadership().await;
+                    self.determine_leadership();
                 }
             }
         }
     }
     
-    async fn determine_leadership(&mut self) {
+    fn determine_leadership(&mut self) {
         let our_startup_time = self.startup_time;
         let our_machine_id = &self.config.machine;
         
@@ -531,13 +531,13 @@ impl PeerService {
            matches!(self.availability_state, AvailabilityState::Unavailable) {
             if let Some(services) = &self.services {
                 let client_handle = &services.client_handle;
-                client_handle.force_disconnect_all().await;
+                client_handle.force_disconnect_all();
                 info!("Disconnected all clients due to unavailability");
             }
         }
     }
     
-    async fn send_sync_message_to_peers(&self, requests: Vec<qlib_rs::Request>) {
+    fn send_sync_message_to_peers(&self, requests: Vec<qlib_rs::Request>) {
         let current_machine = &self.config.machine;
         
         // Filter requests to only include those from our machine
@@ -561,7 +561,7 @@ impl PeerService {
                 let message = Message::Text(message_json);
                 
                 for (peer_addr, sender) in &self.connected_outbound_peers {
-                    if let Err(e) = sender.send(message.clone()).await {
+                    if let Err(e) = sender.send(message.clone()) {
                         warn!(
                             peer_addr = %peer_addr,
                             error = %e,
@@ -579,7 +579,7 @@ impl PeerService {
         }
     }
     
-    async fn send_full_sync_request(&mut self, leader_machine_id: String) {
+    fn send_full_sync_request(&mut self, leader_machine_id: String) {
         info!(
             leader_machine_id = %leader_machine_id,
             "Grace period expired, sending FullSyncRequest to leader"
@@ -596,7 +596,7 @@ impl PeerService {
             
             let mut sent = false;
             for (peer_addr, sender) in &self.connected_outbound_peers {
-                if let Err(e) = sender.send(message.clone()).await {
+                if let Err(e) = sender.send(message.clone()) {
                     warn!(
                         peer_addr = %peer_addr,
                         error = %e,
@@ -622,7 +622,7 @@ impl PeerService {
         }
     }
 
-    async fn process_peer_message_internal(&mut self, peer_msg: PeerMessage, _peer_addr: String) -> Option<PeerMessage> {
+    fn process_peer_message_internal(&mut self, peer_msg: PeerMessage, _peer_addr: String) -> Option<PeerMessage> {
         match peer_msg {
             PeerMessage::Startup { .. } => {
                 // Startup messages are handled separately through PeerConnected
@@ -634,7 +634,7 @@ impl PeerService {
                 
                 if let Some(services) = &self.services {
                     // Take a snapshot and send it
-                    if let Some(snapshot) = services.store_handle.take_snapshot().await {
+                    if let Some(snapshot) = services.store_handle.take_snapshot() {
                         info!(
                             requesting_machine = %machine_id,
                             snapshot_entities = snapshot.entities.len(),
@@ -657,12 +657,12 @@ impl PeerService {
                 
                 if let Some(services) = &self.services {
                     // Apply the snapshot to the store
-                    services.store_handle.disable_notifications().await;
-                    services.store_handle.restore_snapshot(snapshot.clone()).await;
-                    services.store_handle.enable_notifications().await;
+                    services.store_handle.disable_notifications();
+                    services.store_handle.restore_snapshot(snapshot.clone());
+                    services.store_handle.enable_notifications();
                     
                     // Save the snapshot to disk for persistence
-                    match services.snapshot_handle.save(snapshot).await {
+                    match services.snapshot_handle.save(snapshot) {
                         Ok(snapshot_counter) => {
                             info!(
                                 snapshot_counter = snapshot_counter,
@@ -676,7 +676,7 @@ impl PeerService {
                                 originator: Some(self.config.machine.clone()),
                             };
                             
-                            if let Err(e) = services.wal_handle.write_request(snapshot_request).await {
+                            if let Err(e) = services.wal_handle.write_request(snapshot_request) {
                                 error!(
                                     error = %e,
                                     snapshot_counter = snapshot_counter,
@@ -727,7 +727,7 @@ impl PeerService {
                     
                     let req_len = requests_to_apply.len();
                     if !requests_to_apply.is_empty() {
-                        if let Err(e) = services.store_handle.perform_mut(requests_to_apply).await {
+                        if let Err(e) = services.store_handle.perform_mut(requests_to_apply) {
                             error!(
                                 error = %e,
                                 request_count = req_len,
@@ -754,24 +754,24 @@ impl PeerService {
 
 /// Handle a single peer WebSocket connection
 #[instrument(skip(stream, handle), fields(peer_addr = %peer_addr))]
-async fn handle_inbound_peer_connection(
+fn handle_inbound_peer_connection(
     stream: TcpStream,
     peer_addr: std::net::SocketAddr,
     handle: PeerHandle,
 ) -> Result<()> {
     info!("Accepting inbound peer connection");
     
-    let ws_stream = accept_async(stream).await?;
+    let ws_stream = accept_async(stream)?;
     debug!("WebSocket handshake completed");
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
-    while let Some(msg) = ws_receiver.next().await {
+    while let Some(msg) = ws_receiver.next() {
         match msg {
             Ok(Message::Text(text)) => {
                 match serde_json::from_str::<PeerMessage>(&text) {
                     Ok(peer_msg) => {
-                        handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
+                        handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle);
                     }
                     Err(e) => {
                         error!(error = %e, "Failed to deserialize text message from peer");
@@ -781,7 +781,7 @@ async fn handle_inbound_peer_connection(
             Ok(Message::Binary(data)) => {
                 match bincode::deserialize::<PeerMessage>(&data) {
                     Ok(peer_msg) => {
-                        handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle).await;
+                        handle_peer_message(peer_msg, &peer_addr, &mut ws_sender, &handle);
                     }
                     Err(e) => {
                         error!(error = %e, "Failed to deserialize binary message from peer");
@@ -789,7 +789,7 @@ async fn handle_inbound_peer_connection(
                 }
             }
             Ok(Message::Ping(payload)) => {
-                if let Err(e) = ws_sender.send(Message::Pong(payload)).await {
+                if let Err(e) = ws_sender.send(Message::Pong(payload)) {
                     error!(error = %e, "Failed to respond to ping from peer");
                     break;
                 }
@@ -803,12 +803,12 @@ async fn handle_inbound_peer_connection(
         }
     }
     
-    handle.peer_disconnected(peer_addr.to_string()).await;
+    handle.peer_disconnected(peer_addr.to_string());
     info!("Peer connection terminated");
     Ok(())
 }
 
-async fn handle_peer_message(
+fn handle_peer_message(
     peer_msg: PeerMessage,
     peer_addr: &std::net::SocketAddr,
     ws_sender: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
@@ -822,12 +822,12 @@ async fn handle_peer_message(
                 "Processing startup message from peer"
             );
             
-            handle.peer_connected(peer_addr.to_string(), machine_id, startup_time).await;
+            handle.peer_connected(peer_addr.to_string(), machine_id, startup_time);
         }
         
         other_msg => {
             // Process the message and get potential response
-            if let Some(response_msg) = handle.process_peer_message(other_msg, peer_addr.to_string()).await {
+            if let Some(response_msg) = handle.process_peer_message(other_msg, peer_addr.to_string()) {
                 match &response_msg {
                     PeerMessage::FullSyncResponse { .. } => {
                         // Use binary serialization for the snapshot since it contains complex key types
@@ -839,7 +839,7 @@ async fn handle_peer_message(
                                 );
                                 
                                 let message = Message::Binary(response_binary);
-                                if let Err(e) = ws_sender.send(message).await {
+                                if let Err(e) = ws_sender.send(message) {
                                     error!(
                                         error = %e,
                                         "Failed to send FullSyncResponse to requesting peer"
@@ -859,7 +859,7 @@ async fn handle_peer_message(
                     _ => {
                         // For other response types, use JSON serialization
                         if let Ok(response_json) = serde_json::to_string(&response_msg) {
-                            if let Err(e) = ws_sender.send(Message::Text(response_json)).await {
+                            if let Err(e) = ws_sender.send(Message::Text(response_json)) {
                                 error!(error = %e, "Failed to send response to peer");
                             }
                         }
@@ -870,21 +870,21 @@ async fn handle_peer_message(
     }
 }
 
-async fn start_inbound_peer_server(
+fn start_inbound_peer_server(
     config: PeerConfig,
     handle: PeerHandle,
 ) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.peer_port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr)?;
     info!(bind_address = %addr, "Peer WebSocket server started");
     
     loop {
-        match listener.accept().await {
+        match listener.accept() {
             Ok((stream, peer_addr)) => {
                 let handle_clone = handle.clone();
                 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr, handle_clone).await {
+                    if let Err(e) = handle_inbound_peer_connection(stream, peer_addr, handle_clone) {
                         error!(error = %e, peer_addr = %peer_addr, "Error handling peer connection");
                     }
                 });
@@ -896,18 +896,18 @@ async fn start_inbound_peer_server(
     }
 }
 
-async fn manage_outbound_peer_connections(config: PeerConfig, handle: PeerHandle) -> Result<()> {
+fn manage_outbound_peer_connections(config: PeerConfig, handle: PeerHandle) -> Result<()> {
     info!("Starting outbound peer connection manager");
     
     let reconnect_interval = Duration::from_secs(config.peer_reconnect_interval_secs);
     let mut interval = tokio::time::interval(reconnect_interval);
     
     loop {
-        interval.tick().await;
+        interval.tick();
         
         for peer_addr in &config.peer_addresses {
             // Check if we already have an active connection to this peer
-            if handle.is_outbound_peer_connected(peer_addr).await {
+            if handle.is_outbound_peer_connected(peer_addr) {
                 continue;
             }
             
@@ -915,7 +915,7 @@ async fn manage_outbound_peer_connections(config: PeerConfig, handle: PeerHandle
             let handle_clone = handle.clone();
             
             tokio::spawn(async move {
-                if let Err(e) = handle_outbound_peer_connection(&peer_addr_clone, handle_clone).await {
+                if let Err(e) = handle_outbound_peer_connection(&peer_addr_clone, handle_clone) {
                     error!(peer_addr = %peer_addr_clone, error = %e, "Failed to connect to peer");
                 }
             });
@@ -923,16 +923,16 @@ async fn manage_outbound_peer_connections(config: PeerConfig, handle: PeerHandle
     }
 }
 
-async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) -> Result<()> {
+fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) -> Result<()> {
     let ws_url = format!("ws://{}", peer_addr);
-    let (ws_stream, _) = connect_async(&ws_url).await?;
+    let (ws_stream, _) = connect_async(&ws_url)?;
     info!(peer_addr = %peer_addr, "Connected to outbound peer");
     
     let (ws_sender, mut ws_receiver) = ws_stream.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(65536);
     
     // Notify the service about the connection - it will handle sending the startup message
-    handle.outbound_peer_connected(peer_addr.to_string(), tx.clone()).await;
+    handle.outbound_peer_connected(peer_addr.to_string(), tx.clone());
     
     let peer_addr_clone = peer_addr.to_string();
     let handle_clone = handle.clone();
@@ -940,15 +940,15 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     // Spawn sender task
     let sender_task = tokio::spawn(async move {
         let mut ws_sender = ws_sender;
-        while let Some(message) = rx.recv().await {
-            if ws_sender.send(message).await.is_err() {
+        while let Some(message) = rx.recv() {
+            if ws_sender.send(message).is_err() {
                 break;
             }
         }
     });
     
     // Handle incoming messages (mainly FullSyncResponse)
-    while let Some(msg) = ws_receiver.next().await {
+    while let Some(msg) = ws_receiver.next() {
         match msg {
             Ok(Message::Binary(data)) => {
                 if let Ok(peer_msg) = bincode::deserialize::<PeerMessage>(&data) {
@@ -956,7 +956,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
                         PeerMessage::FullSyncResponse { .. } => {
                             // Handle FullSyncResponse - process it through the service
                             info!("Received FullSyncResponse via outbound connection");
-                            if let Some(_) = handle_clone.process_peer_message(peer_msg, peer_addr_clone.clone()).await {
+                            if let Some(_) = handle_clone.process_peer_message(peer_msg, peer_addr_clone.clone()) {
                                 // FullSyncResponse processing is handled internally
                             }
                         }
@@ -977,7 +977,7 @@ async fn handle_outbound_peer_connection(peer_addr: &str, handle: PeerHandle) ->
     }
     
     sender_task.abort();
-    handle_clone.outbound_peer_disconnected(peer_addr_clone).await;
+    handle_clone.outbound_peer_disconnected(peer_addr_clone);
     
     Ok(())
 }

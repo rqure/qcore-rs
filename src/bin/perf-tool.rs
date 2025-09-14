@@ -130,7 +130,7 @@ impl TestResult {
     }
 }
 
-async fn load_existing_entities_from_topology(config: &Config) -> Result<Vec<EntityId>> {
+fn load_existing_entities_from_topology(config: &Config) -> Result<Vec<EntityId>> {
     let mut entities = Vec::new();
     
     // Connect to load topology data using the first URL
@@ -138,12 +138,12 @@ async fn load_existing_entities_from_topology(config: &Config) -> Result<Vec<Ent
         &config.core_urls[0],
         &config.username,
         &config.password,
-    ).await.context("Failed to connect for topology loading")?;
+    ).context("Failed to connect for topology loading")?;
     
     let entity_type_filter = EntityType::from(config.entity_type.as_str());
     
     // Find existing entities of the specified type
-    let found_entities = store.find_entities(&entity_type_filter, None).await
+    let found_entities = store.find_entities(&entity_type_filter, None)
         .context("Failed to find entities")?;
     entities.extend(found_entities);
     
@@ -151,17 +151,17 @@ async fn load_existing_entities_from_topology(config: &Config) -> Result<Vec<Ent
     Ok(entities)
 }
 
-async fn find_test_entity(config: &Config) -> Result<EntityId> {
+fn find_test_entity(config: &Config) -> Result<EntityId> {
     let store = StoreProxy::connect_and_authenticate(
         &config.core_urls[0],
         &config.username,
         &config.password,
-    ).await.context("Failed to connect for finding test entity")?;
+    ).context("Failed to connect for finding test entity")?;
     
     let perf_test_entity_type = EntityType::from("PerfTestEntity");
     
     // Find the TestEntity by searching for entities with Name = "TestEntity"
-    let entities = store.find_entities(&perf_test_entity_type, Some("Name == 'TestEntity'".to_string())).await
+    let entities = store.find_entities(&perf_test_entity_type, Some("Name == 'TestEntity'".to_string()))
         .context("Failed to find test entity")?;
     
     if entities.is_empty() {
@@ -171,7 +171,7 @@ async fn find_test_entity(config: &Config) -> Result<EntityId> {
     Ok(entities[0].clone())
 }
 
-async fn run_test_client(
+fn run_test_client(
     config: Arc<Config>,
     client_id: usize,
     core_url: String,
@@ -182,7 +182,7 @@ async fn run_test_client(
         &core_url,
         &config.username,
         &config.password,
-    ).await.with_context(|| format!("Client {} failed to connect to {}", client_id, core_url))?;
+    ).with_context(|| format!("Client {} failed to connect to {}", client_id, core_url))?;
 
     debug!("Client {} connected successfully", client_id);
 
@@ -204,7 +204,7 @@ async fn run_test_client(
         if let Some(interval) = rps_limit {
             let elapsed_since_last = last_request_time.elapsed();
             if elapsed_since_last < interval {
-                sleep(interval - elapsed_since_last).await;
+                sleep(interval - elapsed_since_last);
             }
             last_request_time = Instant::now();
         }
@@ -215,7 +215,7 @@ async fn run_test_client(
             client_id,
             &test_entities,
             &test_entity_id,
-        ).await {
+        ) {
             Ok(_) => true,
             Err(e) => {
                 debug!("Client {} request failed: {}", client_id, e);
@@ -239,7 +239,7 @@ async fn run_test_client(
     Ok(local_stats)
 }
 
-async fn perform_test_operation(
+fn perform_test_operation(
     store: &mut StoreProxy,
     config: &Config,
     client_id: usize,
@@ -250,7 +250,7 @@ async fn perform_test_operation(
         TestType::ReadOnly => {
             if !test_entities.is_empty() {
                 let entity_id = &test_entities[client_id % test_entities.len()];
-                let _exists = store.entity_exists(entity_id).await;
+                let _exists = store.entity_exists(entity_id);
             }
         }
         TestType::WriteOnly => {
@@ -259,25 +259,25 @@ async fn perform_test_operation(
                 swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
                 swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
                 swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(fastrand::bool()))),
-            ]).await?;
+            ])?;
         }
         TestType::Mixed => {
             if client_id % 3 == 0 {
                 // Read operation
                 if !test_entities.is_empty() {
                     let entity_id = &test_entities[client_id % test_entities.len()];
-                    let _exists = store.entity_exists(entity_id).await;
+                    let _exists = store.entity_exists(entity_id);
                 }
             } else if client_id % 3 == 1 {
                 // Write operation to test entity only
                 store.perform(vec![
                     swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("MixedTest_Client_{}", client_id))),
                     swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(client_id as i64)),
-                ]).await?;
+                ])?;
             } else {
                 // Search operation
                 let entity_type = EntityType::from(config.entity_type.as_str());
-                let _result = store.find_entities_paginated(&entity_type, Some(PageOpts::new(20, None)), Some(format!("Name != 'NonExistent_{}'", client_id))).await?;
+                let _result = store.find_entities_paginated(&entity_type, Some(PageOpts::new(20, None)), Some(format!("Name != 'NonExistent_{}'", client_id)))?;
             }
         }
         TestType::Create => {
@@ -286,7 +286,7 @@ async fn perform_test_operation(
                 swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
                 swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(fastrand::i64(..))),
                 swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(true))),
-            ]).await?;
+            ])?;
         }
         TestType::Search => {
             let entity_type = EntityType::from(config.entity_type.as_str());
@@ -294,7 +294,7 @@ async fn perform_test_operation(
                 &entity_type,
                 Some(PageOpts::new(20, None)),
                 Some(format!("Name != 'NonExistent_{}'", client_id))
-            ).await?;
+            )?;
         }
         TestType::Bulk => {
             // Multiple writes to the existing test entity
@@ -306,17 +306,17 @@ async fn perform_test_operation(
                     requests.push(swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(i % 4 == 0))));
                 }
             }
-            store.perform(requests).await?;
+            store.perform(requests)?;
         }
     }
     Ok(())
 }
 
-async fn setup_test_data(config: &Config) -> Result<Vec<EntityId>> {
+fn setup_test_data(config: &Config) -> Result<Vec<EntityId>> {
     info!("Loading existing entities from topology...");
     
     // Load existing entities from topology for read operations only
-    let entities = load_existing_entities_from_topology(config).await?;
+    let entities = load_existing_entities_from_topology(config)?;
     
     info!("Found {} existing entities for read operations", entities.len());
     
@@ -325,7 +325,7 @@ async fn setup_test_data(config: &Config) -> Result<Vec<EntityId>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let config = Arc::new(Config::parse());
 
     // Validate that we have at least one URL
@@ -352,12 +352,12 @@ async fn main() -> Result<()> {
     info!("Clients will be distributed evenly across {} URL(s)", config.core_urls.len());
 
     // Find the test entity that we'll use for write operations
-    let test_entity_id = find_test_entity(&config).await
+    let test_entity_id = find_test_entity(&config)
         .context("Failed to find test entity")?;
     info!("Found test entity: {:?}", test_entity_id);
 
     // Load test data
-    let test_entities = Arc::new(setup_test_data(&config).await?);
+    let test_entities = Arc::new(setup_test_data(&config)?);
 
     // Warmup phase
     if config.warmup > 0 {
@@ -383,7 +383,7 @@ async fn main() -> Result<()> {
                     core_url,
                     test_entities_clone,
                     test_entity_id_clone,
-                ).await {
+                ) {
                     Ok(_) => {},
                     Err(e) => warn!("Warmup client {} failed: {}", i, e),
                 }
@@ -392,7 +392,7 @@ async fn main() -> Result<()> {
         }
         
         for handle in warmup_handles {
-            let _ = handle.await;
+            let _ = handle;
         }
         
         info!("Warmup phase completed");
@@ -417,7 +417,7 @@ async fn main() -> Result<()> {
                 core_url,
                 test_entities_clone,
                 test_entity_id_clone,
-            ).await
+            )
         });
         handles.push(handle);
     }
@@ -425,7 +425,7 @@ async fn main() -> Result<()> {
     // Wait for all clients to complete and collect results
     let mut client_results = Vec::new();
     for handle in handles {
-        match handle.await {
+        match handle {
             Ok(Ok(result)) => client_results.push(result),
             Ok(Err(e)) => error!("Client failed: {}", e),
             Err(e) => error!("Client task panicked: {}", e),

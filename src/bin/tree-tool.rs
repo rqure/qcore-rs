@@ -53,7 +53,7 @@ struct TreeNode {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize tracing for CLI tools
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
     info!(core_url = %config.core_url, "Connecting to QCore service");
     
     // Connect to the Core service with authentication
-    let mut store = StoreProxy::connect_and_authenticate(&config.core_url, &username, &password).await
+    let mut store = StoreProxy::connect_and_authenticate(&config.core_url, &username, &password)
         .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
 
     info!("Connected successfully, building tree structure");
@@ -94,12 +94,12 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Invalid entity ID format '{}': {}", start_id, e))?
     } else {
         // Find the Root entity
-        find_root_entity(&mut store).await
+        find_root_entity(&mut store)
             .context("Failed to find Root entity")?
     };
 
     // Build the tree structure
-    let tree = build_tree(&mut store, root_entity_id, config.max_depth, 0).await
+    let tree = build_tree(&mut store, root_entity_id, config.max_depth, 0)
         .context("Failed to build tree structure")?;
 
     // Print the tree
@@ -111,10 +111,10 @@ async fn main() -> Result<()> {
 }
 
 /// Find the Root entity in the data store
-async fn find_root_entity(store: &mut StoreProxy) -> Result<EntityId> {
+fn find_root_entity(store: &mut StoreProxy) -> Result<EntityId> {
     // Look for entities of type "Root"
     let root_type = EntityType::from("Root");
-    let entities = store.find_entities(&root_type, None).await
+    let entities = store.find_entities(&root_type, None)
         .context("Failed to find Root entities")?;
 
     if entities.is_empty() {
@@ -147,22 +147,22 @@ fn build_tree(
         }
 
         // Get entity type
-        let entity_type = get_entity_type(store, &entity_id).await
+        let entity_type = get_entity_type(store, &entity_id)
             .with_context(|| format!("Failed to get entity type for {}", entity_id.get_id()))?;
 
         // Get entity name
-        let name = get_entity_name(store, &entity_id).await
+        let name = get_entity_name(store, &entity_id)
             .with_context(|| format!("Failed to get entity name for {}", entity_id.get_id()))?;
 
         // Get children
-        let children_ids = get_entity_children(store, &entity_id).await
+        let children_ids = get_entity_children(store, &entity_id)
             .with_context(|| format!("Failed to get children for {}", entity_id.get_id()))?;
 
         // Recursively build child nodes
         let mut children = Vec::new();
         for child_id in children_ids {
             let child_id_str = child_id.get_id().to_string();
-            match build_tree(store, child_id, max_depth, current_depth + 1).await {
+            match build_tree(store, child_id, max_depth, current_depth + 1) {
                 Ok(child_node) => children.push(child_node),
                 Err(e) => {
                     warn!(
@@ -185,14 +185,14 @@ fn build_tree(
 }
 
 /// Get the entity type for a given entity ID
-async fn get_entity_type(_store: &mut StoreProxy, entity_id: &EntityId) -> Result<String> {
+fn get_entity_type(_store: &mut StoreProxy, entity_id: &EntityId) -> Result<String> {
     // The entity type is stored in the entity ID itself
     Ok(entity_id.get_type().as_ref().to_string())
 }
 
 /// Get the name of an entity
-async fn get_entity_name(store: &mut StoreProxy, entity_id: &EntityId) -> Result<String> {
-    let results = store.perform(vec![qlib_rs::sread!(entity_id.clone(), ft::name())]).await?;
+fn get_entity_name(store: &mut StoreProxy, entity_id: &EntityId) -> Result<String> {
+    let results = store.perform(vec![qlib_rs::sread!(entity_id.clone(), ft::name())])?;
     
     if let Some(request) = results.first() {
         if let Some(Value::String(name)) = request.value() {
@@ -204,8 +204,8 @@ async fn get_entity_name(store: &mut StoreProxy, entity_id: &EntityId) -> Result
 }
 
 /// Get the children of an entity
-async fn get_entity_children(store: &mut StoreProxy, entity_id: &EntityId) -> Result<Vec<EntityId>> {
-    let results = store.perform(vec![qlib_rs::sread!(entity_id.clone(), ft::children())]).await?;
+fn get_entity_children(store: &mut StoreProxy, entity_id: &EntityId) -> Result<Vec<EntityId>> {
+    let results = store.perform(vec![qlib_rs::sread!(entity_id.clone(), ft::children())])?;
 
     if let Some(request) = results.first() {
         if let Some(Value::EntityList(children)) = request.value() {

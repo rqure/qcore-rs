@@ -78,13 +78,13 @@ pub struct Services {
 
 impl Services {
     /// Perform graceful shutdown by taking a final snapshot and writing snapshot marker to WAL
-    pub async fn shutdown(&self, machine_id: String) -> Result<()> {
+    pub fn shutdown(&self, machine_id: String) -> Result<()> {
         use qlib_rs::now;
         
         tracing::info!("Taking final snapshot before shutdown");
         
         // Take a snapshot from the store
-        let snapshot = match self.store_handle.take_snapshot().await {
+        let snapshot = match self.store_handle.take_snapshot() {
             Some(snapshot) => snapshot,
             None => {
                 tracing::error!("Failed to take snapshot during shutdown");
@@ -93,7 +93,7 @@ impl Services {
         };
         
         // Save the snapshot to disk
-        match self.snapshot_handle.save(snapshot).await {
+        match self.snapshot_handle.save(snapshot) {
             Ok(snapshot_counter) => {
                 tracing::info!(
                     snapshot_counter = snapshot_counter,
@@ -108,7 +108,7 @@ impl Services {
                     originator: Some(machine_id),
                 };
                 
-                if let Err(e) = self.wal_handle.write_request(snapshot_request).await {
+                if let Err(e) = self.wal_handle.write_request(snapshot_request) {
                     tracing::error!(error = %e, "Failed to write final snapshot marker to WAL");
                 } else {
                     tracing::info!("Final snapshot marker written to WAL");
@@ -125,7 +125,7 @@ impl Services {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let config = Config::parse();
 
     // Initialize tracing with better structured logging
@@ -167,19 +167,19 @@ async fn main() -> Result<()> {
     };
 
     // Set services for all services that need dependencies
-    wal_handle.set_services(services.clone()).await;
-    client_handle.set_services(services.clone()).await;
-    peer_handle.set_services(services.clone()).await;
-    store_handle.set_services(services.clone()).await;
-    snapshot_handle.set_services(services.clone()).await;
-    misc_handle.set_services(services.clone()).await;
+    wal_handle.set_services(services.clone());
+    client_handle.set_services(services.clone());
+    peer_handle.set_services(services.clone());
+    store_handle.set_services(services.clone());
+    snapshot_handle.set_services(services.clone());
+    misc_handle.set_services(services.clone());
 
     // Keep the main task alive
-    tokio::signal::ctrl_c().await?;
+    tokio::signal::ctrl_c()?;
     tracing::info!("Received shutdown signal, initiating graceful shutdown");
 
     // Perform graceful shutdown with final snapshot
-    if let Err(e) = services.shutdown(config.machine.clone()).await {
+    if let Err(e) = services.shutdown(config.machine.clone()) {
         tracing::error!(error = %e, "Error during graceful shutdown");
     }
 

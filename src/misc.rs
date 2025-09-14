@@ -40,13 +40,13 @@ pub struct MiscHandle {
 
 impl MiscHandle {
     /// Set services for dependencies
-    pub async fn set_services(&self, services: Services) {
+    pub fn set_services(&self, services: Services) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Ok(_) = self.sender.send(MiscRequest::SetServices {
             services,
             response: response_tx,
-        }).await {
-            if let Err(e) = response_rx.await {
+        }) {
+            if let Err(e) = response_rx {
                 error!(error = %e, "Failed to receive SetServices response");
             }
         }
@@ -76,7 +76,7 @@ impl MiscService {
                     // Handle service requests
                     request = receiver.recv() => {
                         match request {
-                            Some(req) => service.handle_request(req).await,
+                            Some(req) => service.handle_request(req),
                             None => break, // Channel closed
                         }
                     }
@@ -84,7 +84,7 @@ impl MiscService {
                     // Handle misc tasks every 10ms
                     _ = misc_interval.tick() => {
                         if let Some(ref services) = service.services {
-                            if let Err(e) = Self::handle_fault_tolerance_management(&service.config, services).await {
+                            if let Err(e) = Self::handle_fault_tolerance_management(&service.config, services) {
                                 error!(error = %e, "Error in fault tolerance management");
                             }
                         }
@@ -93,7 +93,7 @@ impl MiscService {
                     // Handle heartbeat every 1 second
                     _ = heartbeat_interval.tick() => {
                         if let Some(ref services) = service.services {
-                            if let Err(e) = Self::write_heartbeat(&service.config, services).await {
+                            if let Err(e) = Self::write_heartbeat(&service.config, services) {
                                 error!(error = %e, "Error in heartbeat writing");
                             }
                         }
@@ -107,7 +107,7 @@ impl MiscService {
         MiscHandle { sender }
     }
     
-    async fn handle_request(&mut self, request: MiscRequest) {
+    fn handle_request(&mut self, request: MiscRequest) {
         match request {
             MiscRequest::SetServices { services, response } => {
                 self.services = Some(services);
@@ -119,11 +119,11 @@ impl MiscService {
     }
     
     /// Handle fault tolerance and leader management when this instance is the leader
-    async fn handle_fault_tolerance_management(
+    fn handle_fault_tolerance_management(
         config: &MiscConfig,
         services: &Services,
     ) -> Result<()> {
-        let (is_leader, _) = services.peer_handle.get_leadership_info().await;
+        let (is_leader, _) = services.peer_handle.get_leadership_info();
         
         if !is_leader {
             return Ok(());
@@ -137,7 +137,7 @@ impl MiscService {
                 &et::candidate(), 
                 None,
                 Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))
-            ).await?;
+            )?;
             
             candidates.items.first().cloned()
         };
@@ -147,14 +147,14 @@ impl MiscService {
             &et::fault_tolerance(), 
             None,
             None
-        ).await?;
+        )?;
         
         for ft_entity_id in fault_tolerances.items {
             let ft_fields = services.store_handle.perform_map(vec![
                 sread!(ft_entity_id.clone(), ft::candidate_list()),
                 sread!(ft_entity_id.clone(), ft::available_list()),
                 sread!(ft_entity_id.clone(), ft::current_leader())
-            ]).await?;
+            ])?;
             
             let candidates = ft_fields
                 .get(&ft::candidate_list())
@@ -169,7 +169,7 @@ impl MiscService {
                     sread!(candidate_id.clone(), ft::make_me()),
                     sread!(candidate_id.clone(), ft::heartbeat()),
                     sread!(candidate_id.clone(), ft::death_detection_timeout()),
-                ]).await?;
+                ])?;
                 
                 let heartbeat_time = candidate_fields
                     .get(&ft::heartbeat())
@@ -273,14 +273,14 @@ impl MiscService {
                 }
             }
             
-            services.store_handle.perform_mut(requests).await?;
+            services.store_handle.perform_mut(requests)?;
         }
         
         Ok(())
     }
     
     /// Handle heartbeat writing for this machine
-    async fn write_heartbeat(
+    fn write_heartbeat(
         config: &MiscConfig,
         services: &Services,
     ) -> Result<()> {
@@ -290,13 +290,13 @@ impl MiscService {
             &et::candidate(), 
             None,
             Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))
-        ).await?;
+        )?;
         
         if let Some(candidate) = candidates.items.first() {
             services.store_handle.perform_mut(vec![
                 swrite!(candidate.clone(), ft::heartbeat(), schoice!(0)),
                 swrite!(candidate.clone(), ft::make_me(), schoice!(1), PushCondition::Changes)
-            ]).await?;
+            ])?;
         }
         
         Ok(())

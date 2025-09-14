@@ -138,7 +138,7 @@ impl Progress {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize tracing for CLI tools
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -163,19 +163,19 @@ async fn main() -> Result<()> {
 
     let result = match config.command {
         Commands::Take { output, pretty } => {
-            take_snapshot(&config.core_url, &username, &password, &output, pretty).await
+            take_snapshot(&config.core_url, &username, &password, &output, pretty)
         }
         Commands::FactoryRestore { input, force, data_dir, machine } => {
-            factory_restore_snapshot(&input, force, data_dir, machine).await
+            factory_restore_snapshot(&input, force, data_dir, machine)
         }
         Commands::Restore { input } => {
-            normal_restore_snapshot(&config.core_url, &username, &password, &input).await
+            normal_restore_snapshot(&config.core_url, &username, &password, &input)
         }
         Commands::Report { input, output, format } => {
-            report_snapshot_diff(&config.core_url, &username, &password, &input, output, format).await
+            report_snapshot_diff(&config.core_url, &username, &password, &input, output, format)
         }
         Commands::Validate { input } => {
-            validate_snapshot(&input).await
+            validate_snapshot(&input)
         }
     };
 
@@ -190,7 +190,7 @@ async fn main() -> Result<()> {
 }
 
 /// Take a snapshot from the Core service and save it to a file
-async fn take_snapshot(
+fn take_snapshot(
     core_url: &str, 
     username: &str, 
     password: &str, 
@@ -201,7 +201,7 @@ async fn take_snapshot(
     let spinner = Progress::new_spinner("Establishing connection...");
     
     // Connect to the Core service with authentication
-    let mut store = StoreProxy::connect_and_authenticate(core_url, username, password).await
+    let mut store = StoreProxy::connect_and_authenticate(core_url, username, password)
         .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
 
     spinner.finish_with_message("Connected successfully");
@@ -210,7 +210,7 @@ async fn take_snapshot(
     let spinner = Progress::new_spinner("Retrieving schemas and entities...");
 
     // Take the JSON snapshot using the library function
-    let snapshot = take_json_snapshot(&mut store).await
+    let snapshot = take_json_snapshot(&mut store)
         .context("Failed to take snapshot")?;
 
     let entity_count = count_entities_in_tree(&snapshot.tree);
@@ -238,7 +238,7 @@ async fn take_snapshot(
     let spinner = Progress::new_spinner("Saving to disk...");
 
     // Write to file
-    write(output_path, json_content.as_bytes()).await
+    write(output_path, json_content.as_bytes())
         .with_context(|| format!("Failed to write snapshot to {}", output_path.display()))?;
 
     spinner.finish_with_message("File saved successfully");
@@ -284,7 +284,7 @@ fn count_entities_by_type(entity: &qlib_rs::JsonEntity, counts: &mut HashMap<Str
 }
 
 /// Factory restore a snapshot from a file by generating snapshot and WAL files in the target data directory
-async fn factory_restore_snapshot(
+fn factory_restore_snapshot(
     input_path: &PathBuf, 
     force: bool, 
     data_dir: Option<PathBuf>, 
@@ -294,7 +294,7 @@ async fn factory_restore_snapshot(
     let spinner = Progress::new_spinner("Reading and parsing JSON...");
 
     // Read and parse the snapshot file
-    let snapshot = load_json_snapshot(input_path).await?;
+    let snapshot = load_json_snapshot(input_path)?;
     let entity_count = count_entities_in_tree(&snapshot.tree);
     
     spinner.finish_with_message(format!("Loaded {} schemas, {} entities", snapshot.schemas.len(), entity_count));
@@ -324,7 +324,7 @@ async fn factory_restore_snapshot(
     let spinner = Progress::new_spinner("Creating snapshot and WAL files...");
 
     // Use the new factory restore function
-    factory_restore_json_snapshot(&snapshot, target_data_dir.clone(), machine_id.clone()).await
+    factory_restore_json_snapshot(&snapshot, target_data_dir.clone(), machine_id.clone())
         .context("Failed to perform factory restore")?;
 
     spinner.finish_with_message("Factory restore completed");
@@ -338,7 +338,7 @@ async fn factory_restore_snapshot(
 }
 
 /// Normal restore via StoreProxy: connect to service and apply differences
-async fn normal_restore_snapshot(
+fn normal_restore_snapshot(
     core_url: &str,
     username: &str,
     password: &str,
@@ -348,7 +348,7 @@ async fn normal_restore_snapshot(
     let spinner = Progress::new_spinner("Reading and parsing JSON...");
 
     // Read and parse the snapshot file
-    let snapshot = load_json_snapshot(input_path).await?;
+    let snapshot = load_json_snapshot(input_path)?;
     let entity_count = count_entities_in_tree(&snapshot.tree);
     
     spinner.finish_with_message(format!("Loaded {} schemas, {} entities", snapshot.schemas.len(), entity_count));
@@ -357,7 +357,7 @@ async fn normal_restore_snapshot(
     let spinner = Progress::new_spinner("Establishing connection...");
     
     // Connect to the Core service with authentication
-    let mut store = StoreProxy::connect_and_authenticate(core_url, username, password).await
+    let mut store = StoreProxy::connect_and_authenticate(core_url, username, password)
         .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
 
     spinner.finish_with_message("Connected successfully");
@@ -366,7 +366,7 @@ async fn normal_restore_snapshot(
     let spinner = Progress::new_spinner("Analyzing current state and applying changes...");
 
     // Use the new restore via proxy function
-    restore_json_snapshot_via_proxy(&mut store, &snapshot).await
+    restore_json_snapshot_via_proxy(&mut store, &snapshot)
         .context("Failed to restore snapshot via proxy")?;
 
     spinner.finish_with_message("Changes applied successfully");
@@ -379,7 +379,7 @@ async fn normal_restore_snapshot(
 }
 
 /// Generate a report showing what would be changed by a restore operation
-async fn report_snapshot_diff(
+fn report_snapshot_diff(
     core_url: &str,
     username: &str,
     password: &str,
@@ -391,7 +391,7 @@ async fn report_snapshot_diff(
     let spinner = Progress::new_spinner("Reading and parsing JSON...");
 
     // Read and parse the snapshot file
-    let target_snapshot = load_json_snapshot(input_path).await?;
+    let target_snapshot = load_json_snapshot(input_path)?;
     let entity_count = count_entities_in_tree(&target_snapshot.tree);
     
     spinner.finish_with_message(format!("Loaded {} schemas, {} entities", target_snapshot.schemas.len(), entity_count));
@@ -400,7 +400,7 @@ async fn report_snapshot_diff(
     let spinner = Progress::new_spinner("Establishing connection...");
     
     // Connect to the Core service with authentication
-    let mut store = StoreProxy::connect_and_authenticate(core_url, username, password).await
+    let mut store = StoreProxy::connect_and_authenticate(core_url, username, password)
         .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
 
     spinner.finish_with_message("Connected successfully");
@@ -409,7 +409,7 @@ async fn report_snapshot_diff(
     let spinner = Progress::new_spinner("Retrieving current state...");
 
     // Take current snapshot to compute diff
-    let current_snapshot = take_json_snapshot(&mut store).await
+    let current_snapshot = take_json_snapshot(&mut store)
         .context("Failed to take current snapshot")?;
 
     spinner.finish_with_message("Current state captured");
@@ -429,7 +429,7 @@ async fn report_snapshot_diff(
     };
 
     if let Some(output) = output_path {
-        tokio::fs::write(&output, report_content.as_bytes()).await
+        tokio::fs::write(&output, report_content.as_bytes())
             .with_context(|| format!("Failed to write report to {}", output.display()))?;
         Progress::success(&format!("Report written to {}", output.display()));
     } else {
@@ -442,8 +442,8 @@ async fn report_snapshot_diff(
 }
 
 /// Load and parse a JSON snapshot file
-async fn load_json_snapshot(input_path: &PathBuf) -> Result<JsonSnapshot> {
-    let json_content = read_to_string(input_path).await
+fn load_json_snapshot(input_path: &PathBuf) -> Result<JsonSnapshot> {
+    let json_content = read_to_string(input_path)
         .with_context(|| format!("Failed to read snapshot file: {}", input_path.display()))?;
     
     serde_json::from_str(&json_content)
@@ -451,12 +451,12 @@ async fn load_json_snapshot(input_path: &PathBuf) -> Result<JsonSnapshot> {
 }
 
 /// Validate a snapshot file without restoring it
-async fn validate_snapshot(input_path: &PathBuf) -> Result<()> {
+fn validate_snapshot(input_path: &PathBuf) -> Result<()> {
     Progress::step(1, 3, "Loading snapshot file");
     let spinner = Progress::new_spinner("Reading and parsing JSON...");
 
     // Read and parse the snapshot file
-    let snapshot = load_json_snapshot(input_path).await?;
+    let snapshot = load_json_snapshot(input_path)?;
 
     spinner.finish_with_message("JSON structure is valid");
 
