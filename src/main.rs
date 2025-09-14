@@ -1,17 +1,23 @@
 mod wal;
-mod clients;
 mod peers;
-mod store;
 mod snapshot;
 mod files;
-mod misc;
+mod core;
+mod peers;
+mod snapshot;
+mod wal;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
 
-use crate::{clients::{ClientConfig, ClientHandle, ClientService}, misc::{MiscConfig, MiscHandle, MiscService}, peers::{PeerConfig, PeerHandle, PeerService}, snapshot::{SnapshotConfig, SnapshotHandle, SnapshotService}, store::{StoreHandle, StoreService}, wal::{WalConfig, WalHandle, WalService}};
+use crate::{
+    core::{CoreConfig, CoreService},
+    peers::{PeerConfig, PeerService},
+    snapshot::{SnapshotConfig, SnapshotService},
+    wal::{WalConfig, WalService}
+};
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -66,65 +72,6 @@ pub struct Config {
     pub self_promotion_delay_secs: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct Services {
-    pub client_handle: ClientHandle,
-    pub misc_handle: MiscHandle,
-    pub peer_handle: PeerHandle,
-    pub snapshot_handle: SnapshotHandle,
-    pub store_handle: StoreHandle,
-    pub wal_handle: WalHandle,
-}
-
-impl Services {
-    /// Perform graceful shutdown by taking a final snapshot and writing snapshot marker to WAL
-    pub fn shutdown(&self, machine_id: String) -> Result<()> {
-        use qlib_rs::now;
-        
-        tracing::info!("Taking final snapshot before shutdown");
-        
-        // Take a snapshot from the store
-        let snapshot = match self.store_handle.take_snapshot() {
-            Some(snapshot) => snapshot,
-            None => {
-                tracing::error!("Failed to take snapshot during shutdown");
-                return Err(anyhow::anyhow!("Failed to take snapshot during shutdown"));
-            }
-        };
-        
-        // Save the snapshot to disk
-        match self.snapshot_handle.save(snapshot) {
-            Ok(snapshot_counter) => {
-                tracing::info!(
-                    snapshot_counter = snapshot_counter,
-                    "Final snapshot saved successfully"
-                );
-                
-                // Write a snapshot marker to the WAL to indicate the final snapshot point
-                // This helps during replay to know that the state was snapshotted at shutdown
-                let snapshot_request = qlib_rs::Request::Snapshot {
-                    snapshot_counter,
-                    timestamp: Some(now()),
-                    originator: Some(machine_id),
-                };
-                
-                if let Err(e) = self.wal_handle.write_request(snapshot_request) {
-                    tracing::error!(error = %e, "Failed to write final snapshot marker to WAL");
-                } else {
-                    tracing::info!("Final snapshot marker written to WAL");
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to save final snapshot");
-                return Err(e);
-            }
-        }
-        
-        Ok(())
-    }
-}
-
-#[tokio::main]
 fn main() -> Result<()> {
     let config = Config::parse();
 
@@ -132,7 +79,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "qcore_rs=debug,tokio=warn,tokio_tungstenite=warn,qlib_rs=debug".to_string())
+                .unwrap_or_else(|_| "qcore_rs=debug,qlib_rs=debug".to_string())
         )
         .with_target(true)
         .with_thread_ids(true)
@@ -140,13 +87,12 @@ fn main() -> Result<()> {
         .with_line_number(cfg!(debug_assertions))
         .init();
 
-    let store_handle = StoreService::spawn(store::StoreConfig {
-        machine_id: config.machine.clone(),
-    });
+    // Create service handles (each runs in its own thread)
     let snapshot_handle = SnapshotService::spawn(SnapshotConfig {
         snapshots_dir: PathBuf::from(&config.data_dir).join(&config.machine).join("snapshots"),
         max_files: config.snapshot_max_files,
     });
+    
     let wal_handle = WalService::spawn(WalConfig {
         wal_dir: PathBuf::from(&config.data_dir).join(&config.machine).join("wal"),
         max_file_size: config.wal_max_file_size * 1024 * 1024,
@@ -154,35 +100,56 @@ fn main() -> Result<()> {
         snapshot_wal_interval: config.snapshot_wal_interval,
         machine_id: config.machine.clone(),
     });
-    let client_handle = ClientService::spawn(ClientConfig::from(&config));
+    
     let peer_handle = PeerService::spawn(PeerConfig::from(&config));
-    let misc_handle = MiscService::spawn(MiscConfig::from(&config));
-    let services = Services {
-        client_handle: client_handle.clone(),
-        misc_handle: misc_handle.clone(),
-        peer_handle: peer_handle.clone(),
-        snapshot_handle: snapshot_handle.clone(),
-        store_handle: store_handle.clone(),
-        wal_handle: wal_handle.clone(),
-    };
-
-    // Set services for all services that need dependencies
-    wal_handle.set_services(services.clone());
-    client_handle.set_services(services.clone());
-    peer_handle.set_services(services.clone());
-    store_handle.set_services(services.clone());
-    snapshot_handle.set_services(services.clone());
-    misc_handle.set_services(services.clone());
-
-    // Keep the main task alive
-    tokio::signal::ctrl_c()?;
+    
+    // Set up dependencies
+    wal_handle.set_snapshot_handle(snapshot_handle.clone());
+    peer_handle.set_snapshot_handle(snapshot_handle.clone());
+    
+    // Create the core service (runs in main thread)
+    let mut core_service = CoreService::new(CoreConfig::from(&config))?;
+    core_service.set_handles(peer_handle, snapshot_handle, wal_handle);
+    
+    // Set up signal handling for graceful shutdown
+    let (shutdown_tx, shutdown_rx) = crossbeam::channel::bounded(1);
+    std::thread::spawn(move || {
+        if let Err(e) = wait_for_signal() {
+            tracing::error!(error = %e, "Error waiting for signal");
+        }
+        let _ = shutdown_tx.send(());
+    });
+    
+    // Run the core service with graceful shutdown
+    std::thread::spawn(move || {
+        if let Err(e) = core_service.run() {
+            tracing::error!(error = %e, "Core service failed");
+        }
+    });
+    
+    // Wait for shutdown signal
+    let _ = shutdown_rx.recv();
     tracing::info!("Received shutdown signal, initiating graceful shutdown");
-
-    // Perform graceful shutdown with final snapshot
-    if let Err(e) = services.shutdown(config.machine.clone()) {
-        tracing::error!(error = %e, "Error during graceful shutdown");
-    }
-
+    
+    // TODO: Implement graceful shutdown by taking final snapshot
     tracing::info!("QCore service shutdown complete");
+    Ok(())
+}
+
+fn wait_for_signal() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+    
+    while running.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    
     Ok(())
 }

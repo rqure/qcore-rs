@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use async_trait::async_trait;
-use tokio::fs::{read_dir, remove_file};
+use std::fs::{read_dir, remove_file};
 use tracing::{info, error};
 
 /// Configuration for numbered file management
@@ -25,7 +24,6 @@ pub struct FileInfo {
 pub struct FileManager;
 
 /// Trait for managing numbered files (WAL files, snapshots, etc.)
-#[async_trait]
 pub trait FileManagerTrait: Send + Sync {
     /// Scan directory for files matching the configuration
     fn scan_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<Vec<FileInfo>>;
@@ -37,7 +35,6 @@ pub trait FileManagerTrait: Send + Sync {
     fn cleanup_old_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<()>;
 }
 
-#[async_trait]
 impl FileManagerTrait for FileManager {
     /// Scan directory for files matching the configuration
     fn scan_files(&self, dir: &PathBuf, config: &FileConfig) -> Result<Vec<FileInfo>> {
@@ -48,7 +45,7 @@ impl FileManagerTrait for FileManager {
         let mut entries = read_dir(dir)?;
         let mut files = Vec::new();
         
-        while let Some(entry) = entries.next_entry()? {
+        while let Some(entry) = entries.next().transpose()? {
             let path = entry.path();
             if let Some(filename) = path.file_name() {
                 if let Some(filename_str) = filename.to_str() {

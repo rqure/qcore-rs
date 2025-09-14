@@ -1,15 +1,14 @@
 use std::path::PathBuf;
-
+use crossbeam::channel::{Sender, Receiver, bounded, unbounded};
+use std::thread;
+use std::fs::{create_dir_all, remove_file, File, OpenOptions};
+use std::io::{Read, Write};
+use tracing::{info, warn, error};
 use anyhow::Result;
-use async_trait::async_trait;
-use tokio::sync::mpsc::Sender;
-use tokio::{fs::{create_dir_all, remove_file, File, OpenOptions}, io::{AsyncReadExt, AsyncWriteExt}};
-use tracing::{info, instrument, warn, error};
 
-use crate::{files::{FileConfig, FileManager, FileManagerTrait}, Services};
+use crate::files::{FileConfig, FileManager, FileManagerTrait};
 
 /// Trait for snapshot operations
-#[async_trait]
 pub trait SnapshotTrait {
     /// Save a snapshot to disk and return the snapshot counter
     fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64>;
@@ -19,13 +18,6 @@ pub trait SnapshotTrait {
     
     /// Initialize snapshot counter from existing files
     fn initialize_counter(&mut self) -> Result<()>;
-}
-
-
-/// Handle for communicating with snapshot manager task
-#[derive(Debug, Clone)]
-pub struct SnapshotHandle {
-    sender: Sender<SnapshotRequest>,
 }
 
 /// Configuration for snapshot manager operations
@@ -42,34 +34,47 @@ pub struct SnapshotConfig {
 pub enum SnapshotRequest {
     Save {
         snapshot: qlib_rs::Snapshot,
-        response: tokio::sync::oneshot::Sender<Result<u64>>,
     },
-    SetServices {
-        services: Services,
-        response: tokio::sync::oneshot::Sender<()>,
-    },
+    LoadLatest,
+}
+
+/// Response types for snapshot requests
+#[derive(Debug)]
+pub enum SnapshotResponse {
+    SaveResult(Result<u64>),
+    LoadResult(Result<Option<(qlib_rs::Snapshot, u64)>>),
+}
+
+/// Handle for communicating with snapshot manager task
+#[derive(Debug, Clone)]
+pub struct SnapshotHandle {
+    request_sender: Sender<(SnapshotRequest, Sender<SnapshotResponse>)>,
 }
 
 impl SnapshotHandle {
     pub fn save(&self, snapshot: qlib_rs::Snapshot) -> Result<u64> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.sender.send(SnapshotRequest::Save {
-            snapshot,
-            response: response_tx,
-        }).map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
-        response_rx.map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((SnapshotRequest::Save { snapshot }, response_tx))
+            .map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
+        {
+            SnapshotResponse::SaveResult(result) => result,
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
     }
-
-    /// Set services for dependencies
-    pub fn set_services(&self, services: Services) {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        if let Ok(_) = self.sender.send(SnapshotRequest::SetServices {
-            services,
-            response: response_tx,
-        }) {
-            if let Err(e) = response_rx {
-                error!(error = %e, "Snapshot service SetServices response channel closed");
-            }
+    
+    pub fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
+        let (response_tx, response_rx) = unbounded();
+        self.request_sender.send((SnapshotRequest::LoadLatest, response_tx))
+            .map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
+        
+        match response_rx.recv()
+            .map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
+        {
+            SnapshotResponse::LoadResult(result) => result,
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
         }
     }
 }
@@ -78,9 +83,11 @@ pub type SnapshotService = SnapshotManagerTrait<FileManager>;
 
 impl SnapshotService {
     pub fn spawn(config: SnapshotConfig) -> SnapshotHandle {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+        let (request_sender, request_receiver) = bounded(1024);
 
-        tokio::spawn(async move {
+        let handle = SnapshotHandle { request_sender };
+
+        thread::spawn(move || {
             let mut service = SnapshotService::new(FileManager, config);
             match service.initialize_counter() {
                 Ok(_) => info!("Snapshot service initialized successfully"),
@@ -90,32 +97,25 @@ impl SnapshotService {
                 },
             }
 
-            while let Some(request) = receiver.recv() {
-                match request {
-                    SnapshotRequest::Save { snapshot, response } => {
-                        let result = service.save(&snapshot);
-                        if let Err(_) = response.send(result) {
-                            error!("Failed to send snapshot save response");
-                        }
+            while let Ok((request, response_sender)) = request_receiver.recv() {
+                let response = match request {
+                    SnapshotRequest::Save { snapshot } => {
+                        SnapshotResponse::SaveResult(service.save(&snapshot))
                     }
-                    SnapshotRequest::SetServices { services: _services, response } => {
-                        match service.load_latest() {
-                            Ok(Some((snapshot, _))) => {
-                                _services.store_handle.restore_snapshot(snapshot);
-                            }
-                            _ => {}
-                        }
-                        if let Err(_) = response.send(()) {
-                            error!("Failed to send SetServices response");
-                        }
+                    SnapshotRequest::LoadLatest => {
+                        SnapshotResponse::LoadResult(service.load_latest())
                     }
+                };
+                
+                if let Err(_) = response_sender.send(response) {
+                    error!("Failed to send snapshot service response");
                 }
             }
 
-            panic!("Snapshot service has stopped unexpectedly");
+            error!("Snapshot service has stopped unexpectedly");
         });
 
-        SnapshotHandle { sender }
+        handle
     }
 }
 
@@ -141,10 +141,8 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
     }
 }
 
-#[async_trait]
 impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
     /// Save a snapshot to disk and return the snapshot counter
-    #[instrument(skip(self, snapshot))]
     fn save(&mut self, snapshot: &qlib_rs::Snapshot) -> Result<u64> {
         create_dir_all(&self.config.snapshots_dir)?;
         
@@ -207,21 +205,22 @@ impl<F: FileManagerTrait> SnapshotTrait for SnapshotManagerTrait<F> {
                     info!(
                         snapshot_file = %file_info.path.display(),
                         snapshot_counter = file_info.counter,
-                        "Snapshot loaded successfully"
+                        "Successfully loaded snapshot"
                     );
                     return Ok(Some((snapshot, file_info.counter)));
                 }
                 Ok(None) => {
-                    // File was corrupted and cleaned up, try next
-                    continue;
+                    warn!(
+                        snapshot_file = %file_info.path.display(),
+                        "Snapshot file is empty or corrupted, trying next"
+                    );
                 }
                 Err(e) => {
-                    error!(
-                        error = %e,
+                    warn!(
                         snapshot_file = %file_info.path.display(),
-                        "Failed to load snapshot, trying previous snapshot"
+                        error = %e,
+                        "Failed to load snapshot, trying next"
                     );
-                    continue;
                 }
             }
         }
@@ -250,29 +249,15 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
         match File::open(snapshot_path) {
             Ok(mut file) => {
                 let mut buffer = Vec::new();
-                match file.read_to_end(&mut buffer) {
-                    Ok(_) => {
-                        match bincode::deserialize(&buffer) {
-                            Ok(snapshot) => Ok(Some(snapshot)),
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    snapshot_file = %snapshot_path.display(),
-                                    "Failed to deserialize snapshot, marking for cleanup"
-                                );
-                                // Defensive: Mark corrupted snapshot for cleanup
-                                if let Err(cleanup_err) = remove_file(snapshot_path) {
-                                    warn!(
-                                        error = %cleanup_err,
-                                        snapshot_file = %snapshot_path.display(),
-                                        "Failed to remove corrupted snapshot file"
-                                    );
-                                }
-                                Ok(None) // Corrupted file cleaned up
-                            }
-                        }
-                    }
-                    Err(e) => Err(anyhow::anyhow!("Failed to read snapshot file: {}", e))
+                file.read_to_end(&mut buffer)?;
+                
+                if buffer.is_empty() {
+                    return Ok(None);
+                }
+                
+                match bincode::deserialize::<qlib_rs::Snapshot>(&buffer) {
+                    Ok(snapshot) => Ok(Some(snapshot)),
+                    Err(e) => Err(anyhow::anyhow!("Failed to deserialize snapshot: {}", e))
                 }
             }
             Err(e) => Err(anyhow::anyhow!("Failed to open snapshot file: {}", e))
