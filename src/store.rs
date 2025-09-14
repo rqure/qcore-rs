@@ -385,7 +385,7 @@ impl StoreService {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(131072);
 
         tokio::spawn(async move {   
-            let mut store = Store::new(Arc::new(Snowflake::new()));
+            let mut store = Store::new(Snowflake::new());
             
             // Initialize permission cache
             let (permission_cache, mut permission_notification_receiver) = match Cache::new(
