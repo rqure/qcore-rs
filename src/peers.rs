@@ -9,6 +9,7 @@ use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use serde::{Serialize, Deserialize};
 use std::thread;
+use qlib_rs::now;
 
 /// Configuration for the peer service
 #[derive(Debug, Clone)]
@@ -86,28 +87,6 @@ pub enum PeerRequest {
     },
     GetAvailabilityState,
     GetLeadershipInfo,
-    IsOutboundPeerConnected {
-        peer_addr: String,
-    },
-    PeerConnected {
-        peer_addr: String,
-        machine_id: String,
-        startup_time: u64,
-    },
-    PeerDisconnected {
-        peer_addr: String,
-    },
-    OutboundPeerConnected {
-        peer_addr: String,
-        sender: Sender<Message>,
-    },
-    OutboundPeerDisconnected {
-        peer_addr: String,
-    },
-    ProcessPeerMessage {
-        message: PeerMessage,
-        peer_addr: String,
-    },
     SetSnapshotHandle {
         handle: crate::snapshot::SnapshotHandle,
     },
@@ -122,7 +101,6 @@ pub enum PeerResponse {
     Unit,
     AvailabilityState(AvailabilityState),
     LeadershipInfo(bool, Option<String>), // (is_leader, current_leader)
-    Bool(bool),
 }
 
 /// Handle for communicating with peer service
@@ -171,57 +149,6 @@ impl PeerHandle {
         }
     }
 
-    pub fn is_outbound_peer_connected(&self, peer_addr: String) -> bool {
-        let (response_tx, response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::IsOutboundPeerConnected { peer_addr }, response_tx)) {
-            error!(error = %e, "Failed to send peer connection check request to peer service");
-            return false;
-        }
-        
-        match response_rx.recv() {
-            Ok(PeerResponse::Bool(connected)) => connected,
-            _ => {
-                error!("Failed to receive peer connection check response from peer service");
-                false
-            }
-        }
-    }
-
-    pub fn peer_connected(&self, peer_addr: String, machine_id: String, startup_time: u64) {
-        let (response_tx, _response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::PeerConnected { peer_addr, machine_id, startup_time }, response_tx)) {
-            error!(error = %e, "Failed to send peer connected notification to peer service");
-        }
-    }
-
-    pub fn peer_disconnected(&self, peer_addr: String) {
-        let (response_tx, _response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::PeerDisconnected { peer_addr }, response_tx)) {
-            error!(error = %e, "Failed to send peer disconnected notification to peer service");
-        }
-    }
-
-    pub fn outbound_peer_connected(&self, peer_addr: String, sender: Sender<Message>) {
-        let (response_tx, _response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::OutboundPeerConnected { peer_addr, sender }, response_tx)) {
-            error!(error = %e, "Failed to send outbound peer connected notification to peer service");
-        }
-    }
-
-    pub fn outbound_peer_disconnected(&self, peer_addr: String) {
-        let (response_tx, _response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::OutboundPeerDisconnected { peer_addr }, response_tx)) {
-            error!(error = %e, "Failed to send outbound peer disconnected notification to peer service");
-        }
-    }
-
-    pub fn process_peer_message(&self, message: PeerMessage, peer_addr: String) {
-        let (response_tx, _response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::ProcessPeerMessage { message, peer_addr }, response_tx)) {
-            error!(error = %e, "Failed to send process peer message request to peer service");
-        }
-    }
-
     /// Set snapshot handle for dependencies
     pub fn set_snapshot_handle(&self, handle: crate::snapshot::SnapshotHandle) {
         let (response_tx, _response_rx) = unbounded();
@@ -266,7 +193,6 @@ pub struct PeerService {
     became_unavailable_at: Option<u64>,
     full_sync_request_pending: bool,
     peer_info: HashMap<String, PeerInfo>,
-    connected_outbound_peers: HashMap<String, Sender<Message>>,
     snapshot_handle: Option<crate::snapshot::SnapshotHandle>,
     core_handle: Option<crate::core::CoreHandle>,
     
@@ -314,10 +240,10 @@ impl PeerService {
         
         info!(bind_address = %addr, "Peer service WebSocket server initialized");
         
-        let now = std::time::Instant::now();
+        let now_instant = std::time::Instant::now();
         let mut service = Self {
             config: config.clone(),
-            startup_time: qlib_rs::now().unix_timestamp() as u64,
+            startup_time: now().unix_timestamp() as u64,
             availability_state: AvailabilityState::Unavailable,
             is_leader: false,
             current_leader: None,
@@ -325,15 +251,14 @@ impl PeerService {
             became_unavailable_at: None,
             full_sync_request_pending: false,
             peer_info: HashMap::new(),
-            connected_outbound_peers: HashMap::new(),
             snapshot_handle: None,
             core_handle: None,
             poll,
             listener,
             connections: HashMap::new(),
             next_token: 1, // Start from 1, as 0 is reserved for listener
-            last_leadership_check: now,
-            last_reconnect_attempt: now,
+            last_leadership_check: now_instant,
+            last_reconnect_attempt: now_instant,
         };
         
         let mut events = Events::with_capacity(128);
@@ -476,10 +401,35 @@ impl PeerService {
                 loop {
                     match websocket.read() {
                         Ok(Message::Text(text)) => {
-                            if let Ok(peer_message) = serde_json::from_str::<PeerMessage>(&text) {
-                                messages_to_process.push(peer_message);
+                            // Check if this is a binary wrapper message
+                            if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(base64_data) = wrapper.get("binary_message").and_then(|v| v.as_str()) {
+                                    // Decode binary message
+                                    use base64::Engine;
+                                    if let Ok(binary_data) = base64::engine::general_purpose::STANDARD.decode(base64_data) {
+                                        if let Ok(peer_message) = bincode::deserialize::<PeerMessage>(&binary_data) {
+                                            messages_to_process.push(peer_message);
+                                        } else {
+                                            warn!(peer_addr = %connection.addr_string, "Failed to deserialize binary peer message");
+                                        }
+                                    } else {
+                                        warn!(peer_addr = %connection.addr_string, "Failed to decode base64 binary message");
+                                    }
+                                } else {
+                                    // Regular JSON message
+                                    if let Ok(peer_message) = serde_json::from_str::<PeerMessage>(&text) {
+                                        messages_to_process.push(peer_message);
+                                    } else {
+                                        warn!(peer_addr = %connection.addr_string, "Received invalid JSON from peer");
+                                    }
+                                }
                             } else {
-                                warn!(peer_addr = %connection.addr_string, "Received invalid JSON from peer");
+                                // Try to parse as regular peer message
+                                if let Ok(peer_message) = serde_json::from_str::<PeerMessage>(&text) {
+                                    messages_to_process.push(peer_message);
+                                } else {
+                                    warn!(peer_addr = %connection.addr_string, "Received invalid JSON from peer");
+                                }
                             }
                         }
                         Ok(Message::Binary(_)) => {
@@ -545,18 +495,35 @@ impl PeerService {
         if let Some(connection) = self.connections.remove(&token) {
             info!(peer_addr = %connection.addr_string, "Removed peer connection");
             
-            // Notify about disconnection
-            if connection.is_outbound {
-                self.connected_outbound_peers.remove(&connection.addr_string);
-            }
+            // Check if the disconnected peer was the current leader
+            let disconnected_machine_id = self.peer_info.get(&connection.addr_string)
+                .map(|info| info.machine_id.clone());
             
+            // Clean up peer info
             self.peer_info.remove(&connection.addr_string);
+            
+            // Check if the disconnected peer was the current leader
+            if let Some(disconnected_machine_id) = disconnected_machine_id {
+                if let Some(ref current_leader) = self.current_leader {
+                    if *current_leader == disconnected_machine_id {
+                        info!(
+                            disconnected_machine = %disconnected_machine_id,
+                            "Current leader disconnected, retriggering leader election"
+                        );
+                        self.determine_leadership();
+                    }
+                }
+            }
         }
     }
     
     fn attempt_outbound_connections(&mut self) -> Result<()> {
         for peer_addr in &self.config.peer_addresses.clone() {
-            if !self.connected_outbound_peers.contains_key(peer_addr) {
+            // Check if we already have a connection to this peer address
+            let already_connected = self.connections.values()
+                .any(|conn| &conn.addr_string == peer_addr);
+            
+            if !already_connected {
                 self.attempt_outbound_connection(peer_addr)?;
             }
         }
@@ -567,9 +534,9 @@ impl PeerService {
         if let Ok(addr) = peer_addr.parse::<SocketAddr>() {
             debug!(peer_addr = %peer_addr, "Attempting outbound connection");
             
-            // For simplicity, we'll use blocking connection and handshake
-            // In a more complex implementation, you'd want to make this non-blocking
-            match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            // For a full non-blocking implementation, we'd need to manage the connection
+            // state machine ourselves. For now, using a short timeout to avoid blocking too long.
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                 Ok(std_stream) => {
                     std_stream.set_nonblocking(true)?;
                     let mio_stream = MioTcpStream::from_std(std_stream);
@@ -634,30 +601,6 @@ impl PeerService {
             PeerRequest::GetLeadershipInfo => {
                 PeerResponse::LeadershipInfo(self.is_leader, self.current_leader.clone())
             }
-            PeerRequest::IsOutboundPeerConnected { peer_addr } => {
-                PeerResponse::Bool(self.connected_outbound_peers.contains_key(&peer_addr))
-            }
-            PeerRequest::PeerConnected { peer_addr, machine_id, startup_time } => {
-                self.peer_info.insert(peer_addr.clone(), PeerInfo { machine_id, startup_time });
-                PeerResponse::Unit
-            }
-            PeerRequest::PeerDisconnected { peer_addr } => {
-                self.peer_info.remove(&peer_addr);
-                self.connected_outbound_peers.remove(&peer_addr);
-                PeerResponse::Unit
-            }
-            PeerRequest::OutboundPeerConnected { peer_addr, sender } => {
-                self.connected_outbound_peers.insert(peer_addr, sender);
-                PeerResponse::Unit
-            }
-            PeerRequest::OutboundPeerDisconnected { peer_addr } => {
-                self.connected_outbound_peers.remove(&peer_addr);
-                PeerResponse::Unit
-            }
-            PeerRequest::ProcessPeerMessage { message, peer_addr } => {
-                self.handle_peer_message_internal(message, &peer_addr);
-                PeerResponse::Unit
-            }
             PeerRequest::SetSnapshotHandle { handle } => {
                 self.snapshot_handle = Some(handle);
                 PeerResponse::Unit
@@ -673,7 +616,12 @@ impl PeerService {
         match message {
             PeerMessage::Startup { machine_id, startup_time } => {
                 info!(peer_addr = %peer_addr, machine_id = %machine_id, startup_time = %startup_time, "Received startup message from peer");
-                self.peer_info.insert(peer_addr.to_string(), PeerInfo { machine_id, startup_time });
+                
+                // Update peer info
+                self.peer_info.insert(peer_addr.to_string(), PeerInfo { machine_id: machine_id.clone(), startup_time });
+                
+                // Re-determine leadership
+                self.determine_leadership();
                 
                 // Send our startup message back
                 let our_startup_message = PeerMessage::Startup {
@@ -685,16 +633,122 @@ impl PeerService {
             PeerMessage::FullSyncRequest { machine_id } => {
                 if self.is_leader {
                     info!(peer_addr = %peer_addr, machine_id = %machine_id, "Received full sync request from peer");
-                    // TODO: Send snapshot to peer
+                    
+                    // Take a snapshot and send it
+                    if let Some(ref core_handle) = self.core_handle {
+                        match core_handle.take_snapshot() {
+                            Ok(snapshot) => {
+                                info!(
+                                    requesting_machine = %machine_id,
+                                    snapshot_entities = snapshot.entities.len(),
+                                    "Snapshot prepared for full sync response"
+                                );
+                                
+                                let full_sync_response = PeerMessage::FullSyncResponse { snapshot };
+                                self.send_message_to_peer_binary(peer_addr, full_sync_response);
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to take snapshot for full sync request");
+                            }
+                        }
+                    } else {
+                        error!("Core handle not available for full sync request");
+                    }
                 }
             }
-            PeerMessage::FullSyncResponse { snapshot: _ } => {
+            PeerMessage::FullSyncResponse { snapshot } => {
                 info!(peer_addr = %peer_addr, "Received full sync response from peer");
-                // TODO: Apply snapshot
+                
+                if let Some(ref core_handle) = self.core_handle {
+                    // Apply the snapshot
+                    if let Err(e) = core_handle.restore_snapshot(snapshot.clone()) {
+                        error!(error = %e, "Failed to restore snapshot during full sync");
+                        return;
+                    }
+                    
+                    // Save the snapshot to disk for persistence
+                    if let Some(ref snapshot_handle) = self.snapshot_handle {
+                        match snapshot_handle.save(snapshot) {
+                            Ok(snapshot_counter) => {
+                                info!(
+                                    snapshot_counter = snapshot_counter,
+                                    "Snapshot saved to disk during full sync"
+                                );
+                                
+                                // Write a snapshot marker to the WAL
+                                let snapshot_request = qlib_rs::Request::Snapshot {
+                                    snapshot_counter,
+                                    timestamp: Some(now()),
+                                    originator: Some(self.config.machine.clone()),
+                                };
+                                
+                                if let Err(e) = core_handle.write_request(snapshot_request) {
+                                    error!(
+                                        error = %e,
+                                        snapshot_counter = snapshot_counter,
+                                        "Failed to write snapshot marker to WAL"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to save snapshot during full sync");
+                            }
+                        }
+                    }
+                    
+                    // Update state to indicate full sync completion
+                    self.is_fully_synced = true;
+                    self.full_sync_request_pending = false;
+                    self.availability_state = AvailabilityState::Available;
+                    self.became_unavailable_at = None;
+                    
+                    info!("Successfully applied full sync snapshot, instance is now fully synchronized");
+                } else {
+                    error!("Core handle not available for full sync response");
+                }
             }
             PeerMessage::SyncRequest { requests } => {
                 debug!(peer_addr = %peer_addr, request_count = %requests.len(), "Received sync request from peer");
-                // TODO: Apply requests
+                
+                if let Some(ref core_handle) = self.core_handle {
+                    let our_machine_id = &self.config.machine;
+                    
+                    // Filter requests to only include those with valid originators (different from our machine)
+                    let requests_to_apply: Vec<_> = requests.into_iter()
+                        .filter(|request| {
+                            if let Some(originator) = request.originator() {
+                                originator != our_machine_id
+                            } else {
+                                false
+                            }
+                        })
+                        .filter(|request| {
+                            match request {
+                                qlib_rs::Request::Snapshot { .. } => false, // Ignore snapshot requests from peers
+                                _ => true,
+                            }
+                        })
+                        .collect();
+                    
+                    let req_len = requests_to_apply.len();
+                    if !requests_to_apply.is_empty() {
+                        // Apply requests through the core handle
+                        for request in requests_to_apply {
+                            if let Err(e) = core_handle.write_request(request) {
+                                error!(error = %e, "Failed to apply sync request from peer");
+                            }
+                        }
+                        
+                        debug!(
+                            request_count = req_len,
+                            "Successfully applied sync requests from peer"
+                        );
+                    } else {
+                        debug!("No valid sync requests to apply from peer");
+                    }
+                } else {
+                    error!("Core handle not available for sync request");
+                }
             }
         }
     }
@@ -711,68 +765,222 @@ impl PeerService {
         }
     }
     
+    fn send_message_to_peer_binary(&mut self, peer_addr: &str, message: PeerMessage) {
+        // Use binary serialization for large messages like FullSyncResponse
+        match bincode::serialize(&message) {
+            Ok(binary_data) => {
+                // Encode as base64 and wrap in JSON for consistent transport
+                use base64::Engine;
+                let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                let wrapper = serde_json::json!({
+                    "binary_message": base64_data
+                });
+                
+                if let Ok(json) = serde_json::to_string(&wrapper) {
+                    for connection in self.connections.values_mut() {
+                        if connection.addr_string == peer_addr {
+                            connection.outbound_messages.push_back(json);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to serialize binary message");
+            }
+        }
+    }
+    
     fn send_sync_message_to_peers(&mut self, requests: Vec<qlib_rs::Request>) {
-        let message = PeerMessage::SyncRequest { requests };
-        if let Ok(json) = serde_json::to_string(&message) {
-            // Send to all connected peers
-            for connection in self.connections.values_mut() {
-                if let PeerConnectionState::Connected(_) = connection.state {
-                    connection.outbound_messages.push_back(json.clone());
+        let current_machine = &self.config.machine;
+        
+        // Filter requests to only include those from our machine
+        let requests_to_sync: Vec<qlib_rs::Request> = requests.iter()
+            .filter(|request| {
+                if let Some(originator) = request.originator() {
+                    originator == current_machine
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect();
+        
+        if !requests_to_sync.is_empty() {
+            let message = PeerMessage::SyncRequest { requests: requests_to_sync.clone() };
+            if let Ok(json) = serde_json::to_string(&message) {
+                // Send to all connected peers
+                for connection in self.connections.values_mut() {
+                    if let PeerConnectionState::Connected(_) = connection.state {
+                        connection.outbound_messages.push_back(json.clone());
+                        debug!(
+                            peer_addr = %connection.addr_string,
+                            count = requests_to_sync.len(),
+                            "Sent sync requests to peer"
+                        );
+                    }
                 }
             }
         }
     }
     
     fn check_leader_election_and_sync(&mut self) {
-        // Simple leader election: highest startup time wins
-        let mut highest_startup_time = self.startup_time;
-        let mut leader_machine_id = self.config.machine.clone();
-        
-        for peer_info in self.peer_info.values() {
-            if peer_info.startup_time > highest_startup_time {
-                highest_startup_time = peer_info.startup_time;
-                leader_machine_id = peer_info.machine_id.clone();
-            }
-        }
-        
-        let was_leader = self.is_leader;
-        self.is_leader = leader_machine_id == self.config.machine;
-        self.current_leader = Some(leader_machine_id);
-        
-        if self.is_leader != was_leader {
-            if self.is_leader {
-                info!("Became leader");
+        // Self-promotion logic
+        if !self.is_leader && 
+           (self.config.peer_addresses.is_empty() || self.connections.is_empty()) &&
+           self.peer_info.is_empty() {
+            
+            let current_time = now().unix_timestamp() as u64;
+            let time_since_startup = current_time.saturating_sub(self.startup_time);
+            
+            if time_since_startup >= self.config.self_promotion_delay_secs {
+                info!("Self-promoting to leader due to no peer connections");
+                self.is_leader = true;
+                self.current_leader = Some(self.config.machine.clone());
                 self.availability_state = AvailabilityState::Available;
-            } else {
-                info!(current_leader = %self.current_leader.as_ref().unwrap(), "Leader changed");
-                if !self.is_fully_synced {
-                    self.availability_state = AvailabilityState::Unavailable;
-                }
-            }
-        }
-        
-        // Handle availability and syncing logic
-        if !self.is_leader && !self.is_fully_synced && !self.full_sync_request_pending {
-            // Request full sync from leader if available
-            if let Some(ref leader) = self.current_leader {
-                let full_sync_message = PeerMessage::FullSyncRequest {
-                    machine_id: self.config.machine.clone(),
-                };
+                self.is_fully_synced = true;
+                self.became_unavailable_at = None;
                 
-                // Find leader connection and send request
-                for connection in self.connections.values_mut() {
-                    if let Some(peer_info) = self.peer_info.get(&connection.addr_string) {
-                        if peer_info.machine_id == *leader {
-                            if let Ok(json) = serde_json::to_string(&full_sync_message) {
-                                connection.outbound_messages.push_back(json);
-                                self.full_sync_request_pending = true;
-                                info!(leader = %leader, "Requested full sync from leader");
-                            }
-                            break;
-                        }
+                // Force disconnect all clients during transition
+                if let Some(ref core_handle) = self.core_handle {
+                    if let Err(e) = core_handle.force_disconnect_all_clients() {
+                        error!(error = %e, "Failed to force disconnect clients during leader promotion");
                     }
                 }
             }
+        }
+        
+        // Regular leadership determination
+        self.determine_leadership();
+        
+        // Full sync request logic
+        if matches!(self.availability_state, AvailabilityState::Unavailable) &&
+           !self.is_leader &&
+           !self.is_fully_synced &&
+           !self.full_sync_request_pending {
+            
+            if let Some(became_unavailable_at) = self.became_unavailable_at {
+                let current_time = now().unix_timestamp() as u64;
+                let elapsed = current_time.saturating_sub(became_unavailable_at);
+                
+                if elapsed >= self.config.full_sync_grace_period_secs {
+                    if let Some(ref leader_machine_id) = self.current_leader.clone() {
+                        self.send_full_sync_request(leader_machine_id.clone());
+                    }
+                }
+            }
+        }
+    }
+    
+    fn determine_leadership(&mut self) {
+        let our_startup_time = self.startup_time;
+        let our_machine_id = &self.config.machine;
+        
+        // Find the earliest startup time among all known peers including ourselves
+        let earliest_startup = self.peer_info.values()
+            .map(|p| p.startup_time)
+            .min()
+            .unwrap_or(our_startup_time)
+            .min(our_startup_time);
+        
+        let mut should_be_leader = our_startup_time <= earliest_startup;
+        
+        // Handle startup time ties
+        if our_startup_time == earliest_startup {
+            let peers_with_same_time: Vec<_> = self.peer_info.values()
+                .filter(|p| p.startup_time == our_startup_time)
+                .collect();
+            
+            if !peers_with_same_time.is_empty() {
+                let mut all_machine_ids = peers_with_same_time.iter()
+                    .map(|p| p.machine_id.as_str())
+                    .collect::<Vec<_>>();
+                all_machine_ids.push(our_machine_id.as_str());
+                
+                let min_machine_id = all_machine_ids.iter().min().unwrap();
+                should_be_leader = **min_machine_id == *our_machine_id;
+            }
+        }
+        
+        let old_state = self.availability_state.clone();
+        
+        if should_be_leader {
+            self.is_leader = true;
+            self.current_leader = Some(our_machine_id.clone());
+            self.is_fully_synced = true;
+            self.availability_state = AvailabilityState::Available;
+            self.became_unavailable_at = None;
+            
+            info!(
+                our_startup_time = our_startup_time,
+                earliest_startup = earliest_startup,
+                "Elected as leader"
+            );
+        } else {
+            let leader = self.peer_info.values()
+                .filter(|p| p.startup_time <= earliest_startup)
+                .min_by_key(|p| (&p.startup_time, &p.machine_id))
+                .map(|p| p.machine_id.clone());
+            
+            self.is_leader = false;
+            self.current_leader = leader;
+            self.availability_state = AvailabilityState::Unavailable;
+            self.is_fully_synced = false;
+            self.full_sync_request_pending = false;
+            self.became_unavailable_at = Some(now().unix_timestamp() as u64);
+            
+            info!(
+                leader = ?self.current_leader,
+                our_startup_time = our_startup_time,
+                earliest_startup = earliest_startup,
+                "Leader determined, stepping down"
+            );
+        }
+        
+        // Force disconnect clients if becoming unavailable
+        if old_state != self.availability_state && 
+           matches!(self.availability_state, AvailabilityState::Unavailable) {
+            if let Some(ref core_handle) = self.core_handle {
+                if let Err(e) = core_handle.force_disconnect_all_clients() {
+                    error!(error = %e, "Failed to force disconnect clients due to unavailability");
+                }
+                info!("Disconnected all clients due to unavailability");
+            }
+        }
+    }
+    
+    fn send_full_sync_request(&mut self, leader_machine_id: String) {
+        info!(
+            leader_machine_id = %leader_machine_id,
+            "Grace period expired, sending FullSyncRequest to leader"
+        );
+        
+        self.full_sync_request_pending = true;
+        
+        let full_sync_request = PeerMessage::FullSyncRequest {
+            machine_id: self.config.machine.clone(),
+        };
+        
+        if let Ok(request_json) = serde_json::to_string(&full_sync_request) {
+            let mut sent = false;
+            for connection in self.connections.values_mut() {
+                if let Some(peer_info) = self.peer_info.get(&connection.addr_string) {
+                    if peer_info.machine_id == leader_machine_id {
+                        connection.outbound_messages.push_back(request_json);
+                        info!(peer_addr = %connection.addr_string, "Sent FullSyncRequest to leader");
+                        sent = true;
+                        break;
+                    }
+                }
+            }
+            
+            if !sent {
+                warn!("No connected peer available to send FullSyncRequest to leader");
+                self.full_sync_request_pending = false;
+            }
+        } else {
+            error!("Failed to serialize FullSyncRequest");
+            self.full_sync_request_pending = false;
         }
     }
 }
