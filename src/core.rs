@@ -429,18 +429,29 @@ impl CoreService {
                         Interest::READABLE | Interest::WRITABLE
                     )?;
                     
-                    let connection = ClientConnection {
-                        websocket: WebSocket::from_partially_read(mio_stream, Vec::new(), tungstenite::protocol::Role::Server, None),
-                        addr_string: addr.to_string(),
-                        authenticated: false,
-                        client_id: None,
-                        notification_queue: NotificationQueue::new(),
-                        notification_configs: HashSet::new(),
-                        pending_notifications: VecDeque::new(),
-                        outbound_messages: VecDeque::new(),
-                    };
-                    
-                    self.connections.insert(token, connection);
+                    // Perform WebSocket handshake
+                    match tungstenite::accept(mio_stream) {
+                        Ok(websocket) => {
+                            let connection = ClientConnection {
+                                websocket,
+                                addr_string: addr.to_string(),
+                                authenticated: false,
+                                client_id: None,
+                                notification_queue: NotificationQueue::new(),
+                                notification_configs: HashSet::new(),
+                                pending_notifications: VecDeque::new(),
+                                outbound_messages: VecDeque::new(),
+                            };
+                            
+                            self.connections.insert(token, connection);
+                            debug!(client_addr = %addr, "WebSocket handshake completed");
+                        }
+                        Err(e) => {
+                            error!(client_addr = %addr, error = %e, "WebSocket handshake failed");
+                            // Note: mio_stream is moved, so we can't deregister it here
+                            // The connection will be cleaned up when the token is removed
+                        }
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     break;
@@ -556,8 +567,15 @@ impl CoreService {
             let response = self.process_store_message(store_msg, token)?;
             if let Ok(response_text) = serde_json::to_string(&response) {
                 if let Some(conn) = self.connections.get_mut(&token) {
+                    debug!(
+                        client_addr = %conn.addr_string,
+                        message_length = response_text.len(),
+                        "Queueing response message"
+                    );
                     conn.outbound_messages.push_back(response_text);
                 }
+            } else {
+                error!("Failed to serialize response message");
             }
         }
         
@@ -569,7 +587,25 @@ impl CoreService {
             while let Some(message_text) = connection.outbound_messages.pop_front() {
                 match connection.websocket.write(Message::Text(message_text.clone())) {
                     Ok(_) => {
-                        // Message written successfully
+                        debug!(
+                            client_addr = %connection.addr_string,
+                            "Sent message to client"
+                        );
+                        // Try to flush the websocket to ensure data is sent
+                        if let Err(e) = connection.websocket.flush() {
+                            match e {
+                                tungstenite::Error::Io(ref io_err) 
+                                    if io_err.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // Put the message back and try again later
+                                    connection.outbound_messages.push_front(message_text);
+                                    break;
+                                }
+                                _ => {
+                                    error!(error = %e, "Failed to flush websocket");
+                                    return Err(e.into());
+                                }
+                            }
+                        }
                     }
                     Err(tungstenite::Error::Io(ref e)) 
                         if e.kind() == std::io::ErrorKind::WouldBlock => {

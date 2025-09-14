@@ -1,7 +1,9 @@
 use crossbeam::channel::{Sender, Receiver, bounded, unbounded};
-use std::net::SocketAddr;
+use crossbeam::queue::SegQueue;
+use std::net::ToSocketAddrs;
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
+use std::sync::Arc;
 use mio::{Poll, Interest, Token, Events};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use tungstenite::{WebSocket, Message};
@@ -100,14 +102,12 @@ enum ConnectionRequest {
     },
 }
 
-/// Peer service request types
+/// Fire-and-forget peer service requests (no response needed)
 #[derive(Debug)]
-pub enum PeerRequest {
+pub enum PeerCommand {
     SendSyncMessage {
         requests: Vec<qlib_rs::Request>,
     },
-    GetAvailabilityState,
-    GetLeadershipInfo,
     SetSnapshotHandle {
         handle: crate::snapshot::SnapshotHandle,
     },
@@ -116,26 +116,30 @@ pub enum PeerRequest {
     },
 }
 
+/// Peer service request types that require responses
+#[derive(Debug)]
+pub enum PeerRequest {
+    GetAvailabilityState,
+    GetLeadershipInfo,
+}
+
 /// Response types for peer requests
 #[derive(Debug)]
 pub enum PeerResponse {
-    Unit,
     AvailabilityState(AvailabilityState),
-    LeadershipInfo(bool, Option<String>),
+    LeadershipInfo(bool, Option<String>), // (is_leader, current_leader)
 }
 
 /// Handle for communicating with peer service
 #[derive(Debug, Clone)]
 pub struct PeerHandle {
     request_sender: Sender<(PeerRequest, Sender<PeerResponse>)>,
+    command_queue: Arc<SegQueue<PeerCommand>>,
 }
 
 impl PeerHandle {
     pub fn send_sync_message(&self, requests: Vec<qlib_rs::Request>) {
-        let (response_tx, _response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::SendSyncMessage { requests }, response_tx)) {
-            error!(error = %e, "Failed to send sync message request to peer service");
-        }
+        self.command_queue.push(PeerCommand::SendSyncMessage { requests });
     }
 
     pub fn get_availability_state(&self) -> AvailabilityState {
@@ -172,18 +176,12 @@ impl PeerHandle {
 
     /// Set snapshot handle for dependencies
     pub fn set_snapshot_handle(&self, handle: crate::snapshot::SnapshotHandle) {
-        let (response_tx, _response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::SetSnapshotHandle { handle }, response_tx)) {
-            error!(error = %e, "Failed to send set snapshot handle request to peer service");
-        }
+        self.command_queue.push(PeerCommand::SetSnapshotHandle { handle });
     }
 
     /// Set core handle for dependencies
     pub fn set_core_handle(&self, handle: crate::core::CoreHandle) {
-        let (response_tx, _response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::SetCoreHandle { handle }, response_tx)) {
-            error!(error = %e, "Failed to send set core handle request to peer service");
-        }
+        self.command_queue.push(PeerCommand::SetCoreHandle { handle });
     }
 }
 
@@ -246,7 +244,13 @@ fn connection_worker(
             ConnectionRequest::OutboundConnection { peer_addr } => {
                 debug!(peer_addr = %peer_addr, "Processing outbound connection request");
                 
-                if let Ok(addr) = peer_addr.parse::<SocketAddr>() {
+                // Try to resolve the address (handles both IP addresses and hostnames like localhost)
+                let socket_addr = match peer_addr.to_socket_addrs() {
+                    Ok(mut addrs) => addrs.next(),
+                    Err(_) => None,
+                };
+                
+                if let Some(addr) = socket_addr {
                     match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                         Ok(std_stream) => {
                             if let Err(e) = std_stream.set_nonblocking(true) {
@@ -301,13 +305,17 @@ fn connection_worker(
 impl PeerService {
     pub fn spawn(config: PeerConfig) -> PeerHandle {
         let (request_sender, request_receiver) = bounded(1024);
+        let command_queue = Arc::new(SegQueue::new());
         
-        let handle = PeerHandle { request_sender };
+        let handle = PeerHandle { 
+            request_sender,
+            command_queue: command_queue.clone(),
+        };
         
         // Spawn the service thread
         let service_config = config.clone();
         thread::spawn(move || {
-            if let Err(e) = Self::run_service(service_config, request_receiver) {
+            if let Err(e) = Self::run_service(service_config, request_receiver, command_queue) {
                 error!(error = %e, "Peer service failed");
             }
             error!("Peer service has stopped unexpectedly");
@@ -318,7 +326,8 @@ impl PeerService {
     
     fn run_service(
         config: PeerConfig, 
-        request_receiver: Receiver<(PeerRequest, Sender<PeerResponse>)>
+        request_receiver: Receiver<(PeerRequest, Sender<PeerResponse>)>,
+        command_queue: Arc<SegQueue<PeerCommand>>,
     ) -> Result<()> {
         let addr = format!("0.0.0.0:{}", config.peer_port).parse()?;
         let mut listener = MioTcpListener::bind(addr)?;
@@ -388,6 +397,11 @@ impl PeerService {
                 if let Err(_) = response_sender.send(response) {
                     error!("Failed to send response back to caller");
                 }
+            }
+            
+            // Handle commands (non-blocking)
+            while let Some(command) = command_queue.pop() {
+                service.handle_command(command);
             }
             
             // Handle connection results from background threads (non-blocking)
@@ -694,23 +708,25 @@ impl PeerService {
     
     fn handle_request(&mut self, request: PeerRequest) -> PeerResponse {
         match request {
-            PeerRequest::SendSyncMessage { requests } => {
-                self.send_sync_message_to_peers(requests);
-                PeerResponse::Unit
-            }
             PeerRequest::GetAvailabilityState => {
                 PeerResponse::AvailabilityState(self.availability_state.clone())
             }
             PeerRequest::GetLeadershipInfo => {
                 PeerResponse::LeadershipInfo(self.is_leader, self.current_leader.clone())
             }
-            PeerRequest::SetSnapshotHandle { handle } => {
-                self.snapshot_handle = Some(handle);
-                PeerResponse::Unit
+        }
+    }
+    
+    fn handle_command(&mut self, command: PeerCommand) {
+        match command {
+            PeerCommand::SendSyncMessage { requests } => {
+                self.send_sync_message_to_peers(requests);
             }
-            PeerRequest::SetCoreHandle { handle } => {
+            PeerCommand::SetSnapshotHandle { handle } => {
+                self.snapshot_handle = Some(handle);
+            }
+            PeerCommand::SetCoreHandle { handle } => {
                 self.core_handle = Some(handle);
-                PeerResponse::Unit
             }
         }
     }
@@ -927,6 +943,8 @@ impl PeerService {
     }
     
     fn check_leader_election_and_sync(&mut self) {
+        let mut leadership_changed = false;
+        
         // Self-promotion logic
         if !self.is_leader && 
            (self.config.peer_addresses.is_empty() || self.connections.is_empty()) &&
@@ -942,6 +960,7 @@ impl PeerService {
                 self.availability_state = AvailabilityState::Available;
                 self.is_fully_synced = true;
                 self.became_unavailable_at = None;
+                leadership_changed = true;
                 
                 // Force disconnect all clients during transition
                 if let Some(ref core_handle) = self.core_handle {
@@ -952,8 +971,10 @@ impl PeerService {
             }
         }
         
-        // Regular leadership determination
-        self.determine_leadership();
+        // Only re-determine leadership if there are actual peers connected or we're not yet leader
+        if !self.peer_info.is_empty() || !self.is_leader || leadership_changed {
+            self.determine_leadership();
+        }
         
         // Full sync request logic
         if matches!(self.availability_state, AvailabilityState::Unavailable) &&
