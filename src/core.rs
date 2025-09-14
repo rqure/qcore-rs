@@ -4,18 +4,16 @@ use std::time::Duration as StdDuration;
 use mio::{Poll, Interest, Token, Events};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use tungstenite::{WebSocket, Message};
-use tungstenite::handshake::HandshakeRole;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
     AuthenticationResult, Notification, Store, Cache, CelExecutor,
-    et, ft, now, schoice, sread, sref, swrite, PushCondition, Value,
-    StoreTrait, EntityType, FieldType, Request, Snapshot, Snowflake,
-    PageOpts, PageResult, EntitySchema, FieldSchema, 
-    AuthConfig, authenticate_subject, get_scope, AuthorizationScope
+    PushCondition, Value, Request, Snapshot, Snowflake, StoreTrait,
+    AuthConfig, EntityType, FieldType, PageOpts, PageResult, 
+    auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
-use time;
+use crate::peers::AvailabilityState;
 
 /// Configuration for the core service
 #[derive(Debug, Clone)]
@@ -88,9 +86,15 @@ impl CoreService {
         info!(bind_address = %addr, "Core service WebSocket server initialized");
         
         // Initialize store with snowflake
-        let snowflake = Snowflake::new(1, 1); // TODO: configure these properly
-        let store = Store::new(snowflake);
-        let permission_cache = Cache::new();
+        let snowflake = Snowflake::new(); // TODO: configure these properly
+        let mut store = Store::new(snowflake);
+        
+        let (permission_cache, _notification_queue) = Cache::new(
+            &mut store,
+            qlib_rs::et::permission(),
+            vec![qlib_rs::ft::resource_type(), qlib_rs::ft::resource_field()],
+            vec![qlib_rs::ft::scope(), qlib_rs::ft::condition()]
+        ).map_err(|e| anyhow::anyhow!("Failed to create permission cache: {}", e))?;
         let cel_executor = CelExecutor::new();
         
         let now = std::time::Instant::now();
@@ -196,7 +200,7 @@ impl CoreService {
                     )?;
                     
                     let connection = ClientConnection {
-                        websocket: WebSocket::from_raw_socket(mio_stream, HandshakeRole::Server, None),
+                        websocket: WebSocket::from_partially_read(mio_stream, Vec::new(), tungstenite::protocol::Role::Server, None),
                         addr,
                         addr_string: addr.to_string(),
                         authenticated: false,
@@ -266,6 +270,10 @@ impl CoreService {
     }
     
     fn handle_client_read(&mut self, token: Token) -> Result<bool> {
+        let mut messages_to_process = Vec::new();
+        let mut should_close = false;
+        
+        // First pass: collect messages
         if let Some(connection) = self.connections.get_mut(&token) {
             loop {
                 match connection.websocket.read() {
@@ -278,13 +286,7 @@ impl CoreService {
                         
                         match serde_json::from_str::<StoreMessage>(&text) {
                             Ok(store_msg) => {
-                                let addr_string = connection.addr_string.clone();
-                                let response = self.process_store_message(store_msg, token)?;
-                                if let Ok(response_text) = serde_json::to_string(&response) {
-                                    if let Some(conn) = self.connections.get_mut(&token) {
-                                        conn.outbound_messages.push_back(response_text);
-                                    }
-                                }
+                                messages_to_process.push(store_msg);
                             }
                             Err(e) => {
                                 error!(
@@ -295,15 +297,15 @@ impl CoreService {
                             }
                         }
                     }
-                    Ok(Message::Ping(payload)) => {
-                        if let Some(conn) = self.connections.get_mut(&token) {
-                            // Respond with pong
-                            if let Ok(pong) = Message::Pong(payload).to_string() {
-                                conn.outbound_messages.push_back(pong);
-                            }
-                        }
+                    Ok(Message::Ping(_payload)) => {
+                        // WebSocket ping/pong is handled automatically by tungstenite
+                        // We don't need to manually respond to pings
+                        debug!("Received WebSocket ping");
                     }
-                    Ok(Message::Close(_)) => return Ok(false),
+                    Ok(Message::Close(_)) => {
+                        should_close = true;
+                        break;
+                    }
                     Err(tungstenite::Error::Io(ref e)) 
                         if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
@@ -312,21 +314,31 @@ impl CoreService {
                             error = %e,
                             "WebSocket read error"
                         );
-                        return Ok(false);
+                        should_close = true;
+                        break;
                     }
                     _ => {} // Handle other message types
                 }
             }
-            Ok(true)
-        } else {
-            Ok(false)
         }
+        
+        // Second pass: process messages
+        for store_msg in messages_to_process {
+            let response = self.process_store_message(store_msg, token)?;
+            if let Ok(response_text) = serde_json::to_string(&response) {
+                if let Some(conn) = self.connections.get_mut(&token) {
+                    conn.outbound_messages.push_back(response_text);
+                }
+            }
+        }
+        
+        Ok(!should_close)
     }
     
     fn handle_client_write(&mut self, token: Token) -> Result<()> {
         if let Some(connection) = self.connections.get_mut(&token) {
             while let Some(message_text) = connection.outbound_messages.pop_front() {
-                match connection.websocket.write(Message::Text(message_text)) {
+                match connection.websocket.write(Message::Text(message_text.clone())) {
                     Ok(_) => {
                         // Message written successfully
                     }
@@ -403,6 +415,7 @@ impl CoreService {
                             id,
                             response: Ok(AuthenticationResult {
                                 subject_id,
+                                subject_type: "User".to_string(), // TODO: determine actual subject type
                             }),
                         })
                     }
@@ -454,7 +467,19 @@ impl CoreService {
                         
                         match self.check_requests_authorization(client_id, requests) {
                             Ok(authorized_requests) => {
-                                match self.store.perform(authorized_requests) {
+                                // Check if any requests are write operations
+                                let has_writes = authorized_requests.iter().any(|req| match req {
+                                    Request::Write { .. } | Request::Create { .. } | Request::Delete { .. } => true,
+                                    _ => false,
+                                });
+                                
+                                let result = if has_writes {
+                                    self.store.perform_mut(authorized_requests)
+                                } else {
+                                    self.store.perform(authorized_requests)
+                                };
+                                
+                                match result {
                                     Ok(results) => {
                                         Ok(StoreMessage::PerformResponse { 
                                             id, 
@@ -473,41 +498,6 @@ impl CoreService {
                             Err(e) => {
                                 error!(error = %e, "Authorization check failed");
                                 Ok(StoreMessage::PerformResponse { 
-                                    id, 
-                                    response: Err(format!("Authorization error: {}", e)) 
-                                })
-                            }
-                        }
-                    }
-                    
-                    StoreMessage::PerformMut { id, requests } => {
-                        debug!(
-                            client_addr = %addr_string,
-                            request_count = requests.len(),
-                            "Processing PerformMut request"
-                        );
-                        
-                        match self.check_requests_authorization(client_id, requests) {
-                            Ok(authorized_requests) => {
-                                match self.store.perform_mut(authorized_requests) {
-                                    Ok(results) => {
-                                        Ok(StoreMessage::PerformMutResponse { 
-                                            id, 
-                                            response: Ok(results) 
-                                        })
-                                    }
-                                    Err(e) => {
-                                        error!(error = %e, "Store perform_mut failed");
-                                        Ok(StoreMessage::PerformMutResponse { 
-                                            id, 
-                                            response: Err(format!("Store error: {}", e)) 
-                                        })
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Authorization check failed");
-                                Ok(StoreMessage::PerformMutResponse { 
                                     id, 
                                     response: Err(format!("Authorization error: {}", e)) 
                                 })
@@ -574,7 +564,7 @@ impl CoreService {
             let machine = &self.config.machine_id;
             
             let candidates = self.store.find_entities_paginated(
-                &et::candidate(), 
+                &qlib_rs::et::candidate(), 
                 None,
                 Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))
             )?;
@@ -584,42 +574,80 @@ impl CoreService {
         
         // Update available list and current leader for all fault tolerance entities
         let fault_tolerances = self.store.find_entities_paginated(
-            &et::fault_tolerance(), 
+            &qlib_rs::et::fault_tolerance(), 
             None,
             None
         )?;
         
         for ft_entity_id in fault_tolerances.items {
             let ft_fields = self.store.perform(vec![
-                sread!(ft_entity_id.clone(), ft::candidate_list()),
-                sread!(ft_entity_id.clone(), ft::available_list()),
-                sread!(ft_entity_id.clone(), ft::current_leader())
+                qlib_rs::sread!(ft_entity_id.clone(), qlib_rs::ft::candidate_list()),
+                qlib_rs::sread!(ft_entity_id.clone(), qlib_rs::ft::available_list()),
+                qlib_rs::sread!(ft_entity_id.clone(), qlib_rs::ft::current_leader())
             ])?;
             
+            let default_candidates = Vec::new();
             let candidates = ft_fields
                 .get(0)
                 .and_then(|r| match r {
-                    Request::Read { response: Some(Ok(value)), .. } => value.as_entity_list().ok(),
+                    Request::Read { value: Some(value), .. } => value.as_entity_list(),
                     _ => None,
                 })
-                .unwrap_or_default();
+                .unwrap_or(&default_candidates);
             
             let mut available = Vec::new();
             for candidate_id in candidates.iter() {
                 let candidate_fields = self.store.perform(vec![
-                    sread!(candidate_id.clone(), ft::heartbeat()),
-                    sread!(candidate_id.clone(), ft::make_me()),
-                    sread!(candidate_id.clone(), ft::death_detection_timeout()),
+                    qlib_rs::sread!(candidate_id.clone(), qlib_rs::ft::heartbeat()),
+                    qlib_rs::sread!(candidate_id.clone(), qlib_rs::ft::make_me()),
+                    qlib_rs::sread!(candidate_id.clone(), qlib_rs::ft::death_detection_timeout()),
                 ])?;
                 
-                // Process candidate availability logic here...
-                // This is simplified for now
+                // Process candidate availability logic
+                if let (Some(heartbeat_req), Some(make_me_req), Some(timeout_req)) = (
+                    candidate_fields.get(0),
+                    candidate_fields.get(1),
+                    candidate_fields.get(2)
+                ) {
+                    if let (
+                        Request::Read { write_time: Some(heartbeat_time), .. },
+                        Request::Read { value: Some(make_me_value), .. },
+                        Request::Read { value: Some(timeout_value), .. }
+                    ) = (heartbeat_req, make_me_req, timeout_req) {
+                        if let (Some(make_me_choice), Some(timeout_millis)) = (
+                            make_me_value.as_choice(),
+                            timeout_value.as_int()
+                        ) {
+                            let desired_availability = match make_me_choice {
+                                1 => AvailabilityState::Available,
+                                _ => AvailabilityState::Unavailable,
+                            };
+                            
+                            let now = qlib_rs::now();
+                            let death_timeout = time::Duration::milliseconds(timeout_millis);
+                            
+                            if desired_availability == AvailabilityState::Available &&
+                               *heartbeat_time + death_timeout > now {
+                                available.push(candidate_id.clone());
+                            }
+                        }
+                    }
+                }
             }
             
             // Update the fault tolerance entity
-            let requests = vec![
-                swrite!(ft_entity_id.clone(), ft::available_list(), Some(Value::EntityList(available.clone())), PushCondition::Changes),
+            let mut requests = vec![
+                qlib_rs::swrite!(ft_entity_id.clone(), qlib_rs::ft::available_list(), Some(Value::EntityList(available.clone())), PushCondition::Changes),
             ];
+            
+            // Handle leadership assignment
+            if let Some(me_as_candidate) = &me_as_candidate {
+                if candidates.contains(me_as_candidate) {
+                    requests.push(
+                        qlib_rs::swrite!(ft_entity_id.clone(), qlib_rs::ft::current_leader(), qlib_rs::sref!(Some(me_as_candidate.clone())), PushCondition::Changes)
+                    );
+                }
+            }
             
             self.store.perform_mut(requests)?;
         }
@@ -632,15 +660,15 @@ impl CoreService {
         let machine = &self.config.machine_id;
         
         let candidates = self.store.find_entities_paginated(
-            &et::candidate(), 
+            &qlib_rs::et::candidate(), 
             None,
             Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))
         )?;
         
         if let Some(candidate) = candidates.items.first() {
             self.store.perform_mut(vec![
-                swrite!(candidate.clone(), ft::heartbeat(), schoice!(0)),
-                swrite!(candidate.clone(), ft::make_me(), schoice!(1), PushCondition::Changes)
+                qlib_rs::swrite!(candidate.clone(), qlib_rs::ft::heartbeat(), qlib_rs::schoice!(0)),
+                qlib_rs::swrite!(candidate.clone(), qlib_rs::ft::make_me(), qlib_rs::schoice!(1), PushCondition::Changes)
             ])?;
         }
         
@@ -656,24 +684,31 @@ impl CoreService {
         let mut authorized_requests = Vec::new();
         
         for request in requests {
-            let scope = get_scope(&request)?;
+            // Extract entity_id and field_type from the request
+            let authorization_needed = match &request {
+                Request::Read { entity_id, field_type, .. } => Some((entity_id, field_type)),
+                Request::Write { entity_id, field_type, .. } => Some((entity_id, field_type)),
+                Request::Create { .. } => None, // No field-level authorization for creation
+                Request::Delete { .. } => None, // No field-level authorization for deletion
+                Request::SchemaUpdate { .. } => None, // No field-level authorization for schema updates
+                _ => None, // For other request types, skip authorization check
+            };
             
-            match scope {
-                AuthorizationScope::Public => {
-                    authorized_requests.push(request);
+            if let Some((entity_id, field_type)) = authorization_needed {
+                let scope = get_scope(&self.store, &mut self.cel_executor, &self.permission_cache, &client_id, entity_id, field_type)?;
+                
+                match scope {
+                    AuthorizationScope::ReadOnly | AuthorizationScope::ReadWrite => {
+                        authorized_requests.push(request);
+                    }
+                    AuthorizationScope::None => {
+                        // Skip unauthorized requests
+                        continue;
+                    }
                 }
-                AuthorizationScope::Private { entity_id, field_type } => {
-                    // Check if client is authorized for this specific entity/field
-                    let auth_config = AuthConfig {
-                        subject_id: client_id.clone(),
-                        entity_id: entity_id.clone(),
-                        field_type: field_type.clone(),
-                    };
-                    
-                    // For now, implement basic authorization logic
-                    // In a full implementation, this would check permissions
-                    authorized_requests.push(request);
-                }
+            } else {
+                // No authorization needed for this request type
+                authorized_requests.push(request);
             }
         }
         
@@ -686,7 +721,9 @@ impl CoreService {
         subject_name: &str,
         credential: &str,
     ) -> Result<EntityId> {
-        authenticate_subject(subject_name, credential, &mut self.store, &mut self.permission_cache, &mut self.cel_executor)
+        let auth_config = AuthConfig::default(); // Use default auth config
+        authenticate_subject(&mut self.store, subject_name, credential, &auth_config)
+            .map_err(|e| anyhow::anyhow!("Authentication error: {}", e))
     }
     
     /// Take a snapshot from the store
@@ -707,5 +744,75 @@ impl CoreService {
     /// Enable notifications
     pub fn enable_notifications(&mut self) {
         self.store.enable_notifications();
+    }
+    
+    /// Get entity schema
+    pub fn get_entity_schema(&self, entity_type: &EntityType) -> Result<qlib_rs::EntitySchema<qlib_rs::Single>> {
+        self.store.get_entity_schema(entity_type)
+            .map_err(|e| anyhow::anyhow!("Failed to get entity schema: {}", e))
+    }
+    
+    /// Get complete entity schema
+    pub fn get_complete_entity_schema(&self, entity_type: &EntityType) -> Result<qlib_rs::EntitySchema<qlib_rs::Complete>> {
+        self.store.get_complete_entity_schema(entity_type)
+            .map_err(|e| anyhow::anyhow!("Failed to get complete entity schema: {}", e))
+    }
+    
+    /// Get field schema
+    pub fn get_field_schema(&self, entity_type: &EntityType, field_type: &FieldType) -> Result<qlib_rs::FieldSchema> {
+        self.store.get_field_schema(entity_type, field_type)
+            .map_err(|e| anyhow::anyhow!("Failed to get field schema: {}", e))
+    }
+    
+    /// Set field schema
+    pub fn set_field_schema(&mut self, entity_type: &EntityType, field_type: &FieldType, schema: qlib_rs::FieldSchema) -> Result<()> {
+        self.store.set_field_schema(entity_type, field_type, schema)
+            .map_err(|e| anyhow::anyhow!("Failed to set field schema: {}", e))
+    }
+    
+    /// Check if entity exists
+    pub fn entity_exists(&self, entity_id: &EntityId) -> bool {
+        self.store.entity_exists(entity_id)
+    }
+    
+    /// Check if field exists
+    pub fn field_exists(&self, entity_type: &EntityType, field_type: &FieldType) -> bool {
+        self.store.field_exists(entity_type, field_type)
+    }
+    
+    /// Find entities with pagination
+    pub fn find_entities_paginated(&self, entity_type: &EntityType, page_opts: Option<PageOpts>, filter: Option<String>) -> Result<PageResult<EntityId>> {
+        self.store.find_entities_paginated(entity_type, page_opts, filter)
+            .map_err(|e| anyhow::anyhow!("Failed to find entities: {}", e))
+    }
+    
+    /// Find entities exact match
+    pub fn find_entities_exact(&self, entity_type: &EntityType, page_opts: Option<PageOpts>, filter: Option<String>) -> Result<PageResult<EntityId>> {
+        self.store.find_entities_exact(entity_type, page_opts, filter)
+            .map_err(|e| anyhow::anyhow!("Failed to find entities exact: {}", e))
+    }
+    
+    /// Get entity types with pagination
+    pub fn get_entity_types_paginated(&self, page_opts: Option<PageOpts>) -> Result<PageResult<EntityType>> {
+        self.store.get_entity_types_paginated(page_opts)
+            .map_err(|e| anyhow::anyhow!("Failed to get entity types: {}", e))
+    }
+    
+    /// Perform map operation
+    pub fn perform_map(&mut self, requests: Vec<Request>) -> Result<HashMap<FieldType, Request>> {
+        self.store.perform_map(requests)
+            .map_err(|e| anyhow::anyhow!("Failed to perform map: {}", e))
+    }
+    
+    /// Register notification configuration
+    pub fn register_notification(&mut self, _client_id: EntityId, _config: NotifyConfig) -> Result<()> {
+        // Add notification logic here when implemented
+        Ok(())
+    }
+    
+    /// Unregister notification configuration
+    pub fn unregister_notification(&mut self, _client_id: EntityId, _config: NotifyConfig) -> bool {
+        // Add notification logic here when implemented
+        false
     }
 }

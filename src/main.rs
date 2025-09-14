@@ -3,9 +3,6 @@ mod peers;
 mod snapshot;
 mod files;
 mod core;
-mod peers;
-mod snapshot;
-mod wal;
 
 use std::path::PathBuf;
 
@@ -120,16 +117,15 @@ fn main() -> Result<()> {
         let _ = shutdown_tx.send(());
     });
     
-    // Run the core service with graceful shutdown
-    std::thread::spawn(move || {
-        if let Err(e) = core_service.run() {
-            tracing::error!(error = %e, "Core service failed");
-        }
-    });
+    // Run the core service in the main thread (it uses mio for non-blocking I/O)
+    if let Err(e) = core_service.run() {
+        tracing::error!(error = %e, "Core service failed");
+    }
     
-    // Wait for shutdown signal
-    let _ = shutdown_rx.recv();
-    tracing::info!("Received shutdown signal, initiating graceful shutdown");
+    // Check for shutdown signal (non-blocking)
+    if let Ok(_) = shutdown_rx.try_recv() {
+        tracing::info!("Received shutdown signal, initiating graceful shutdown");
+    }
     
     // TODO: Implement graceful shutdown by taking final snapshot
     tracing::info!("QCore service shutdown complete");
