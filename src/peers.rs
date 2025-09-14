@@ -79,6 +79,36 @@ pub struct PeerInfo {
     pub startup_time: u64
 }
 
+/// Result of an asynchronous connection attempt
+#[derive(Debug)]
+enum ConnectionResult {
+    InboundSuccess {
+        addr: SocketAddr,
+        websocket: WebSocket<MioTcpStream>,
+    },
+    OutboundSuccess {
+        peer_addr: String,
+        addr: SocketAddr,
+        websocket: WebSocket<MioTcpStream>,
+    },
+    InboundFailure {
+        addr: SocketAddr,
+        error: String,
+    },
+    OutboundFailure {
+        peer_addr: String,
+        error: String,
+    },
+}
+
+/// Request for an outbound connection attempt
+#[derive(Debug)]
+enum ConnectionRequest {
+    OutboundConnection {
+        peer_addr: String,
+    },
+}
+
 /// Peer service request types
 #[derive(Debug)]
 pub enum PeerRequest {
@@ -205,10 +235,81 @@ pub struct PeerService {
     // Timing for periodic operations
     last_leadership_check: std::time::Instant,
     last_reconnect_attempt: std::time::Instant,
+    
+    // Channel for receiving connection results from background threads
+    connection_result_receiver: Receiver<ConnectionResult>,
+    
+    // Channel for sending connection requests to the connection worker thread
+    connection_request_sender: Sender<ConnectionRequest>,
 }
 
 const LISTENER_TOKEN: Token = Token(0);
 const LEADERSHIP_CHECK_INTERVAL_SECS: u64 = 1;
+
+/// Worker function that handles all outbound connection attempts in a single thread
+fn connection_worker(
+    connection_request_receiver: Receiver<ConnectionRequest>,
+    connection_result_sender: Sender<ConnectionResult>,
+) {
+    debug!("Connection worker thread started");
+    
+    while let Ok(request) = connection_request_receiver.recv() {
+        match request {
+            ConnectionRequest::OutboundConnection { peer_addr } => {
+                debug!(peer_addr = %peer_addr, "Processing outbound connection request");
+                
+                if let Ok(addr) = peer_addr.parse::<SocketAddr>() {
+                    match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                        Ok(std_stream) => {
+                            if let Err(e) = std_stream.set_nonblocking(true) {
+                                let _ = connection_result_sender.send(ConnectionResult::OutboundFailure {
+                                    peer_addr: peer_addr.clone(),
+                                    error: format!("Failed to set non-blocking: {}", e),
+                                });
+                                continue;
+                            }
+                            
+                            let mio_stream = MioTcpStream::from_std(std_stream);
+                            let url = format!("ws://{}", peer_addr);
+                            
+                            match tungstenite::client(&url, mio_stream) {
+                                Ok((websocket, _response)) => {
+                                    info!(peer_addr = %peer_addr, "Outbound peer connection established");
+                                    let _ = connection_result_sender.send(ConnectionResult::OutboundSuccess {
+                                        peer_addr,
+                                        addr,
+                                        websocket,
+                                    });
+                                }
+                                Err(e) => {
+                                    debug!(peer_addr = %peer_addr, error = %e, "Failed to establish outbound WebSocket connection");
+                                    let _ = connection_result_sender.send(ConnectionResult::OutboundFailure {
+                                        peer_addr,
+                                        error: format!("WebSocket client handshake failed: {}", e),
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(peer_addr = %peer_addr, error = %e, "Failed to connect to peer");
+                            let _ = connection_result_sender.send(ConnectionResult::OutboundFailure {
+                                peer_addr,
+                                error: format!("TCP connection failed: {}", e),
+                            });
+                        }
+                    }
+                } else {
+                    let _ = connection_result_sender.send(ConnectionResult::OutboundFailure {
+                        peer_addr,
+                        error: "Invalid peer address format".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    
+    debug!("Connection worker thread exiting");
+}
 
 impl PeerService {
     pub fn spawn(config: PeerConfig) -> PeerHandle {
@@ -240,6 +341,18 @@ impl PeerService {
         
         info!(bind_address = %addr, "Peer service WebSocket server initialized");
         
+        // Create channel for connection results from background threads
+        let (connection_result_sender, connection_result_receiver) = unbounded();
+        
+        // Create channel for connection requests to the connection worker thread
+        let (connection_request_sender, connection_request_receiver) = unbounded();
+        
+        // Spawn connection worker thread
+        let worker_result_sender = connection_result_sender.clone();
+        thread::spawn(move || {
+            connection_worker(connection_request_receiver, worker_result_sender);
+        });
+        
         let now_instant = std::time::Instant::now();
         let mut service = Self {
             config: config.clone(),
@@ -259,6 +372,8 @@ impl PeerService {
             next_token: 1, // Start from 1, as 0 is reserved for listener
             last_leadership_check: now_instant,
             last_reconnect_attempt: now_instant,
+            connection_result_receiver,
+            connection_request_sender,
         };
         
         let mut events = Events::with_capacity(128);
@@ -272,7 +387,7 @@ impl PeerService {
             for event in events.iter() {
                 match event.token() {
                     LISTENER_TOKEN => {
-                        service.handle_new_peer_connection()?;
+                        service.handle_new_peer_connection(&connection_result_sender)?;
                     }
                     token => {
                         service.handle_peer_event(token, event.is_readable(), event.is_writable())?;
@@ -288,6 +403,11 @@ impl PeerService {
                 }
             }
             
+            // Handle connection results from background threads (non-blocking)
+            while let Ok(connection_result) = service.connection_result_receiver.try_recv() {
+                service.handle_connection_result(connection_result, &connection_result_sender)?;
+            }
+            
             // Periodic operations
             let now = std::time::Instant::now();
             
@@ -300,30 +420,34 @@ impl PeerService {
             // Reconnect attempts
             let reconnect_interval = Duration::from_secs(service.config.peer_reconnect_interval_secs);
             if now.duration_since(service.last_reconnect_attempt) >= reconnect_interval {
-                service.attempt_outbound_connections()?;
+                service.attempt_outbound_connections(&connection_result_sender)?;
                 service.last_reconnect_attempt = now;
             }
         }
     }
     
-    fn handle_new_peer_connection(&mut self) -> Result<()> {
+    fn handle_new_peer_connection(&mut self, connection_result_sender: &Sender<ConnectionResult>) -> Result<()> {
         loop {
             match self.listener.accept() {
                 Ok((stream, addr)) => {
-                    let token = Token(self.next_token);
-                    self.next_token += 1;
-                    
                     info!(peer_addr = %addr, "Accepting inbound peer connection");
                     
-                    // Handle the WebSocket handshake synchronously for inbound connections
+                    // For now, we'll handle the handshake directly but quickly
+                    // In a production system, you'd want a more sophisticated approach
                     match tungstenite::accept(stream) {
                         Ok(mut websocket) => {
+                            let token = Token(self.next_token);
+                            self.next_token += 1;
+                            
                             // Register the websocket stream for read/write events
-                            self.poll.registry().register(
+                            if let Err(e) = self.poll.registry().register(
                                 websocket.get_mut(), 
                                 token, 
                                 Interest::READABLE | Interest::WRITABLE
-                            )?;
+                            ) {
+                                error!(peer_addr = %addr, error = %e, "Failed to register websocket with poll");
+                                continue;
+                            }
                             
                             let connection = PeerConnection {
                                 addr,
@@ -517,65 +641,95 @@ impl PeerService {
         }
     }
     
-    fn attempt_outbound_connections(&mut self) -> Result<()> {
+    fn attempt_outbound_connections(&mut self, connection_result_sender: &Sender<ConnectionResult>) -> Result<()> {
         for peer_addr in &self.config.peer_addresses.clone() {
             // Check if we already have a connection to this peer address
             let already_connected = self.connections.values()
                 .any(|conn| &conn.addr_string == peer_addr);
             
             if !already_connected {
-                self.attempt_outbound_connection(peer_addr)?;
+                self.attempt_outbound_connection(peer_addr, connection_result_sender)?;
             }
         }
         Ok(())
     }
     
-    fn attempt_outbound_connection(&mut self, peer_addr: &str) -> Result<()> {
-        if let Ok(addr) = peer_addr.parse::<SocketAddr>() {
-            debug!(peer_addr = %peer_addr, "Attempting outbound connection");
-            
-            // For a full non-blocking implementation, we'd need to manage the connection
-            // state machine ourselves. For now, using a short timeout to avoid blocking too long.
-            match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
-                Ok(std_stream) => {
-                    std_stream.set_nonblocking(true)?;
-                    let mio_stream = MioTcpStream::from_std(std_stream);
-                    
-                    let url = format!("ws://{}", peer_addr);
-                    match tungstenite::client(&url, mio_stream) {
-                        Ok((mut websocket, _response)) => {
-                            let token = Token(self.next_token);
-                            self.next_token += 1;
-                            
-                            // Register the websocket stream for read/write events
-                            self.poll.registry().register(
-                                websocket.get_mut(), 
-                                token, 
-                                Interest::READABLE | Interest::WRITABLE
-                            )?;
-                            
-                            let connection = PeerConnection {
-                                addr,
-                                addr_string: peer_addr.to_string(),
-                                state: PeerConnectionState::Connected(websocket),
-                                outbound_messages: VecDeque::new(),
-                                is_outbound: true,
-                            };
-                            
-                            info!(peer_addr = %peer_addr, "Outbound peer connection established");
-                            self.connections.insert(token, connection);
-                            
-                            // Send our startup message to the new peer
-                            self.send_startup_message_to_peer(peer_addr);
-                        }
-                        Err(e) => {
-                            debug!(peer_addr = %peer_addr, error = %e, "Failed to establish outbound WebSocket connection");
-                        }
-                    }
+    fn attempt_outbound_connection(&mut self, peer_addr: &str, _connection_result_sender: &Sender<ConnectionResult>) -> Result<()> {
+        debug!(peer_addr = %peer_addr, "Queuing outbound connection request");
+        
+        // Send connection request to the connection worker thread
+        if let Err(e) = self.connection_request_sender.send(ConnectionRequest::OutboundConnection {
+            peer_addr: peer_addr.to_string(),
+        }) {
+            warn!(peer_addr = %peer_addr, error = %e, "Failed to queue outbound connection request");
+        }
+        
+        Ok(())
+    }
+    
+    fn handle_connection_result(&mut self, result: ConnectionResult, _connection_result_sender: &Sender<ConnectionResult>) -> Result<()> {
+        match result {
+            ConnectionResult::InboundSuccess { addr, mut websocket } => {
+                let token = Token(self.next_token);
+                self.next_token += 1;
+                
+                // Register the websocket stream for read/write events
+                if let Err(e) = self.poll.registry().register(
+                    websocket.get_mut(), 
+                    token, 
+                    Interest::READABLE | Interest::WRITABLE
+                ) {
+                    error!(peer_addr = %addr, error = %e, "Failed to register inbound websocket with poll");
+                    return Ok(());
                 }
-                Err(e) => {
-                    debug!(peer_addr = %peer_addr, error = %e, "Failed to connect to peer");
+                
+                let connection = PeerConnection {
+                    addr,
+                    addr_string: addr.to_string(),
+                    state: PeerConnectionState::Connected(websocket),
+                    outbound_messages: VecDeque::new(),
+                    is_outbound: false,
+                };
+                
+                self.connections.insert(token, connection);
+                info!(peer_addr = %addr, "Inbound peer connection registered");
+                
+                // Send our startup message to the new peer
+                self.send_startup_message_to_peer(&addr.to_string());
+            }
+            ConnectionResult::OutboundSuccess { peer_addr, addr, mut websocket } => {
+                let token = Token(self.next_token);
+                self.next_token += 1;
+                
+                // Register the websocket stream for read/write events
+                if let Err(e) = self.poll.registry().register(
+                    websocket.get_mut(), 
+                    token, 
+                    Interest::READABLE | Interest::WRITABLE
+                ) {
+                    error!(peer_addr = %peer_addr, error = %e, "Failed to register outbound websocket with poll");
+                    return Ok(());
                 }
+                
+                let connection = PeerConnection {
+                    addr,
+                    addr_string: peer_addr.clone(),
+                    state: PeerConnectionState::Connected(websocket),
+                    outbound_messages: VecDeque::new(),
+                    is_outbound: true,
+                };
+                
+                self.connections.insert(token, connection);
+                info!(peer_addr = %peer_addr, "Outbound peer connection registered");
+                
+                // Send our startup message to the new peer
+                self.send_startup_message_to_peer(&peer_addr);
+            }
+            ConnectionResult::InboundFailure { addr, error } => {
+                debug!(peer_addr = %addr, error = %error, "Inbound connection failed");
+            }
+            ConnectionResult::OutboundFailure { peer_addr, error } => {
+                debug!(peer_addr = %peer_addr, error = %error, "Outbound connection failed");
             }
         }
         Ok(())
