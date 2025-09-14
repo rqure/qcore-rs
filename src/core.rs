@@ -165,6 +165,7 @@ impl CoreService {
             // Handle misc operations
             if now >= next_misc {
                 self.handle_misc_operations()?;
+                self.check_availability_state()?;
                 self.last_misc_tick = now;
             }
             
@@ -372,8 +373,23 @@ impl CoreService {
     fn process_notifications(&mut self) -> Result<()> {
         // Check each client for new notifications and queue them for sending
         for connection in self.connections.values_mut() {
+            // Pop notifications from the queue and add to pending
             while let Some(notification) = connection.notification_queue.pop() {
                 connection.pending_notifications.push_back(notification);
+            }
+            
+            // Send pending notifications as messages
+            while let Some(notification) = connection.pending_notifications.pop_front() {
+                let notification_message = StoreMessage::Notification { notification };
+                
+                if let Ok(message_text) = serde_json::to_string(&notification_message) {
+                    connection.outbound_messages.push_back(message_text);
+                } else {
+                    error!(
+                        client_addr = %connection.addr_string,
+                        "Failed to serialize notification message"
+                    );
+                }
             }
         }
         Ok(())
@@ -503,6 +519,180 @@ impl CoreService {
                                 })
                             }
                         }
+                    }
+                    
+                    StoreMessage::GetEntitySchema { id, entity_type } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            entity_type = %entity_type,
+                            "Processing GetEntitySchema request"
+                        );
+                        
+                        match self.get_entity_schema(&entity_type) {
+                            Ok(schema) => Ok(StoreMessage::GetEntitySchemaResponse {
+                                id,
+                                response: Ok(Some(schema)),
+                            }),
+                            Err(e) => Ok(StoreMessage::GetEntitySchemaResponse {
+                                id,
+                                response: Err(format!("Schema error: {}", e)),
+                            }),
+                        }
+                    }
+                    
+                    StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            entity_type = %entity_type,
+                            "Processing GetCompleteEntitySchema request"
+                        );
+                        
+                        match self.get_complete_entity_schema(&entity_type) {
+                            Ok(schema) => Ok(StoreMessage::GetCompleteEntitySchemaResponse {
+                                id,
+                                response: Ok(schema),
+                            }),
+                            Err(e) => Ok(StoreMessage::GetCompleteEntitySchemaResponse {
+                                id,
+                                response: Err(format!("Schema error: {}", e)),
+                            }),
+                        }
+                    }
+                    
+                    StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            entity_type = %entity_type,
+                            field_type = %field_type,
+                            "Processing GetFieldSchema request"
+                        );
+                        
+                        match self.get_field_schema(&entity_type, &field_type) {
+                            Ok(schema) => Ok(StoreMessage::GetFieldSchemaResponse {
+                                id,
+                                response: Ok(Some(schema)),
+                            }),
+                            Err(e) => Ok(StoreMessage::GetFieldSchemaResponse {
+                                id,
+                                response: Err(format!("Schema error: {}", e)),
+                            }),
+                        }
+                    }
+                    
+                    StoreMessage::EntityExists { id, entity_id } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            entity_id = %entity_id,
+                            "Processing EntityExists request"
+                        );
+                        
+                        let exists = self.entity_exists(&entity_id);
+                        Ok(StoreMessage::EntityExistsResponse {
+                            id,
+                            response: exists,
+                        })
+                    }
+                    
+                    StoreMessage::FieldExists { id, entity_type, field_type } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            entity_type = %entity_type,
+                            field_type = %field_type,
+                            "Processing FieldExists request"
+                        );
+                        
+                        let exists = self.field_exists(&entity_type, &field_type);
+                        Ok(StoreMessage::FieldExistsResponse {
+                            id,
+                            response: exists,
+                        })
+                    }
+                    
+                    StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            entity_type = %entity_type,
+                            "Processing FindEntities request"
+                        );
+                        
+                        match self.find_entities_paginated(&entity_type, page_opts, filter) {
+                            Ok(result) => Ok(StoreMessage::FindEntitiesResponse {
+                                id,
+                                response: Ok(result),
+                            }),
+                            Err(e) => Ok(StoreMessage::FindEntitiesResponse {
+                                id,
+                                response: Err(format!("Find error: {}", e)),
+                            }),
+                        }
+                    }
+                    
+                    StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            entity_type = %entity_type,
+                            "Processing FindEntitiesExact request"
+                        );
+                        
+                        match self.find_entities_exact(&entity_type, page_opts, filter) {
+                            Ok(result) => Ok(StoreMessage::FindEntitiesExactResponse {
+                                id,
+                                response: Ok(result),
+                            }),
+                            Err(e) => Ok(StoreMessage::FindEntitiesExactResponse {
+                                id,
+                                response: Err(format!("Find error: {}", e)),
+                            }),
+                        }
+                    }
+                    
+                    StoreMessage::GetEntityTypes { id, page_opts } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            "Processing GetEntityTypes request"
+                        );
+                        
+                        match self.get_entity_types_paginated(page_opts) {
+                            Ok(result) => Ok(StoreMessage::GetEntityTypesResponse {
+                                id,
+                                response: Ok(result),
+                            }),
+                            Err(e) => Ok(StoreMessage::GetEntityTypesResponse {
+                                id,
+                                response: Err(format!("Get entity types error: {}", e)),
+                            }),
+                        }
+                    }
+                    
+                    StoreMessage::RegisterNotification { id, config } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            "Processing RegisterNotification request"
+                        );
+                        
+                        match self.register_notification_for_client(token, config) {
+                            Ok(_) => Ok(StoreMessage::RegisterNotificationResponse {
+                                id,
+                                response: Ok(()),
+                            }),
+                            Err(e) => Ok(StoreMessage::RegisterNotificationResponse {
+                                id,
+                                response: Err(format!("Notification error: {}", e)),
+                            }),
+                        }
+                    }
+                    
+                    StoreMessage::UnregisterNotification { id, config } => {
+                        debug!(
+                            client_addr = %addr_string,
+                            "Processing UnregisterNotification request"
+                        );
+                        
+                        let unregistered = self.unregister_notification_for_client(token, config);
+                        Ok(StoreMessage::UnregisterNotificationResponse {
+                            id,
+                            response: unregistered,
+                        })
                     }
                     
                     // Add other message types as needed...
@@ -802,6 +992,72 @@ impl CoreService {
     pub fn perform_map(&mut self, requests: Vec<Request>) -> Result<HashMap<FieldType, Request>> {
         self.store.perform_map(requests)
             .map_err(|e| anyhow::anyhow!("Failed to perform map: {}", e))
+    }
+    
+    /// Register notification configuration for a specific client
+    fn register_notification_for_client(&mut self, token: Token, config: NotifyConfig) -> Result<()> {
+        if let Some(connection) = self.connections.get_mut(&token) {
+            // Register the notification with the store
+            self.store.register_notification(config.clone(), connection.notification_queue.clone())?;
+            
+            // Track this config for the client
+            connection.notification_configs.insert(config);
+            
+            debug!(
+                client_addr = %connection.addr_string,
+                "Registered notification configuration for client"
+            );
+            
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Client connection not found"))
+        }
+    }
+    
+    /// Unregister notification configuration for a specific client
+    fn unregister_notification_for_client(&mut self, token: Token, config: NotifyConfig) -> bool {
+        if let Some(connection) = self.connections.get_mut(&token) {
+            // Unregister from store
+            let unregistered = self.store.unregister_notification(&config, &connection.notification_queue);
+            
+            // Remove from client's config set
+            connection.notification_configs.remove(&config);
+            
+            debug!(
+                client_addr = %connection.addr_string,
+                unregistered = unregistered,
+                "Unregistered notification configuration for client"
+            );
+            
+            unregistered
+        } else {
+            false
+        }
+    }
+    
+    /// Force disconnect all clients (used when transitioning to unavailable state)
+    pub fn force_disconnect_all_clients(&mut self) {
+        info!("Force disconnecting all clients");
+        
+        let tokens_to_remove: Vec<Token> = self.connections.keys().cloned().collect();
+        
+        for token in tokens_to_remove {
+            self.remove_client(token);
+        }
+    }
+    
+    /// Check if we should force disconnect clients based on availability state
+    fn check_availability_state(&mut self) -> Result<()> {
+        if let Some(peer_handle) = &self.peer_handle {
+            let availability_state = peer_handle.get_availability_state();
+            
+            if availability_state == AvailabilityState::Unavailable {
+                // Force disconnect all clients when unavailable
+                self.force_disconnect_all_clients();
+            }
+        }
+        
+        Ok(())
     }
     
     /// Register notification configuration
