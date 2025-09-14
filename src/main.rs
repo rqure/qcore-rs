@@ -93,7 +93,6 @@ fn main() -> Result<()> {
         max_file_size: config.wal_max_file_size * 1024 * 1024, // Convert MB to bytes
         max_files: config.wal_max_files,
         snapshot_wal_interval: config.snapshot_wal_interval,
-        machine_id: config.machine.clone(),
     });
     
     let peer_handle = PeerService::spawn(PeerConfig::from(&config));

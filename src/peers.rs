@@ -114,13 +114,6 @@ pub enum PeerRequest {
     SetCoreHandle {
         handle: crate::core::CoreHandle,
     },
-    ProcessPeerMessage {
-        peer_msg: PeerMessage,
-        peer_addr: String,
-    },
-    IsOutboundPeerConnected {
-        peer_addr: String,
-    },
 }
 
 /// Response types for peer requests
@@ -128,9 +121,7 @@ pub enum PeerRequest {
 pub enum PeerResponse {
     Unit,
     AvailabilityState(AvailabilityState),
-    LeadershipInfo(bool, Option<String>), // (is_leader, current_leader)
-    PeerMessage(Option<PeerMessage>),
-    IsConnected(bool),
+    LeadershipInfo(bool, Option<String>),
 }
 
 /// Handle for communicating with peer service
@@ -192,40 +183,6 @@ impl PeerHandle {
         let (response_tx, _response_rx) = unbounded();
         if let Err(e) = self.request_sender.send((PeerRequest::SetCoreHandle { handle }, response_tx)) {
             error!(error = %e, "Failed to send set core handle request to peer service");
-        }
-    }
-
-    /// Process a peer message and get potential response
-    pub fn process_peer_message(&self, peer_msg: PeerMessage, peer_addr: String) -> Option<PeerMessage> {
-        let (response_tx, response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::ProcessPeerMessage { peer_msg, peer_addr }, response_tx)) {
-            error!(error = %e, "Failed to send process peer message request to peer service");
-            return None;
-        }
-        
-        match response_rx.recv() {
-            Ok(PeerResponse::PeerMessage(response)) => response,
-            _ => {
-                error!("Failed to receive peer message response from peer service");
-                None
-            }
-        }
-    }
-
-    /// Check if we already have an outbound connection to a peer
-    pub fn is_outbound_peer_connected(&self, peer_addr: &str) -> bool {
-        let (response_tx, response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((PeerRequest::IsOutboundPeerConnected { peer_addr: peer_addr.to_string() }, response_tx)) {
-            error!(error = %e, "Failed to send is outbound peer connected request to peer service");
-            return false;
-        }
-        
-        match response_rx.recv() {
-            Ok(PeerResponse::IsConnected(is_connected)) => is_connected,
-            _ => {
-                error!("Failed to receive is outbound peer connected response from peer service");
-                false
-            }
         }
     }
 }
@@ -754,18 +711,6 @@ impl PeerService {
             PeerRequest::SetCoreHandle { handle } => {
                 self.core_handle = Some(handle);
                 PeerResponse::Unit
-            }
-            PeerRequest::ProcessPeerMessage { peer_msg, peer_addr } => {
-                // Since we're already inside the service, we can handle this directly
-                // This is mainly for external processing of peer messages
-                self.handle_peer_message_internal(peer_msg, &peer_addr);
-                PeerResponse::PeerMessage(None)
-            }
-            PeerRequest::IsOutboundPeerConnected { peer_addr } => {
-                // Check if we have any connection with this peer address (both inbound and outbound)
-                let is_connected = self.connections.values()
-                    .any(|conn| conn.addr_string == peer_addr);
-                PeerResponse::IsConnected(is_connected)
             }
         }
     }

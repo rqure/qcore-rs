@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration as StdDuration;
 use mio::{Poll, Interest, Token, Events};
@@ -11,7 +10,7 @@ use std::thread;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
     AuthenticationResult, Notification, Store, Cache, CelExecutor,
-    PushCondition, Value, Request, Snapshot, Snowflake, StoreTrait,
+    PushCondition, Value, Request, Snapshot, Snowflake,
     AuthConfig, EntityType, FieldType, PageOpts, PageResult, 
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
@@ -38,10 +37,6 @@ impl From<&crate::Config> for CoreConfig {
 /// Core service request types
 #[derive(Debug)]
 pub enum CoreRequest {
-    ProcessStoreMessage {
-        message: StoreMessage,
-        client_token: Option<Token>,
-    },
     WriteRequest {
         request: Request,
     },
@@ -49,7 +44,6 @@ pub enum CoreRequest {
     RestoreSnapshot {
         snapshot: Snapshot,
     },
-    GetAvailabilityState,
     ForceDisconnectAllClients,
     SetHandles {
         peer_handle: crate::peers::PeerHandle,
@@ -62,11 +56,9 @@ pub enum CoreRequest {
 /// Response types for core requests
 #[derive(Debug)]
 pub enum CoreResponse {
-    StoreMessage(StoreMessage),
     WriteResult(Result<()>),
     Snapshot(Snapshot),
     Unit,
-    AvailabilityState(AvailabilityState),
 }
 
 /// Handle for communicating with core service
@@ -76,19 +68,6 @@ pub struct CoreHandle {
 }
 
 impl CoreHandle {
-    pub fn process_store_message(&self, message: StoreMessage, client_token: Option<Token>) -> Result<StoreMessage> {
-        let (response_tx, response_rx) = unbounded();
-        self.request_sender.send((CoreRequest::ProcessStoreMessage { message, client_token }, response_tx))
-            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
-        
-        match response_rx.recv()
-            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
-        {
-            CoreResponse::StoreMessage(msg) => Ok(msg),
-            _ => Err(anyhow::anyhow!("Unexpected response type")),
-        }
-    }
-
     pub fn write_request(&self, request: Request) -> Result<()> {
         let (response_tx, response_rx) = unbounded();
         self.request_sender.send((CoreRequest::WriteRequest { request }, response_tx))
@@ -124,19 +103,6 @@ impl CoreHandle {
             .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
         {
             CoreResponse::Unit => Ok(()),
-            _ => Err(anyhow::anyhow!("Unexpected response type")),
-        }
-    }
-
-    pub fn get_availability_state(&self) -> Result<AvailabilityState> {
-        let (response_tx, response_rx) = unbounded();
-        self.request_sender.send((CoreRequest::GetAvailabilityState, response_tx))
-            .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
-        
-        match response_rx.recv()
-            .map_err(|e| anyhow::anyhow!("Core service response channel closed: {}", e))?
-        {
-            CoreResponse::AvailabilityState(state) => Ok(state),
             _ => Err(anyhow::anyhow!("Unexpected response type")),
         }
     }
@@ -192,7 +158,6 @@ impl CoreHandle {
 #[derive(Debug)]
 struct ClientConnection {
     websocket: WebSocket<MioTcpStream>,
-    addr: SocketAddr,
     addr_string: String,
     authenticated: bool,
     client_id: Option<EntityId>,
@@ -332,18 +297,6 @@ impl CoreService {
         Ok(())
     }
     
-    /// Set handles to other services
-    pub fn set_handles(
-        &mut self,
-        peer_handle: crate::peers::PeerHandle,
-        snapshot_handle: crate::snapshot::SnapshotHandle,
-        wal_handle: crate::wal::WalHandle,
-    ) {
-        self.peer_handle = Some(peer_handle);
-        self.snapshot_handle = Some(snapshot_handle);
-        self.wal_handle = Some(wal_handle);
-    }
-    
     /// Run the main event loop
     pub fn run(&mut self) -> Result<()> {
         let mut events = Events::with_capacity(1024);
@@ -410,19 +363,6 @@ impl CoreService {
     /// Handle requests from other services
     fn handle_request(&mut self, request: CoreRequest) -> CoreResponse {
         match request {
-            CoreRequest::ProcessStoreMessage { message, client_token } => {
-                match self.process_store_message(message, client_token.unwrap_or(Token(0))) {
-                    Ok(response_msg) => CoreResponse::StoreMessage(response_msg),
-                    Err(e) => {
-                        error!("Error processing store message: {}", e);
-                        // Return an error message
-                        CoreResponse::StoreMessage(StoreMessage::Error {
-                            id: "unknown".to_string(),
-                            error: format!("Error processing request: {}", e),
-                        })
-                    }
-                }
-            }
             CoreRequest::WriteRequest { request } => {
                 match self.wal_handle.as_ref() {
                     Some(wal_handle) => {
@@ -440,13 +380,6 @@ impl CoreService {
             CoreRequest::RestoreSnapshot { snapshot } => {
                 self.store.restore_snapshot(snapshot);
                 CoreResponse::Unit
-            }
-            CoreRequest::GetAvailabilityState => {
-                let state = match self.peer_handle.as_ref() {
-                    Some(peer_handle) => peer_handle.get_availability_state(),
-                    None => AvailabilityState::Unavailable,
-                };
-                CoreResponse::AvailabilityState(state)
             }
             CoreRequest::ForceDisconnectAllClients => {
                 self.disconnect_all_clients();
@@ -498,7 +431,6 @@ impl CoreService {
                     
                     let connection = ClientConnection {
                         websocket: WebSocket::from_partially_read(mio_stream, Vec::new(), tungstenite::protocol::Role::Server, None),
-                        addr,
                         addr_string: addr.to_string(),
                         authenticated: false,
                         client_id: None,
@@ -1042,74 +974,6 @@ impl CoreService {
         Ok(())
     }
     
-    /// Manually trigger a snapshot (useful for graceful shutdown or periodic snapshots)
-    pub fn trigger_snapshot(&mut self) -> Result<()> {
-        if let Some(snapshot_handle) = &self.snapshot_handle {
-            let snapshot = self.store.take_snapshot();
-            if let Err(e) = snapshot_handle.save(snapshot) {
-                error!(error = %e, "Failed to save snapshot");
-                return Err(anyhow::anyhow!("Failed to save snapshot: {}", e));
-            }
-            info!("Snapshot successfully created");
-        }
-        Ok(())
-    }
-    
-    /// Handle incoming peer synchronization requests
-    pub fn handle_peer_sync_requests(&mut self, requests: Vec<Request>) -> Result<()> {
-        if !requests.is_empty() {
-            info!(request_count = %requests.len(), "Processing peer synchronization requests");
-            
-            // Temporarily disable notifications during peer sync to avoid feedback loops
-            self.store.disable_notifications();
-            
-            // Apply the synchronized requests to the store
-            if let Err(e) = self.store.perform_mut(requests) {
-                error!(error = %e, "Failed to apply peer synchronization requests");
-                self.store.enable_notifications();
-                return Err(e.into());
-            }
-            
-            // Re-enable notifications
-            self.store.enable_notifications();
-            
-            info!("Peer synchronization requests applied successfully");
-        }
-        Ok(())
-    }
-    
-    /// Handle full sync request from peer (send snapshot)
-    pub fn handle_full_sync_request(&mut self, requesting_machine_id: &str) -> Result<()> {
-        if let Some(peer_handle) = &self.peer_handle {
-            let (is_leader, _) = peer_handle.get_leadership_info();
-            if is_leader {
-                info!(machine_id = %requesting_machine_id, "Handling full sync request");
-                let _snapshot = self.store.take_snapshot();
-                // Note: In a complete implementation, we'd need a way to send this back to the requesting peer
-                // For now, we'll log that we have the snapshot ready
-                info!(machine_id = %requesting_machine_id, "Snapshot prepared for full sync");
-            }
-        }
-        Ok(())
-    }
-    
-    /// Handle full sync response from peer (restore snapshot)
-    pub fn handle_full_sync_response(&mut self, snapshot: Snapshot) -> Result<()> {
-        info!("Applying full sync snapshot");
-        
-        // Temporarily disable notifications during snapshot restoration
-        self.store.disable_notifications();
-        
-        // Restore from the received snapshot
-        self.store.restore_snapshot(snapshot);
-        
-        // Re-enable notifications
-        self.store.enable_notifications();
-        
-        info!("Full sync snapshot applied successfully");
-        Ok(())
-    }
-    
     /// Handle heartbeat writing
     fn handle_heartbeat(&mut self) -> Result<()> {
         self.write_heartbeat()?;
@@ -1285,26 +1149,6 @@ impl CoreService {
             .map_err(|e| anyhow::anyhow!("Authentication error: {}", e))
     }
     
-    /// Take a snapshot from the store
-    pub fn take_snapshot(&self) -> Option<Snapshot> {
-        Some(self.store.take_snapshot())
-    }
-    
-    /// Restore from a snapshot
-    pub fn restore_snapshot(&mut self, snapshot: Snapshot) {
-        self.store.restore_snapshot(snapshot);
-    }
-    
-    /// Disable notifications temporarily
-    pub fn disable_notifications(&mut self) {
-        self.store.disable_notifications();
-    }
-    
-    /// Enable notifications
-    pub fn enable_notifications(&mut self) {
-        self.store.enable_notifications();
-    }
-    
     /// Get entity schema
     pub fn get_entity_schema(&self, entity_type: &EntityType) -> Result<qlib_rs::EntitySchema<qlib_rs::Single>> {
         self.store.get_entity_schema(entity_type)
@@ -1321,12 +1165,6 @@ impl CoreService {
     pub fn get_field_schema(&self, entity_type: &EntityType, field_type: &FieldType) -> Result<qlib_rs::FieldSchema> {
         self.store.get_field_schema(entity_type, field_type)
             .map_err(|e| anyhow::anyhow!("Failed to get field schema: {}", e))
-    }
-    
-    /// Set field schema
-    pub fn set_field_schema(&mut self, entity_type: &EntityType, field_type: &FieldType, schema: qlib_rs::FieldSchema) -> Result<()> {
-        self.store.set_field_schema(entity_type, field_type, schema)
-            .map_err(|e| anyhow::anyhow!("Failed to set field schema: {}", e))
     }
     
     /// Check if entity exists
@@ -1355,12 +1193,6 @@ impl CoreService {
     pub fn get_entity_types_paginated(&self, page_opts: Option<PageOpts>) -> Result<PageResult<EntityType>> {
         self.store.get_entity_types_paginated(page_opts)
             .map_err(|e| anyhow::anyhow!("Failed to get entity types: {}", e))
-    }
-    
-    /// Perform map operation
-    pub fn perform_map(&mut self, requests: Vec<Request>) -> Result<HashMap<FieldType, Request>> {
-        self.store.perform_map(requests)
-            .map_err(|e| anyhow::anyhow!("Failed to perform map: {}", e))
     }
     
     /// Register notification configuration for a specific client
@@ -1427,17 +1259,5 @@ impl CoreService {
         }
         
         Ok(())
-    }
-    
-    /// Register notification configuration
-    pub fn register_notification(&mut self, _client_id: EntityId, _config: NotifyConfig) -> Result<()> {
-        // Add notification logic here when implemented
-        Ok(())
-    }
-    
-    /// Unregister notification configuration
-    pub fn unregister_notification(&mut self, _client_id: EntityId, _config: NotifyConfig) -> bool {
-        // Add notification logic here when implemented
-        false
     }
 }

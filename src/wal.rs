@@ -18,9 +18,7 @@ pub struct WalConfig {
     /// Maximum number of WAL files to keep
     pub max_files: usize,
     /// Number of WAL file rollovers before taking a snapshot
-    pub snapshot_wal_interval: u64,
-    /// Unique machine identifier for snapshot originator
-    pub machine_id: String,
+    pub snapshot_wal_interval: u64
 }
 
 /// WAL manager request types
