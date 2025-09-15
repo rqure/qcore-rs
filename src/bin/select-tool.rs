@@ -11,8 +11,8 @@ use std::time::{Instant, Duration};
 #[derive(Parser)]
 #[command(name = "select-tool", about = "Query entities from the QCore data store using CEL expressions")]
 struct Config {
-    /// QCore service URL (WebSocket endpoint for client connections)
-    #[arg(long, default_value = "ws://localhost:9100")]
+    /// QCore service URL (TCP endpoint for client connections)
+    #[arg(long, default_value = "localhost:9100")]
     core_url: String,
 
     /// Username for authentication (can be set via QCORE_USERNAME env var)

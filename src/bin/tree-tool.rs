@@ -8,7 +8,7 @@ use tracing::{info, warn};
 #[command(name = "tree-tool", about = "Display the tree structure of the QCore data store")]
 struct Config {
     /// QCore service URL (WebSocket endpoint for client connections)
-    #[arg(long, default_value = "ws://localhost:9100")]
+    #[arg(long, default_value = "localhost:9100")]
     core_url: String,
 
     /// Username for authentication (can be set via QCORE_USERNAME env var)

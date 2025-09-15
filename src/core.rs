@@ -376,15 +376,8 @@ impl CoreService {
             // Process any pending write requests from the store
             self.process_write_requests()?;
             
-            // Calculate timeout - use immediate poll if we have pending work
-            let timeout = if self.has_pending_work() {
-                Some(StdDuration::from_millis(0)) // Poll immediately
-            } else {
-                Some(StdDuration::from_millis(100)) // Longer timeout, but still responsive
-            };
-            
             // Poll for OS events - rely on OS notifications
-            self.poll.poll(&mut events, timeout)?;
+            self.poll.poll(&mut events, None)?;
             
             // Handle all mio events
             for event in events.iter() {
@@ -400,14 +393,6 @@ impl CoreService {
                 }
             }
         }
-    }
-    
-    /// Check if there's any pending work that requires immediate attention
-    fn has_pending_work(&self) -> bool {
-        // Check for pending outbound messages
-        self.connections.values().any(|conn| !conn.outbound_messages.is_empty()) ||
-        // Check for pending requests
-        !self.request_receiver.is_empty()
     }
     
     /// Handle requests from other services

@@ -17,7 +17,7 @@ use tracing::{info, warn, error, debug};
 #[command(name = "snapshot-tool", about = "Tool for taking and restoring JSON snapshots from QCore service")]
 struct Config {
     /// QCore service URL (WebSocket endpoint for client connections)
-    #[arg(long, default_value = "ws://localhost:9100")]
+    #[arg(long, default_value = "localhost:9100")]
     core_url: String,
 
     /// Username for authentication (can be set via QCORE_USERNAME env var)

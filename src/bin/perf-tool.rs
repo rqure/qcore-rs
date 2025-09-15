@@ -15,7 +15,7 @@ use fastrand;
 #[command(author, version, about, long_about = None)]
 struct Config {
     /// QCore WebSocket URLs (comma-separated for multiple targets)
-    #[arg(long, default_value = "ws://localhost:9100,ws://localhost:9101", value_delimiter = ',')]
+    #[arg(long, default_value = "localhost:9100,localhost:9101", value_delimiter = ',')]
     core_urls: Vec<String>,
 
     /// Username for authentication
