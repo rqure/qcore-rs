@@ -17,7 +17,7 @@ use qlib_rs::{
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
 use crate::peers::AvailabilityState;
-use crate::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer};
+use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer};
 
 /// Configuration for the core service
 #[derive(Debug, Clone)]

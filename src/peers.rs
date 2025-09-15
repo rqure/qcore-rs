@@ -12,7 +12,7 @@ use anyhow::Result;
 use serde::{Serialize, Deserialize};
 use std::thread;
 use qlib_rs::now;
-use crate::protocol::MessageBuffer;
+use qlib_rs::protocol::{MessageBuffer, ProtocolMessage, ProtocolCodec, PeerStartup, PeerSyncRequest};
 
 /// Configuration for the peer service
 #[derive(Debug, Clone)]
@@ -503,22 +503,22 @@ impl PeerService {
                         // Try to parse complete messages
                         while let Some(message) = connection.message_buffer.try_decode()? {
                             match message {
-                                crate::protocol::ProtocolMessage::PeerStartup(peer_startup) => {
+                                ProtocolMessage::PeerStartup(peer_startup) => {
                                     let peer_msg = PeerMessage::Startup {
                                         machine_id: peer_startup.machine_id,
                                         startup_time: peer_startup.startup_time,
                                     };
                                     messages_to_process.push(peer_msg);
                                 }
-                                crate::protocol::ProtocolMessage::PeerFullSyncRequest { machine_id } => {
+                                ProtocolMessage::PeerFullSyncRequest { machine_id } => {
                                     let peer_msg = PeerMessage::FullSyncRequest { machine_id };
                                     messages_to_process.push(peer_msg);
                                 }
-                                crate::protocol::ProtocolMessage::PeerFullSyncResponse { snapshot } => {
+                                ProtocolMessage::PeerFullSyncResponse { snapshot } => {
                                     let peer_msg = PeerMessage::FullSyncResponse { snapshot };
                                     messages_to_process.push(peer_msg);
                                 }
-                                crate::protocol::ProtocolMessage::PeerSyncRequest(sync_req) => {
+                                ProtocolMessage::PeerSyncRequest(sync_req) => {
                                     // Deserialize the requests from the serialized data
                                     if let Ok(requests) = bincode::deserialize::<Vec<qlib_rs::Request>>(&sync_req.requests_data) {
                                         let peer_msg = PeerMessage::SyncRequest { requests };
@@ -849,21 +849,21 @@ impl PeerService {
         // Convert PeerMessage to appropriate ProtocolMessage variant
         let protocol_message = match message {
             PeerMessage::Startup { machine_id, startup_time } => {
-                crate::protocol::ProtocolMessage::PeerStartup(crate::protocol::PeerStartup {
+                ProtocolMessage::PeerStartup(PeerStartup {
                     machine_id,
                     startup_time,
                 })
             }
             PeerMessage::FullSyncRequest { machine_id } => {
-                crate::protocol::ProtocolMessage::PeerFullSyncRequest { machine_id }
+                ProtocolMessage::PeerFullSyncRequest { machine_id }
             }
             PeerMessage::FullSyncResponse { snapshot } => {
-                crate::protocol::ProtocolMessage::PeerFullSyncResponse { snapshot }
+                ProtocolMessage::PeerFullSyncResponse { snapshot }
             }
             PeerMessage::SyncRequest { requests } => {
                 // Serialize requests for transport
                 if let Ok(requests_data) = bincode::serialize(&requests) {
-                    crate::protocol::ProtocolMessage::PeerSyncRequest(crate::protocol::PeerSyncRequest {
+                    ProtocolMessage::PeerSyncRequest(PeerSyncRequest {
                         requests_data,
                     })
                 } else {
@@ -874,7 +874,7 @@ impl PeerService {
         };
         
         // Encode the protocol message
-        if let Ok(encoded_data) = crate::protocol::ProtocolCodec::encode(&protocol_message) {
+        if let Ok(encoded_data) = ProtocolCodec::encode(&protocol_message) {
             // Find the connection for this peer and queue the message
             for connection in self.connections.values_mut() {
                 if connection.addr_string == peer_addr {
@@ -909,13 +909,13 @@ impl PeerService {
         
         if !requests_to_sync.is_empty() {
             // Convert to protocol message and encode
-            let protocol_message = crate::protocol::ProtocolMessage::PeerSyncRequest(
-                crate::protocol::PeerSyncRequest {
+            let protocol_message = ProtocolMessage::PeerSyncRequest(
+                PeerSyncRequest {
                     requests_data: bincode::serialize(&requests_to_sync).unwrap_or_default(),
                 }
             );
             
-            if let Ok(encoded_data) = crate::protocol::ProtocolCodec::encode(&protocol_message) {
+            if let Ok(encoded_data) = ProtocolCodec::encode(&protocol_message) {
                 // Send to all connected peers
                 for connection in self.connections.values_mut() {
                     let PeerConnectionState::Connected(_) = connection.state;
@@ -1069,11 +1069,11 @@ impl PeerService {
         self.full_sync_request_pending = true;
         
         // Convert to protocol message and encode
-        let protocol_message = crate::protocol::ProtocolMessage::PeerFullSyncRequest {
+        let protocol_message = ProtocolMessage::PeerFullSyncRequest {
             machine_id: self.config.machine.clone(),
         };
         
-        if let Ok(encoded_data) = crate::protocol::ProtocolCodec::encode(&protocol_message) {
+        if let Ok(encoded_data) = ProtocolCodec::encode(&protocol_message) {
             let mut sent = false;
             for connection in self.connections.values_mut() {
                 if let Some(peer_info) = self.peer_info.get(&connection.addr_string) {
