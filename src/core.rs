@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration as StdDuration;
 use std::sync::Arc;
+use std::io::{Read, Write};
 use mio::{Poll, Interest, Token, Events};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use tungstenite::{WebSocket, Message};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use crossbeam::channel::{Sender, Receiver, unbounded};
@@ -17,6 +17,7 @@ use qlib_rs::{
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
 use crate::peers::AvailabilityState;
+use crate::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer};
 
 /// Configuration for the core service
 #[derive(Debug, Clone)]
@@ -167,14 +168,15 @@ impl CoreHandle {
 /// Client connection information  
 #[derive(Debug)]
 struct ClientConnection {
-    websocket: WebSocket<MioTcpStream>,
+    stream: MioTcpStream,
     addr_string: String,
     authenticated: bool,
     client_id: Option<EntityId>,
     notification_queue: NotificationQueue,
     notification_configs: HashSet<NotifyConfig>,
     pending_notifications: VecDeque<Notification>,
-    outbound_messages: VecDeque<String>,
+    outbound_messages: VecDeque<Vec<u8>>, // Raw bytes for TCP
+    message_buffer: MessageBuffer,        // For handling partial reads
 }
 
 /// Core service that handles both client connections and misc operations
@@ -219,7 +221,7 @@ impl CoreService {
         
         poll.registry().register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
         
-        info!(bind_address = %addr, "Core service WebSocket server initialized");
+        info!(bind_address = %addr, "Core service TCP server initialized");
         
         // Initialize store with snowflake
         let snowflake = Snowflake::new(); // TODO: configure these properly
@@ -481,37 +483,29 @@ impl CoreService {
     fn handle_new_connection(&mut self) -> Result<()> {
         loop {
             match self.listener.accept() {
-                Ok((stream, addr)) => {
+                Ok((mut stream, addr)) => {
                     info!(client_addr = %addr, "Accepting new client connection");
                     
                     let token = Token(self.next_token);
                     self.next_token += 1;
                     
-                    // Perform WebSocket handshake (this might block, but it should be quick)
-                    match tungstenite::accept(stream) {
-                        Ok(websocket) => {
-                            // Register the underlying stream with mio
-                            // Note: We can't easily register the websocket's stream after handshake
-                            // This is a limitation of the current approach
-                            
-                            let connection = ClientConnection {
-                                websocket,
-                                addr_string: addr.to_string(),
-                                authenticated: false,
-                                client_id: None,
-                                notification_queue: NotificationQueue::new(),
-                                notification_configs: HashSet::new(),
-                                pending_notifications: VecDeque::new(),
-                                outbound_messages: VecDeque::new(),
-                            };
-                            
-                            self.connections.insert(token, connection);
-                            debug!(client_addr = %addr, "WebSocket handshake completed");
-                        }
-                        Err(e) => {
-                            error!(client_addr = %addr, error = %e, "WebSocket handshake failed");
-                        }
-                    }
+                    // Register the stream with mio for TCP handling
+                    self.poll.registry().register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)?;
+                    
+                    let connection = ClientConnection {
+                        stream,
+                        addr_string: addr.to_string(),
+                        authenticated: false,
+                        client_id: None,
+                        notification_queue: NotificationQueue::new(),
+                        notification_configs: HashSet::new(),
+                        pending_notifications: VecDeque::new(),
+                        outbound_messages: VecDeque::new(),
+                        message_buffer: MessageBuffer::new(),
+                    };
+                    
+                    self.connections.insert(token, connection);
+                    debug!(client_addr = %addr, "TCP connection established");
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     break;
@@ -577,51 +571,62 @@ impl CoreService {
         let mut messages_to_process = Vec::new();
         let mut should_close = false;
         
-        // First pass: collect messages
+        // First pass: read data and parse messages
         if let Some(connection) = self.connections.get_mut(&token) {
+            let mut read_buffer = [0u8; 8192]; // 8KB read buffer
+            
             loop {
-                match connection.websocket.read() {
-                    Ok(Message::Text(text)) => {
-                        debug!(
-                            client_addr = %connection.addr_string,
-                            message_length = text.len(),
-                            "Received text message from client"
-                        );
-                        
-                        match serde_json::from_str::<StoreMessage>(&text) {
-                            Ok(store_msg) => {
-                                messages_to_process.push(store_msg);
-                            }
-                            Err(e) => {
-                                error!(
-                                    client_addr = %connection.addr_string,
-                                    error = %e,
-                                    "Failed to parse StoreMessage from client"
-                                );
-                            }
-                        }
-                    }
-                    Ok(Message::Ping(_payload)) => {
-                        // WebSocket ping/pong is handled automatically by tungstenite
-                        // We don't need to manually respond to pings
-                        debug!("Received WebSocket ping");
-                    }
-                    Ok(Message::Close(_)) => {
+                match connection.stream.read(&mut read_buffer) {
+                    Ok(0) => {
+                        // Connection closed by client
                         should_close = true;
                         break;
                     }
-                    Err(tungstenite::Error::Io(ref e)) 
-                        if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Ok(bytes_read) => {
+                        debug!(
+                            client_addr = %connection.addr_string,
+                            bytes_read = bytes_read,
+                            "Read data from TCP client"
+                        );
+                        
+                        // Add data to buffer
+                        connection.message_buffer.add_data(&read_buffer[..bytes_read]);
+                        
+                        // Try to decode messages from buffer
+                        while let Some(protocol_message) = connection.message_buffer.try_decode()? {
+                            match protocol_message {
+                                ProtocolMessage::Store(store_msg) => {
+                                    messages_to_process.push(store_msg);
+                                }
+                                ProtocolMessage::Error { id: _, message } => {
+                                    error!(
+                                        client_addr = %connection.addr_string,
+                                        error = %message,
+                                        "Received error message from client"
+                                    );
+                                }
+                                _ => {
+                                    warn!(
+                                        client_addr = %connection.addr_string,
+                                        "Received unexpected message type from client"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No more data available
+                        break;
+                    }
                     Err(e) => {
                         error!(
                             client_addr = %connection.addr_string,
                             error = %e,
-                            "WebSocket read error"
+                            "TCP read error"
                         );
                         should_close = true;
                         break;
                     }
-                    _ => {} // Handle other message types
                 }
             }
         }
@@ -629,17 +634,21 @@ impl CoreService {
         // Second pass: process messages
         for store_msg in messages_to_process {
             let response = self.process_store_message(store_msg, token)?;
-            if let Ok(response_text) = serde_json::to_string(&response) {
-                if let Some(conn) = self.connections.get_mut(&token) {
-                    debug!(
-                        client_addr = %conn.addr_string,
-                        message_length = response_text.len(),
-                        "Queueing response message"
-                    );
-                    conn.outbound_messages.push_back(response_text);
+            let protocol_message = ProtocolMessage::Store(response);
+            match ProtocolCodec::encode(&protocol_message) {
+                Ok(response_bytes) => {
+                    if let Some(conn) = self.connections.get_mut(&token) {
+                        debug!(
+                            client_addr = %conn.addr_string,
+                            message_length = response_bytes.len(),
+                            "Queueing response message"
+                        );
+                        conn.outbound_messages.push_back(response_bytes);
+                    }
                 }
-            } else {
-                error!("Failed to serialize response message");
+                Err(e) => {
+                    error!(error = %e, "Failed to encode response message");
+                }
             }
         }
         
@@ -648,37 +657,32 @@ impl CoreService {
     
     fn handle_client_write(&mut self, token: Token) -> Result<()> {
         if let Some(connection) = self.connections.get_mut(&token) {
-            while let Some(message_text) = connection.outbound_messages.pop_front() {
-                match connection.websocket.write(Message::Text(message_text.clone())) {
-                    Ok(_) => {
+            while let Some(message_bytes) = connection.outbound_messages.pop_front() {
+                match connection.stream.write(&message_bytes) {
+                    Ok(bytes_written) => {
+                        if bytes_written < message_bytes.len() {
+                            // Partial write - put remaining bytes back
+                            let remaining = message_bytes[bytes_written..].to_vec();
+                            connection.outbound_messages.push_front(remaining);
+                            break;
+                        }
                         debug!(
                             client_addr = %connection.addr_string,
-                            "Sent message to client"
+                            bytes_written = bytes_written,
+                            "Sent message to TCP client"
                         );
-                        // Try to flush the websocket to ensure data is sent
-                        if let Err(e) = connection.websocket.flush() {
-                            match e {
-                                tungstenite::Error::Io(ref io_err) 
-                                    if io_err.kind() == std::io::ErrorKind::WouldBlock => {
-                                    // Put the message back and try again later
-                                    connection.outbound_messages.push_front(message_text);
-                                    break;
-                                }
-                                _ => {
-                                    error!(error = %e, "Failed to flush websocket");
-                                    return Err(e.into());
-                                }
-                            }
-                        }
                     }
-                    Err(tungstenite::Error::Io(ref e)) 
-                        if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // Put the message back and try again later
-                        connection.outbound_messages.push_front(message_text);
+                        connection.outbound_messages.push_front(message_bytes);
                         break;
                     }
                     Err(e) => {
-                        error!(error = %e, "Failed to write message to client");
+                        error!(
+                            client_addr = %connection.addr_string,
+                            error = %e,
+                            "Failed to write to TCP client"
+                        );
                         return Err(e.into());
                     }
                 }
@@ -709,14 +713,19 @@ impl CoreService {
             // Send pending notifications as messages
             while let Some(notification) = connection.pending_notifications.pop_front() {
                 let notification_message = StoreMessage::Notification { notification };
+                let protocol_message = ProtocolMessage::Store(notification_message);
                 
-                if let Ok(message_text) = serde_json::to_string(&notification_message) {
-                    connection.outbound_messages.push_back(message_text);
-                } else {
-                    error!(
-                        client_addr = %connection.addr_string,
-                        "Failed to serialize notification message"
-                    );
+                match ProtocolCodec::encode(&protocol_message) {
+                    Ok(message_bytes) => {
+                        connection.outbound_messages.push_back(message_bytes);
+                    }
+                    Err(e) => {
+                        error!(
+                            client_addr = %connection.addr_string,
+                            error = %e,
+                            "Failed to encode notification message"
+                        );
+                    }
                 }
             }
         }

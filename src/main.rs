@@ -3,6 +3,7 @@ mod peers;
 mod snapshot;
 mod files;
 mod core;
+mod protocol;
 
 use std::path::PathBuf;
 
