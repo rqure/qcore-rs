@@ -38,20 +38,17 @@ start_node() {
 
 start_node qos-a "$BIN_DIR"/qcore-rs \
     --machine qos-a \
-    --peer-addresses localhost:9001,localhost:9002 \
-    --peer-port 9000 \
+    --peer-addresses localhost:9101,localhost:9102 \
     --client-port 9100
 
 start_node qos-b "$BIN_DIR"/qcore-rs \
     --machine qos-b \
-    --peer-addresses localhost:9000,localhost:9002 \
-    --peer-port 9001 \
+    --peer-addresses localhost:9100,localhost:9102 \
     --client-port 9101
 
 start_node qos-c "$BIN_DIR"/qcore-rs \
     --machine qos-c \
-    --peer-addresses localhost:9000,localhost:9001 \
-    --peer-port 9002 \
+    --peer-addresses localhost:9100,localhost:9101 \
     --client-port 9102
 
 echo "All nodes started."

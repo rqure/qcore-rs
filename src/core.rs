@@ -43,6 +43,7 @@ impl From<&crate::Config> for CoreConfig {
 pub enum CoreCommand {
     HandleMiscOperations,
     HandleHeartbeat,
+    HandlePeerOperations,
 }
 
 /// Core service request types
@@ -178,9 +179,19 @@ struct ClientConnection {
     message_buffer: MessageBuffer,        // For handling partial reads
 }
 
-/// Connection type to distinguish between clients and peers
+/// Unknown connection that hasn't been classified yet
+#[derive(Debug)]
+struct UnknownConnection {
+    stream: MioTcpStream,
+    addr_string: String,
+    outbound_messages: VecDeque<Vec<u8>>, // Raw bytes for TCP
+    message_buffer: MessageBuffer,        // For handling partial reads
+}
+
+/// Connection type to distinguish between clients, peers, and unknown connections
 #[derive(Debug)]
 enum Connection {
+    Unknown(UnknownConnection),
     Client(ClientConnection),
     Peer(crate::peer_manager::PeerConnection),
 }
@@ -188,6 +199,7 @@ enum Connection {
 impl Connection {
     fn get_stream_mut(&mut self) -> &mut MioTcpStream {
         match self {
+            Connection::Unknown(unknown) => &mut unknown.stream,
             Connection::Client(client) => &mut client.stream,
             Connection::Peer(peer) => peer.get_stream_mut(),
         }
@@ -195,6 +207,7 @@ impl Connection {
     
     fn addr_string(&self) -> &str {
         match self {
+            Connection::Unknown(unknown) => &unknown.addr_string,
             Connection::Client(client) => &client.addr_string,
             Connection::Peer(peer) => &peer.addr_string,
         }
@@ -202,6 +215,7 @@ impl Connection {
     
     fn get_message_buffer_mut(&mut self) -> &mut MessageBuffer {
         match self {
+            Connection::Unknown(unknown) => &mut unknown.message_buffer,
             Connection::Client(client) => &mut client.message_buffer,
             Connection::Peer(peer) => &mut peer.message_buffer,
         }
@@ -209,6 +223,7 @@ impl Connection {
     
     fn queue_outbound_message(&mut self, data: Vec<u8>) {
         match self {
+            Connection::Unknown(unknown) => unknown.outbound_messages.push_back(data),
             Connection::Client(client) => client.outbound_messages.push_back(data),
             Connection::Peer(peer) => peer.queue_message(data),
         }
@@ -216,6 +231,7 @@ impl Connection {
     
     fn get_outbound_messages_mut(&mut self) -> &mut VecDeque<Vec<u8>> {
         match self {
+            Connection::Unknown(unknown) => &mut unknown.outbound_messages,
             Connection::Client(client) => &mut client.outbound_messages,
             Connection::Peer(peer) => &mut peer.outbound_messages,
         }
@@ -224,6 +240,7 @@ impl Connection {
     // Client-specific accessors
     fn authenticated(&self) -> bool {
         match self {
+            Connection::Unknown(_) => false,
             Connection::Client(client) => client.authenticated,
             Connection::Peer(_) => false, // Peers don't use the same auth model
         }
@@ -237,6 +254,7 @@ impl Connection {
     
     fn client_id(&self) -> &Option<EntityId> {
         match self {
+            Connection::Unknown(_) => &None,
             Connection::Client(client) => &client.client_id,
             Connection::Peer(_) => &None,
         }
@@ -250,6 +268,7 @@ impl Connection {
     
     fn notification_queue(&self) -> Option<&NotificationQueue> {
         match self {
+            Connection::Unknown(_) => None,
             Connection::Client(client) => Some(&client.notification_queue),
             Connection::Peer(_) => None,
         }
@@ -257,6 +276,7 @@ impl Connection {
     
     fn notification_configs_mut(&mut self) -> Option<&mut HashSet<NotifyConfig>> {
         match self {
+            Connection::Unknown(_) => None,
             Connection::Client(client) => Some(&mut client.notification_configs),
             Connection::Peer(_) => None,
         }
@@ -264,6 +284,14 @@ impl Connection {
     
     fn is_client(&self) -> bool {
         matches!(self, Connection::Client(_))
+    }
+    
+    fn is_peer(&self) -> bool {
+        matches!(self, Connection::Peer(_))
+    }
+    
+    fn is_unknown(&self) -> bool {
+        matches!(self, Connection::Unknown(_))
     }
 }
 
@@ -411,6 +439,17 @@ impl CoreService {
             }
         });
         
+        // Spawn background scheduler thread for peer operations
+        let peer_handle = handle.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(StdDuration::from_millis(MISC_INTERVAL_MS)); // Use same interval as misc ops
+                
+                // Send peer operations command to core (fire-and-forget)
+                peer_handle.command_queue.push(CoreCommand::HandlePeerOperations);
+            }
+        });
+        
         Ok(handle)
     }
     
@@ -473,10 +512,7 @@ impl CoreService {
             // Process any pending write requests from the store
             self.process_write_requests()?;
             
-            // Handle peer management operations
-            self.handle_peer_operations()?;
-            
-            // Poll for OS events - rely on OS notifications
+            // Poll for I/O events (blocking - Redis-like approach)
             self.poll.poll(&mut events, None)?;
             
             // Handle all mio events
@@ -560,14 +596,30 @@ impl CoreService {
                 }
                 false
             }
+            CoreCommand::HandlePeerOperations => {
+                if let Err(e) = self.handle_peer_operations() {
+                    error!(error = %e, "Failed to handle peer operations");
+                }
+                false
+            }
         }
     }
     
     /// Force disconnect all clients
     fn disconnect_all_clients(&mut self) {
-        let tokens_to_remove: Vec<Token> = self.connections.keys().cloned().collect();
-        for token in tokens_to_remove {
-            info!(token = ?token, "Force disconnecting client");
+        let client_tokens: Vec<Token> = self.connections
+            .iter()
+            .filter_map(|(token, connection)| {
+                if connection.is_client() || connection.is_unknown() {
+                    Some(*token)
+                } else {
+                    None
+                }
+            })
+            .collect();
+            
+        for token in client_tokens {
+            info!(token = ?token, "Force disconnecting client due to unavailability");
             self.remove_client(token);
         }
     }
@@ -576,7 +628,7 @@ impl CoreService {
         loop {
             match self.listener.accept() {
                 Ok((mut stream, addr)) => {
-                    info!(client_addr = %addr, "Accepting new client connection");
+                    info!(addr = %addr, "Accepting new connection (type to be determined)");
                     
                     let token = Token(self.next_token);
                     self.next_token += 1;
@@ -584,26 +636,22 @@ impl CoreService {
                     // Register the stream with mio for TCP handling
                     self.poll.registry().register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)?;
                     
-                    let connection = ClientConnection {
+                    // Start with unknown connection type - will be determined by first message
+                    let connection = UnknownConnection {
                         stream,
                         addr_string: addr.to_string(),
-                        authenticated: false,
-                        client_id: None,
-                        notification_queue: NotificationQueue::new(),
-                        notification_configs: HashSet::new(),
-                        pending_notifications: VecDeque::new(),
                         outbound_messages: VecDeque::new(),
                         message_buffer: MessageBuffer::new(),
                     };
                     
-                    self.connections.insert(token, Connection::Client(connection));
-                    debug!(client_addr = %addr, "TCP connection established");
+                    self.connections.insert(token, Connection::Unknown(connection));
+                    debug!(addr = %addr, token = ?token, "Connection established as Unknown, awaiting classification");
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     break;
                 }
                 Err(e) => {
-                    error!(error = %e, "Failed to accept client connection");
+                    error!(error = %e, "Failed to accept connection");
                     break;
                 }
             }
@@ -620,84 +668,335 @@ impl CoreService {
         let mut messages_processed = false;
         
         // Determine connection type and handle appropriately
-        let is_client = self.connections.get(&token).map(|c| c.is_client()).unwrap_or(false);
+        let connection_type = self.connections.get(&token).map(|c| {
+            if c.is_client() { "client" } 
+            else if c.is_peer() { "peer" } 
+            else { "unknown" }
+        }).unwrap_or("missing");
         
         if readable {
-            if is_client {
-                match self.handle_client_read(token) {
-                    Ok(false) => should_remove = true,
-                    Err(e) => {
-                        if let Some(connection) = self.connections.get(&token) {
-                            error!(
-                                client_addr = %connection.addr_string(),
-                                error = %e,
-                                "Error reading from client"
-                            );
+            match connection_type {
+                "client" => {
+                    match self.handle_client_read(token) {
+                        Ok(false) => should_remove = true,
+                        Err(e) => {
+                            if let Some(connection) = self.connections.get(&token) {
+                                error!(
+                                    client_addr = %connection.addr_string(),
+                                    error = %e,
+                                    "Error reading from client"
+                                );
+                            }
+                            should_remove = true;
                         }
-                        should_remove = true;
-                    }
-                    Ok(true) => {
-                        messages_processed = true;
+                        Ok(true) => {
+                            messages_processed = true;
+                        }
                     }
                 }
-            } else {
-                // Handle peer read
-                match self.handle_peer_read(token) {
-                    Ok(false) => should_remove = true,
-                    Err(e) => {
-                        if let Some(connection) = self.connections.get(&token) {
-                            error!(
-                                peer_addr = %connection.addr_string(),
-                                error = %e,
-                                "Error reading from peer"
-                            );
+                "peer" => {
+                    match self.handle_peer_read(token) {
+                        Ok(false) => should_remove = true,
+                        Err(e) => {
+                            if let Some(connection) = self.connections.get(&token) {
+                                error!(
+                                    peer_addr = %connection.addr_string(),
+                                    error = %e,
+                                    "Error reading from peer"
+                                );
+                            }
+                            should_remove = true;
                         }
-                        should_remove = true;
+                        Ok(true) => {
+                            messages_processed = true;
+                        }
                     }
-                    Ok(true) => {
-                        messages_processed = true;
+                }
+                "unknown" => {
+                    match self.handle_unknown_connection_read(token) {
+                        Ok(false) => should_remove = true,
+                        Err(e) => {
+                            if let Some(connection) = self.connections.get(&token) {
+                                error!(
+                                    addr = %connection.addr_string(),
+                                    error = %e,
+                                    "Error reading from unknown connection"
+                                );
+                            }
+                            should_remove = true;
+                        }
+                        Ok(true) => {
+                            messages_processed = true;
+                        }
                     }
+                }
+                _ => {
+                    warn!(token = ?token, "Connection not found, removing");
+                    should_remove = true;
                 }
             }
         }
         
         // If we processed messages or if writable event occurred, try to write
         if (writable || messages_processed) && !should_remove {
-            if is_client {
-                if let Err(e) = self.handle_client_write(token) {
-                    if let Some(connection) = self.connections.get(&token) {
-                        error!(
-                            client_addr = %connection.addr_string(),
-                            error = %e,
-                            "Error writing to client"
-                        );
+            let connection_type = self.connections.get(&token).map(|c| {
+                if c.is_client() { "client" } 
+                else if c.is_peer() { "peer" } 
+                else { "unknown" }
+            }).unwrap_or("missing");
+            
+            match connection_type {
+                "client" => {
+                    if let Err(e) = self.handle_client_write(token) {
+                        if let Some(connection) = self.connections.get(&token) {
+                            error!(
+                                client_addr = %connection.addr_string(),
+                                error = %e,
+                                "Error writing to client"
+                            );
+                        }
+                        should_remove = true;
                     }
-                    should_remove = true;
                 }
-            } else {
-                // Handle peer write
-                if let Err(e) = self.handle_peer_write(token) {
-                    if let Some(connection) = self.connections.get(&token) {
-                        error!(
-                            peer_addr = %connection.addr_string(),
-                            error = %e,
-                            "Error writing to peer"
-                        );
+                "peer" => {
+                    if let Err(e) = self.handle_peer_write(token) {
+                        if let Some(connection) = self.connections.get(&token) {
+                            error!(
+                                peer_addr = %connection.addr_string(),
+                                error = %e,
+                                "Error writing to peer"
+                            );
+                        }
+                        should_remove = true;
                     }
+                }
+                "unknown" => {
+                    if let Err(e) = self.handle_unknown_connection_write(token) {
+                        if let Some(connection) = self.connections.get(&token) {
+                            error!(
+                                addr = %connection.addr_string(),
+                                error = %e,
+                                "Error writing to unknown connection"
+                            );
+                        }
+                        should_remove = true;
+                    }
+                }
+                _ => {
+                    // Connection doesn't exist, should remove
                     should_remove = true;
                 }
             }
         }
         
         if should_remove {
-            if is_client {
-                self.remove_client(token);
-            } else {
-                self.remove_peer_connection(token);
+            let connection_type = self.connections.get(&token).map(|c| {
+                if c.is_client() { "client" } 
+                else if c.is_peer() { "peer" } 
+                else { "unknown" }
+            }).unwrap_or("missing");
+            
+            match connection_type {
+                "client" | "unknown" => {
+                    self.remove_client(token);
+                }
+                "peer" => {
+                    self.remove_peer_connection(token);
+                }
+                _ => {
+                    // Unknown connection type, just remove it
+                    self.connections.remove(&token);
+                }
             }
         }
         
         Ok(())
+    }
+    
+    fn handle_unknown_connection_read(&mut self, token: Token) -> Result<bool> {
+        let mut read_buffer = [0u8; 8192];
+        let mut should_close = false;
+        let mut messages_to_classify = Vec::new();
+        
+        // Read data from unknown connection
+        if let Some(Connection::Unknown(unknown_conn)) = self.connections.get_mut(&token) {
+            loop {
+                match unknown_conn.stream.read(&mut read_buffer) {
+                    Ok(0) => {
+                        // Connection closed
+                        should_close = true;
+                        break;
+                    }
+                    Ok(bytes_read) => {
+                        // Add data to message buffer
+                        unknown_conn.message_buffer.add_data(&read_buffer[0..bytes_read]);
+                        
+                        // Try to extract complete messages for classification
+                        while let Ok(Some(message)) = unknown_conn.message_buffer.try_decode() {
+                            messages_to_classify.push(message);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        break;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Error reading from unknown connection");
+                        should_close = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            return Ok(false);
+        }
+        
+        if should_close {
+            return Ok(false);
+        }
+        
+        // Try to classify the connection based on the first complete message
+        for protocol_message in messages_to_classify {
+            let classified = self.classify_connection_by_message(token, &protocol_message)?;
+            if classified {
+                // Connection has been reclassified, handle the message with the new type
+                return self.handle_reclassified_connection(token, protocol_message);
+            }
+        }
+        
+        Ok(true)
+    }
+    
+    fn handle_unknown_connection_write(&mut self, token: Token) -> Result<()> {
+        if let Some(Connection::Unknown(unknown_conn)) = self.connections.get_mut(&token) {
+            while let Some(message_data) = unknown_conn.outbound_messages.pop_front() {
+                match unknown_conn.stream.write_all(&message_data) {
+                    Ok(_) => {},
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Put the message back and break
+                        unknown_conn.outbound_messages.push_front(message_data);
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to write to unknown connection: {}", e));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    fn classify_connection_by_message(&mut self, token: Token, protocol_message: &ProtocolMessage) -> Result<bool> {
+        // Determine if this is a peer or client message
+        let is_peer_message = matches!(protocol_message,
+            ProtocolMessage::PeerStartup(_) |
+            ProtocolMessage::PeerFullSyncRequest { .. } |
+            ProtocolMessage::PeerFullSyncResponse { .. } |
+            ProtocolMessage::PeerSyncRequest(_)
+        );
+        
+        if let Some(Connection::Unknown(unknown_conn)) = self.connections.remove(&token) {
+            if is_peer_message {
+                info!(addr = %unknown_conn.addr_string, "Classifying connection as peer");
+                
+                // Convert to peer connection
+                let peer_connection = self.peer_manager.handle_new_peer_connection(
+                    unknown_conn.addr_string.clone(), 
+                    unknown_conn.stream
+                );
+                
+                // Transfer any pending outbound messages
+                // Note: peers typically don't have pending messages at this stage
+                
+                self.connections.insert(token, Connection::Peer(peer_connection));
+                
+                // Send startup message to new peer
+                let startup_message = self.peer_manager.get_startup_message();
+                if let Some(Connection::Peer(peer_conn)) = self.connections.get_mut(&token) {
+                    peer_conn.queue_message(startup_message);
+                }
+                
+                Ok(true)
+            } else {
+                info!(addr = %unknown_conn.addr_string, "Classifying connection as client");
+                
+                // Convert to client connection
+                let client_connection = ClientConnection {
+                    stream: unknown_conn.stream,
+                    addr_string: unknown_conn.addr_string,
+                    authenticated: false,
+                    client_id: None,
+                    notification_queue: NotificationQueue::new(),
+                    notification_configs: HashSet::new(),
+                    pending_notifications: VecDeque::new(),
+                    outbound_messages: unknown_conn.outbound_messages,
+                    message_buffer: unknown_conn.message_buffer,
+                };
+                
+                self.connections.insert(token, Connection::Client(client_connection));
+                Ok(true)
+            }
+        } else {
+            Ok(false)
+        }
+    }
+    
+    fn handle_reclassified_connection(&mut self, token: Token, protocol_message: ProtocolMessage) -> Result<bool> {
+        // Handle the message that caused the reclassification
+        if let Some(connection) = self.connections.get(&token) {
+            if connection.is_peer() {
+                // Handle as peer message
+                if let Some(peer_message) = self.protocol_to_peer_message(protocol_message) {
+                    let peer_addr = connection.addr_string().to_string();
+                    let responses = self.peer_manager.handle_peer_message(peer_message, &peer_addr);
+                    
+                    // Queue responses
+                    if let Some(Connection::Peer(peer_conn)) = self.connections.get_mut(&token) {
+                        for (_, response_data) in responses {
+                            peer_conn.queue_message(response_data);
+                        }
+                    }
+                }
+            } else if connection.is_client() {
+                // Handle as client message
+                if let ProtocolMessage::Store(store_message) = protocol_message {
+                    let response = self.process_store_message(store_message, token)?;
+                    let response_protocol = ProtocolMessage::Store(response);
+                    
+                    if let Ok(response_bytes) = ProtocolCodec::encode(&response_protocol) {
+                        if let Some(Connection::Client(client_conn)) = self.connections.get_mut(&token) {
+                            client_conn.outbound_messages.push_back(response_bytes);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(true)
+    }
+    
+    fn protocol_to_peer_message(&self, protocol_message: ProtocolMessage) -> Option<crate::peer_manager::PeerMessage> {
+        match protocol_message {
+            ProtocolMessage::PeerStartup(startup) => {
+                Some(crate::peer_manager::PeerMessage::Startup {
+                    machine_id: startup.machine_id,
+                    startup_time: startup.startup_time,
+                })
+            }
+            ProtocolMessage::PeerFullSyncRequest { machine_id } => {
+                Some(crate::peer_manager::PeerMessage::FullSyncRequest { machine_id })
+            }
+            ProtocolMessage::PeerFullSyncResponse { snapshot } => {
+                Some(crate::peer_manager::PeerMessage::FullSyncResponse { snapshot })
+            }
+            ProtocolMessage::PeerSyncRequest(sync_req) => {
+                if let Ok(requests) = bincode::deserialize::<Vec<qlib_rs::Request>>(&sync_req.requests_data) {
+                    Some(crate::peer_manager::PeerMessage::SyncRequest { requests })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
     
     fn handle_client_read(&mut self, token: Token) -> Result<bool> {
@@ -828,8 +1127,11 @@ impl CoreService {
         if let Some(connection) = self.connections.remove(&token) {
             info!(client_addr = %connection.addr_string(), "Removing client connection");
             
-            // Only unregister notifications for client connections
-            if let Connection::Client(client_conn) = connection {
+            // Handle peer disconnection
+            if let Connection::Peer(_) = connection {
+                self.peer_manager.handle_peer_disconnection(&connection.addr_string());
+            } else if let Connection::Client(client_conn) = connection {
+                // Only unregister notifications for client connections
                 for config in &client_conn.notification_configs {
                     self.store.unregister_notification(config, &client_conn.notification_queue);
                 }
@@ -870,6 +1172,43 @@ impl CoreService {
     }
     
     fn process_store_message(&mut self, message: StoreMessage, token: Token) -> Result<StoreMessage> {
+        // Check availability state first - reject clients if unavailable
+        let availability_state = self.peer_manager.get_availability_state();
+        if matches!(availability_state, AvailabilityState::Unavailable) {
+            warn!("Rejecting client request - service is unavailable");
+            // Return appropriate error response based on message type
+            return Ok(match &message {
+                StoreMessage::Authenticate { id, .. } => StoreMessage::AuthenticateResponse {
+                    id: id.clone(),
+                    response: Err("Service unavailable - system is synchronizing".to_string()),
+                },
+                StoreMessage::Perform { id, .. } => StoreMessage::PerformResponse {
+                    id: id.clone(),
+                    response: Err("Service unavailable - system is synchronizing".to_string()),
+                },
+                StoreMessage::GetEntitySchema { id, .. } => StoreMessage::GetEntitySchemaResponse {
+                    id: id.clone(),
+                    response: Err("Service unavailable - system is synchronizing".to_string()),
+                },
+                StoreMessage::GetCompleteEntitySchema { id, .. } => StoreMessage::GetCompleteEntitySchemaResponse {
+                    id: id.clone(),
+                    response: Err("Service unavailable - system is synchronizing".to_string()),
+                },
+                StoreMessage::GetFieldSchema { id, .. } => StoreMessage::GetFieldSchemaResponse {
+                    id: id.clone(),
+                    response: Err("Service unavailable - system is synchronizing".to_string()),
+                },
+                _ => {
+                    // For other message types, return a generic Perform response
+                    let id = Snowflake::new().generate().to_string();
+                    StoreMessage::PerformResponse {
+                        id,
+                        response: Err("Service unavailable - system is synchronizing".to_string()),
+                    }
+                }
+            });
+        }
+        
         // Get connection info
         let (addr_string, authenticated, client_id) = {
             if let Some(connection) = self.connections.get(&token) {
@@ -1199,8 +1538,20 @@ impl CoreService {
             }
             
             // Send to peers for synchronization
-            // TODO: Implement peer synchronization
-            // self.peer_manager.send_sync_message(requests_to_write);
+            let sync_messages = self.peer_manager.send_sync_message(requests_to_write);
+            
+            // Queue sync messages to all connected peers
+            for (target_peer, message_data) in sync_messages {
+                // Find peer connection and queue message
+                for connection in self.connections.values_mut() {
+                    if let Connection::Peer(peer_conn) = connection {
+                        if peer_conn.addr_string == target_peer {
+                            peer_conn.queue_message(message_data.clone());
+                            break;
+                        }
+                    }
+                }
+            }
         }
         
         Ok(())
@@ -1208,12 +1559,11 @@ impl CoreService {
     
     /// Handle misc operations (fault tolerance, etc.)
     fn handle_misc_operations(&mut self) -> Result<()> {
-        // TODO: Implement leadership check via peer_manager
-        // if let (is_leader, _) = self.peer_manager.get_leadership_info() {
-        //     if is_leader {
-        //         self.handle_fault_tolerance_management()?;
-        //     }
-        // }
+        // Check leadership and handle fault tolerance if we're the leader
+        let (is_leader, _) = self.peer_manager.get_leadership_info();
+        if is_leader {
+            self.handle_fault_tolerance_management()?;
+        }
         
         Ok(())
     }
