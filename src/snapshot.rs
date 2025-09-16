@@ -1,11 +1,12 @@
 use std::path::PathBuf;
-use crossbeam::channel::{Sender, bounded, unbounded};
 use std::thread;
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{Read, Write};
+use crossbeam::channel::Sender;
 use tracing::{info, warn, error};
 use anyhow::Result;
 
+use crate::core::CoreHandle;
 use crate::files::{FileConfig, FileManager, FileManagerTrait};
 
 /// Trait for snapshot operations
@@ -31,51 +32,33 @@ pub struct SnapshotConfig {
 
 /// Snapshot manager request types
 #[derive(Debug)]
-pub enum SnapshotRequest {
+pub enum SnapshotCommand {
     Save {
         snapshot: qlib_rs::Snapshot,
     },
+    SetCoreHandle {
+        core_handle: CoreHandle,
+    },
     LoadLatest,
-}
-
-/// Response types for snapshot requests
-#[derive(Debug)]
-pub enum SnapshotResponse {
-    SaveResult(Result<u64>),
-    LoadResult(Result<Option<(qlib_rs::Snapshot, u64)>>),
 }
 
 /// Handle for communicating with snapshot manager task
 #[derive(Debug, Clone)]
 pub struct SnapshotHandle {
-    request_sender: Sender<(SnapshotRequest, Sender<SnapshotResponse>)>,
+    sender: Sender<SnapshotCommand>,
 }
 
 impl SnapshotHandle {
-    pub fn save(&self, snapshot: qlib_rs::Snapshot) -> Result<u64> {
-        let (response_tx, response_rx) = unbounded();
-        self.request_sender.send((SnapshotRequest::Save { snapshot }, response_tx))
-            .map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
-        
-        match response_rx.recv()
-            .map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
-        {
-            SnapshotResponse::SaveResult(result) => result,
-            _ => Err(anyhow::anyhow!("Unexpected response type")),
-        }
+    pub fn save(&self, snapshot: qlib_rs::Snapshot) {
+        self.sender.send(SnapshotCommand::Save { snapshot }).unwrap();
+    }
+
+    pub fn set_core_handle(&self, core_handle: CoreHandle) {
+        self.sender.send(SnapshotCommand::SetCoreHandle { core_handle }).unwrap();
     }
     
-    pub fn load_latest(&self) -> Result<Option<(qlib_rs::Snapshot, u64)>> {
-        let (response_tx, response_rx) = unbounded();
-        self.request_sender.send((SnapshotRequest::LoadLatest, response_tx))
-            .map_err(|e| anyhow::anyhow!("Snapshot service has stopped: {}", e))?;
-        
-        match response_rx.recv()
-            .map_err(|e| anyhow::anyhow!("Snapshot service response channel closed: {}", e))?
-        {
-            SnapshotResponse::LoadResult(result) => result,
-            _ => Err(anyhow::anyhow!("Unexpected response type")),
-        }
+    pub fn load_latest(&self) {
+        self.sender.send(SnapshotCommand::LoadLatest).unwrap();
     }
 }
 
@@ -83,9 +66,8 @@ pub type SnapshotService = SnapshotManagerTrait<FileManager>;
 
 impl SnapshotService {
     pub fn spawn(config: SnapshotConfig) -> SnapshotHandle {
-        let (request_sender, request_receiver) = bounded(1024);
-
-        let handle = SnapshotHandle { request_sender };
+        let (sender, receiver) = crossbeam::channel::unbounded();
+        let handle = SnapshotHandle { sender };
 
         thread::spawn(move || {
             let mut service = SnapshotService::new(FileManager, config);
@@ -97,22 +79,40 @@ impl SnapshotService {
                 },
             }
 
-            while let Ok((request, response_sender)) = request_receiver.recv() {
-                let response = match request {
-                    SnapshotRequest::Save { snapshot } => {
-                        SnapshotResponse::SaveResult(service.save(&snapshot))
+            while let Ok(request) = receiver.recv() {
+                match request {
+                    SnapshotCommand::Save { snapshot } => {
+                        if let Err(e) = service.save(&snapshot) {
+                            error!(error = %e, "Failed to save snapshot");
+                        }
                     }
-                    SnapshotRequest::LoadLatest => {
-                        SnapshotResponse::LoadResult(service.load_latest())
+                    SnapshotCommand::SetCoreHandle { core_handle } => {
+                        service.core_handle = Some(core_handle);
                     }
-                };
-                
-                if let Err(_) = response_sender.send(response) {
-                    error!("Failed to send snapshot service response");
+                    SnapshotCommand::LoadLatest => {
+                        match service.load_latest() {
+                            Ok(Some((snapshot, counter))) => {
+                                info!(
+                                    snapshot_counter = counter,
+                                    "Loaded latest snapshot successfully"
+                                );
+
+                                if let Some(core) = &service.core_handle {
+                                    core.restore_snapshot(snapshot);
+                                } else {
+                                    warn!("Core handle not set, cannot load snapshot into core");
+                                }                                
+                            },
+                            Ok(None) => {
+                                info!("No snapshots found, starting with empty store");
+                            }
+                            Err(e) => error!(error = %e, "Failed to load latest snapshot"),
+                        }
+                    }
                 }
             }
 
-            error!("Snapshot service has stopped unexpectedly");
+            panic!("Snapshot service has stopped unexpectedly");
         });
 
         handle
@@ -125,6 +125,8 @@ pub struct SnapshotManagerTrait<F: FileManagerTrait> {
     snapshot_config: FileConfig,
     /// Configuration for snapshot operations
     config: SnapshotConfig,
+
+    core_handle: Option<CoreHandle>,
 }
 
 impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
@@ -137,6 +139,7 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
                 max_files: config.max_files,
             },
             config,
+            core_handle: None,
         }
     }
 }

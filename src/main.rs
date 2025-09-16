@@ -1,9 +1,7 @@
 mod wal;
-mod peer_manager;
 mod snapshot;
 mod files;
 mod core;
-mod periodic_client;
 
 use std::path::PathBuf;
 
@@ -13,10 +11,8 @@ use tracing::error;
 
 use crate::{
     core::{CoreConfig, CoreService},
-    peer_manager::PeerConfig,
     snapshot::{SnapshotConfig, SnapshotService},
     wal::{WalConfig, WalService},
-    periodic_client::{PeriodicClientConfig, PeriodicClient}
 };
 
 /// Configuration passed via CLI arguments
@@ -54,18 +50,6 @@ pub struct Config {
     /// List of peer addresses to connect to (format: host:port)
     #[arg(long, value_delimiter = ',')]
     pub peer_addresses: Vec<String>,
-
-    /// Interval in seconds to retry connecting to peers
-    #[arg(long, default_value_t = 3)]
-    pub peer_reconnect_interval_secs: u64,
-
-    /// Grace period in seconds to wait after becoming unavailable before requesting full sync
-    #[arg(long, default_value_t = 5)]
-    pub full_sync_grace_period_secs: u64,
-
-    /// Delay in seconds after startup before self-promoting to leader when no peers are available
-    #[arg(long, default_value_t = 5)]
-    pub self_promotion_delay_secs: u64,
 }
 
 fn main() -> Result<()> {
@@ -92,23 +76,18 @@ fn main() -> Result<()> {
         max_files: config.wal_max_files,
         snapshot_wal_interval: config.snapshot_wal_interval,
     });
+
+    let core_handle = CoreService::spawn(CoreConfig::from(&config));
     
-    // Create the core service (runs in its own thread) with peer configuration
-    let core_handle = CoreService::spawn(CoreConfig::from(&config), PeerConfig::from(&config))?;
-    
-    // Set up dependencies
-    wal_handle.set_snapshot_handle(snapshot_handle.clone());
     wal_handle.set_core_handle(core_handle.clone());
-    
-    // Set handles for the core service
-    core_handle.set_handles(snapshot_handle.clone(), wal_handle)?;
-    
-    // Initialize store from snapshots and WAL replay
-    core_handle.initialize_store()?;
-    
-    // Start the periodic client (self-connecting client for periodic operations)
-    let periodic_client_handle = PeriodicClient::spawn(PeriodicClientConfig::from(&config))?;
-    
+
+    core_handle.set_snapshot_handle(snapshot_handle.clone());
+    core_handle.set_wal_handle(wal_handle.clone());
+
+    snapshot_handle.set_core_handle(core_handle.clone());
+    snapshot_handle.load_latest();
+    wal_handle.replay();
+
     // Set up signal handling for graceful shutdown
     let (shutdown_tx, shutdown_rx) = crossbeam::channel::bounded(1);
     std::thread::spawn(move || {
@@ -121,16 +100,6 @@ fn main() -> Result<()> {
     // Keep the main thread alive and wait for shutdown signal
     if let Ok(_) = shutdown_rx.recv() {
         tracing::info!("Received shutdown signal, initiating graceful shutdown");
-        
-        // Stop the periodic client
-        periodic_client_handle.stop();
-        
-        // Trigger a final snapshot before shutdown
-        if let Ok(snapshot) = core_handle.take_snapshot() {
-            if let Err(e) = snapshot_handle.save(snapshot) {
-                error!("Failed to save final snapshot: {}", e);
-            }
-        }
     }
     
     tracing::info!("QCore service shutdown complete");

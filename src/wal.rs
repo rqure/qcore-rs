@@ -1,4 +1,4 @@
-use crossbeam::channel::{Sender, bounded, unbounded};
+use crossbeam::channel::Sender;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::thread;
@@ -6,7 +6,9 @@ use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{Write, Read};
 use std::path::PathBuf;
 
+use crate::core::CoreHandle;
 use crate::files::{FileConfig, FileInfo, FileManager, FileManagerTrait};
+use crate::snapshot::SnapshotHandle;
 
 /// Configuration for WAL manager operations
 #[derive(Debug, Clone)]
@@ -23,31 +25,20 @@ pub struct WalConfig {
 
 /// WAL manager request types
 #[derive(Debug)]
-pub enum WalRequest {
-    WriteRequest {
+pub enum WalCommand {
+    AppendRequest {
         request: qlib_rs::Request,
     },
     Replay,
-    SetSnapshotHandle {
-        handle: crate::snapshot::SnapshotHandle,
-    },
     SetCoreHandle {
-        handle: crate::core::CoreHandle,
-    },
-}
-
-/// Response types for WAL requests
-#[derive(Debug)]
-pub enum WalResponse {
-    WriteResult(Result<()>),
-    ReplayResult(Result<()>),
-    Unit,
+        handle: CoreHandle,
+    }
 }
 
 /// Trait for WAL operations
 pub trait WalTrait {
     /// Write a request to WAL
-    fn write_request(&mut self, request: &qlib_rs::Request) -> Result<()>;
+    fn append_request(&mut self, request: &qlib_rs::Request) -> Result<()>;
 
     /// Replay WAL files to restore store state
     fn replay(&self) -> Result<Vec<qlib_rs::Request>>;
@@ -126,60 +117,20 @@ impl Iterator for WalEntryReader {
 /// Handle for communicating with WAL manager task
 #[derive(Debug, Clone)]
 pub struct WalHandle {
-    request_sender: Sender<(WalRequest, Sender<WalResponse>)>,
+    sender: Sender<WalCommand>,
 }
 
 impl WalHandle {
-    pub fn write_request(&self, request: qlib_rs::Request) -> Result<()> {
-        let (response_tx, response_rx) = unbounded();
-        self.request_sender.send((WalRequest::WriteRequest { request }, response_tx))
-            .map_err(|e| anyhow::anyhow!("WAL service has stopped: {}", e))?;
-        
-        match response_rx.recv()
-            .map_err(|e| anyhow::anyhow!("WAL service response channel closed: {}", e))?
-        {
-            WalResponse::WriteResult(result) => result,
-            _ => Err(anyhow::anyhow!("Unexpected response type")),
-        }
-    }
-    
-    pub fn replay(&self) -> Result<Vec<qlib_rs::Request>> {
-        let (response_tx, response_rx) = unbounded();
-        self.request_sender.send((WalRequest::Replay, response_tx))
-            .map_err(|e| anyhow::anyhow!("WAL service has stopped: {}", e))?;
-        
-        match response_rx.recv()
-            .map_err(|e| anyhow::anyhow!("WAL service response channel closed: {}", e))?
-        {
-            WalResponse::ReplayResult(result) => result.map(|_| Vec::new()), // TODO: Return actual requests
-            _ => Err(anyhow::anyhow!("Unexpected response type")),
-        }
+    pub fn append_request(&self, request: qlib_rs::Request) {
+        self.sender.send(WalCommand::AppendRequest { request }).unwrap();
     }
 
-    /// Set snapshot handle for dependencies
-    pub fn set_snapshot_handle(&self, handle: crate::snapshot::SnapshotHandle) {
-        let (response_tx, response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((WalRequest::SetSnapshotHandle { handle }, response_tx)) {
-            error!(error = %e, "Failed to send SetSnapshotHandle request");
-            return;
-        }
-        // Wait for response to ensure proper synchronization
-        if let Err(e) = response_rx.recv() {
-            error!(error = %e, "Failed to receive SetSnapshotHandle response");
-        }
+    pub fn replay(&self) {
+        self.sender.send(WalCommand::Replay).unwrap();
     }
 
-    /// Set core handle for dependencies
-    pub fn set_core_handle(&self, handle: crate::core::CoreHandle) {
-        let (response_tx, response_rx) = unbounded();
-        if let Err(e) = self.request_sender.send((WalRequest::SetCoreHandle { handle }, response_tx)) {
-            error!(error = %e, "Failed to send SetCoreHandle request");
-            return;
-        }
-        // Wait for response to ensure proper synchronization
-        if let Err(e) = response_rx.recv() {
-            error!(error = %e, "Failed to receive SetCoreHandle response");
-        }
+    pub fn set_core_handle(&self, core: CoreHandle) {
+        self.sender.send(WalCommand::SetCoreHandle { handle: core }).unwrap();
     }
 }
 
@@ -187,12 +138,11 @@ pub type WalService = WalManagerTrait<FileManager>;
 
 impl WalService {
     pub fn spawn(config: WalConfig) -> WalHandle {
-        let (request_sender, request_receiver) = bounded(131072);
-        
-        let handle = WalHandle { request_sender };
-        
+        let (sender, receiver) = crossbeam::channel::unbounded();
+        let handle = WalHandle { sender };
+
         thread::spawn(move || {
-            let mut service = WalService::new(FileManager, config, None);
+            let mut service = WalService::new(FileManager, config);
             match service.initialize_counter() {
                 Ok(_) => info!("WAL service initialized successfully"),
                 Err(e) => {
@@ -201,30 +151,35 @@ impl WalService {
                 }
             }
 
-            while let Ok((request, response_sender)) = request_receiver.recv() {
-                let response = match request {
-                    WalRequest::WriteRequest { request } => {
-                        WalResponse::WriteResult(service.write_request(&request))
+            while let Ok(request) = receiver.recv() {
+                match request {
+                    WalCommand::AppendRequest { request } => {
+                        match service.append_request(&request) {
+                            Ok(_) => debug!("Wrote request to WAL"),
+                            Err(e) => error!(error = %e, "Failed to write request to WAL"),
+                        }
                     }
-                    WalRequest::Replay => {
-                        WalResponse::ReplayResult(service.replay().map(|_| ()))
+                    WalCommand::Replay => {
+                        if let Some(core_handle) = &service.core_handle {
+                            match service.replay() {
+                                Ok(requests) => {
+                                    core_handle.perform(requests)
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to replay WAL files");
+                                }
+                            }
+                        } else {
+                            warn!("Core handle not set, cannot replay WAL");
+                        }
                     }
-                    WalRequest::SetSnapshotHandle { handle } => {
-                        service.snapshot_handle = Some(handle);
-                        WalResponse::Unit
-                    }
-                    WalRequest::SetCoreHandle { handle } => {
+                    WalCommand::SetCoreHandle { handle } => {
                         service.core_handle = Some(handle);
-                        WalResponse::Unit
                     }
-                };
-                
-                if let Err(_) = response_sender.send(response) {
-                    error!("Failed to send WAL service response");
                 }
             }
 
-            error!("WAL manager service has stopped unexpectedly");
+            panic!("WAL manager service has stopped unexpectedly");
         });
 
         handle
@@ -242,14 +197,12 @@ pub struct WalManagerTrait<F: FileManagerTrait> {
     current_wal_size: usize,
     /// Number of WAL files created since last snapshot
     wal_files_since_snapshot: u64,
-    /// Handle to communicate with snapshot manager
-    snapshot_handle: Option<crate::snapshot::SnapshotHandle>,
     /// Handle to communicate with core service
-    core_handle: Option<crate::core::CoreHandle>,
+    core_handle: Option<CoreHandle>,
 }
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {
-    pub fn new(file_manager: F, config: WalConfig, snapshot_handle: Option<crate::snapshot::SnapshotHandle>) -> Self {
+    pub fn new(file_manager: F, config: WalConfig) -> Self {
         Self {
             file_manager,
             file_config: FileConfig {
@@ -261,7 +214,6 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             current_wal_file: None,
             current_wal_size: 0,
             wal_files_since_snapshot: 0,
-            snapshot_handle,
             core_handle: None,
         }
     }
@@ -269,7 +221,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
 
 impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     /// Write a request to WAL with file rotation and snapshot handling
-    fn write_request(&mut self, request: &qlib_rs::Request) -> Result<()> {
+    fn append_request(&mut self, request: &qlib_rs::Request) -> Result<()> {
         // Serialize the request
         let serialized = bincode::serialize(request)?;
         
@@ -345,10 +297,8 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 "WAL rollover interval reached, triggering snapshot"
             );
             
-            // TODO: Coordinate with core service to take snapshot
-            if let Some(_snapshot_handle) = &self.snapshot_handle {
-                info!("Would trigger snapshot here");
-                // For now, just reset the counter
+            if let Some(core_handle) = &self.core_handle {
+                core_handle.take_snapshot();
                 self.wal_files_since_snapshot = 0;
             }
         }
