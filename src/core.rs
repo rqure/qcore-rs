@@ -16,7 +16,7 @@ use qlib_rs::{
     AuthConfig, EntityType, FieldType, PageOpts, PageResult, 
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
-use crate::peers::AvailabilityState;
+use crate::peer_manager::AvailabilityState;
 use crate::peer_manager::PeerManager;
 use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer};
 
@@ -305,7 +305,7 @@ impl CoreService {
     /// Create a new core service with peer configuration
     pub fn new(
         config: CoreConfig,
-        peer_config: crate::peers::PeerConfig,
+        peer_config: crate::peer_manager::PeerConfig,
         request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>,
         command_queue: Arc<SegQueue<CoreCommand>>,
         request_sender: Sender<(CoreRequest, Sender<CoreResponse>)>
@@ -349,7 +349,7 @@ impl CoreService {
     }
 
     /// Spawn the core service in its own thread and return a handle
-    pub fn spawn(config: CoreConfig, peer_config: crate::peers::PeerConfig) -> Result<CoreHandle> {
+    pub fn spawn(config: CoreConfig, peer_config: crate::peer_manager::PeerConfig) -> Result<CoreHandle> {
         let (request_sender, request_receiver) = unbounded();
         let command_queue = Arc::new(SegQueue::new());
         

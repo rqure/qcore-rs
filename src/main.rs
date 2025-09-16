@@ -1,5 +1,4 @@
 mod wal;
-mod peers;
 mod peer_manager;
 mod snapshot;
 mod files;
@@ -13,7 +12,7 @@ use tracing::error;
 
 use crate::{
     core::{CoreConfig, CoreService},
-    peers::PeerConfig,
+    peer_manager::PeerConfig,
     snapshot::{SnapshotConfig, SnapshotService},
     wal::{WalConfig, WalService}
 };
