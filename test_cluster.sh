@@ -39,17 +39,17 @@ start_node() {
 start_node qos-a "$BIN_DIR"/qcore-rs \
     --machine qos-a \
     --peer-addresses localhost:9101,localhost:9102 \
-    --client-port 9100
+    --port 9100
 
 start_node qos-b "$BIN_DIR"/qcore-rs \
     --machine qos-b \
     --peer-addresses localhost:9100,localhost:9102 \
-    --client-port 9101
+    --port 9101
 
 start_node qos-c "$BIN_DIR"/qcore-rs \
     --machine qos-c \
     --peer-addresses localhost:9100,localhost:9101 \
-    --client-port 9102
+    --port 9102
 
 echo "All nodes started."
 echo "Press Ctrl-C to stop the cluster."

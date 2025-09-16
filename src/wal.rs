@@ -158,17 +158,27 @@ impl WalHandle {
 
     /// Set snapshot handle for dependencies
     pub fn set_snapshot_handle(&self, handle: crate::snapshot::SnapshotHandle) {
-        let (response_tx, _response_rx) = unbounded();
+        let (response_tx, response_rx) = unbounded();
         if let Err(e) = self.request_sender.send((WalRequest::SetSnapshotHandle { handle }, response_tx)) {
             error!(error = %e, "Failed to send SetSnapshotHandle request");
+            return;
+        }
+        // Wait for response to ensure proper synchronization
+        if let Err(e) = response_rx.recv() {
+            error!(error = %e, "Failed to receive SetSnapshotHandle response");
         }
     }
 
     /// Set core handle for dependencies
     pub fn set_core_handle(&self, handle: crate::core::CoreHandle) {
-        let (response_tx, _response_rx) = unbounded();
+        let (response_tx, response_rx) = unbounded();
         if let Err(e) = self.request_sender.send((WalRequest::SetCoreHandle { handle }, response_tx)) {
             error!(error = %e, "Failed to send SetCoreHandle request");
+            return;
+        }
+        // Wait for response to ensure proper synchronization
+        if let Err(e) = response_rx.recv() {
+            error!(error = %e, "Failed to receive SetCoreHandle response");
         }
     }
 }

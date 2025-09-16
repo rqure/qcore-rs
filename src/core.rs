@@ -1,13 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration as StdDuration;
-use std::sync::Arc;
 use std::io::{Read, Write};
 use mio::{Poll, Interest, Token, Events};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use crossbeam::channel::{Sender, Receiver, unbounded};
-use crossbeam::queue::SegQueue;
 use std::thread;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
@@ -32,7 +29,7 @@ pub struct CoreConfig {
 impl From<&crate::Config> for CoreConfig {
     fn from(config: &crate::Config) -> Self {
         Self {
-            port: config.client_port, // For now use client_port, will be unified later
+            port: config.port,
             machine_id: config.machine.clone(),
         }
     }
@@ -76,7 +73,6 @@ pub enum CoreResponse {
 #[derive(Debug, Clone)]
 pub struct CoreHandle {
     request_sender: Sender<(CoreRequest, Sender<CoreResponse>)>,
-    command_queue: Arc<SegQueue<CoreCommand>>,
 }
 
 impl CoreHandle {
@@ -320,14 +316,9 @@ pub struct CoreService {
     
     // Channel for sending requests to other services
     request_sender: Sender<(CoreRequest, Sender<CoreResponse>)>,
-    
-    // Queue for fire-and-forget commands
-    command_queue: Arc<SegQueue<CoreCommand>>,
 }
 
 const LISTENER_TOKEN: Token = Token(0);
-const MISC_INTERVAL_MS: u64 = 10;
-const HEARTBEAT_INTERVAL_SECS: u64 = 1;
 
 impl CoreService {
     /// Create a new core service with peer configuration
@@ -335,7 +326,6 @@ impl CoreService {
         config: CoreConfig,
         peer_config: crate::peer_manager::PeerConfig,
         request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>,
-        command_queue: Arc<SegQueue<CoreCommand>>,
         request_sender: Sender<(CoreRequest, Sender<CoreResponse>)>
     ) -> Result<Self> {
         let addr = format!("0.0.0.0:{}", config.port).parse()?;
@@ -372,25 +362,21 @@ impl CoreService {
             wal_handle: None,
             request_receiver,
             request_sender,
-            command_queue,
         })
     }
 
     /// Spawn the core service in its own thread and return a handle
     pub fn spawn(config: CoreConfig, peer_config: crate::peer_manager::PeerConfig) -> Result<CoreHandle> {
         let (request_sender, request_receiver) = unbounded();
-        let command_queue = Arc::new(SegQueue::new());
         
         let handle = CoreHandle { 
             request_sender: request_sender.clone(),
-            command_queue: command_queue.clone(),
         };
         
         // Spawn the main core service thread (I/O event loop)
-        let command_queue_for_service = command_queue.clone();
         let request_sender_for_service = request_sender.clone();
         thread::spawn(move || {
-            let mut service = match Self::new(config, peer_config, request_receiver, command_queue_for_service, request_sender_for_service) {
+            let mut service = match Self::new(config, peer_config, request_receiver, request_sender_for_service) {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to create core service: {}", e);
@@ -403,51 +389,6 @@ impl CoreService {
             }
             
             error!("Core service has stopped unexpectedly");
-        });
-        
-        // Spawn background scheduler thread for misc operations
-        let misc_handle = handle.clone();
-        thread::spawn(move || {
-            let mut last_misc_tick = std::time::Instant::now();
-            
-            loop {
-                thread::sleep(StdDuration::from_millis(MISC_INTERVAL_MS));
-                
-                let now = std::time::Instant::now();
-                if now.duration_since(last_misc_tick) >= StdDuration::from_millis(MISC_INTERVAL_MS) {
-                    // Send misc operations command to core (fire-and-forget)
-                    misc_handle.command_queue.push(CoreCommand::HandleMiscOperations);
-                    last_misc_tick = now;
-                }
-            }
-        });
-        
-        // Spawn background scheduler thread for heartbeat
-        let heartbeat_handle = handle.clone();
-        thread::spawn(move || {
-            let mut last_heartbeat = std::time::Instant::now();
-            
-            loop {
-                thread::sleep(StdDuration::from_secs(HEARTBEAT_INTERVAL_SECS));
-                
-                let now = std::time::Instant::now();
-                if now.duration_since(last_heartbeat) >= StdDuration::from_secs(HEARTBEAT_INTERVAL_SECS) {
-                    // Send heartbeat command to core (fire-and-forget)
-                    heartbeat_handle.command_queue.push(CoreCommand::HandleHeartbeat);
-                    last_heartbeat = now;
-                }
-            }
-        });
-        
-        // Spawn background scheduler thread for peer operations
-        let peer_handle = handle.clone();
-        thread::spawn(move || {
-            loop {
-                thread::sleep(StdDuration::from_millis(MISC_INTERVAL_MS)); // Use same interval as misc ops
-                
-                // Send peer operations command to core (fire-and-forget)
-                peer_handle.command_queue.push(CoreCommand::HandlePeerOperations);
-            }
         });
         
         Ok(handle)
@@ -498,21 +439,14 @@ impl CoreService {
                 }
             }
             
-            // Handle fire-and-forget commands from the queue (non-blocking)
-            while let Some(command) = self.command_queue.pop() {
-                if self.handle_command(command) {
-                    info!("Core service shutting down");
-                    return Ok(());
-                }
-            }
-            
             // Process notifications and send them to clients
             self.process_notifications()?;
             
             // Process any pending write requests from the store
             self.process_write_requests()?;
             
-            // Poll for I/O events (blocking - Redis-like approach)
+            // Poll for I/O events with no timeout for maximum responsiveness
+            // Periodic operations are now handled by the self-connecting periodic client
             self.poll.poll(&mut events, None)?;
             
             // Handle all mio events
@@ -564,7 +498,6 @@ impl CoreService {
                 self.peer_manager.set_snapshot_handle(snapshot_handle);
                 self.peer_manager.set_core_handle(CoreHandle {
                     request_sender: self.request_sender.clone(),
-                    command_queue: self.command_queue.clone(),
                 });
                 
                 CoreResponse::Unit

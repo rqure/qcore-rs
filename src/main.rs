@@ -3,6 +3,7 @@ mod peer_manager;
 mod snapshot;
 mod files;
 mod core;
+mod periodic_client;
 
 use std::path::PathBuf;
 
@@ -14,7 +15,8 @@ use crate::{
     core::{CoreConfig, CoreService},
     peer_manager::PeerConfig,
     snapshot::{SnapshotConfig, SnapshotService},
-    wal::{WalConfig, WalService}
+    wal::{WalConfig, WalService},
+    periodic_client::{PeriodicClientConfig, PeriodicClient}
 };
 
 /// Configuration passed via CLI arguments
@@ -45,13 +47,9 @@ pub struct Config {
     #[arg(long, default_value_t = 5)]
     pub snapshot_max_files: usize,
 
-    /// Port for peer-to-peer communication
-    #[arg(long, default_value_t = 9000)]
-    pub peer_port: u16,
-
-    /// Port for client communication (StoreProxy clients)
+    /// Port for unified client and peer communication
     #[arg(long, default_value_t = 9100)]
-    pub client_port: u16,
+    pub port: u16,
 
     /// List of peer addresses to connect to (format: host:port)
     #[arg(long, value_delimiter = ',')]
@@ -108,6 +106,9 @@ fn main() -> Result<()> {
     // Initialize store from snapshots and WAL replay
     core_handle.initialize_store()?;
     
+    // Start the periodic client (self-connecting client for periodic operations)
+    let periodic_client_handle = PeriodicClient::spawn(PeriodicClientConfig::from(&config))?;
+    
     // Set up signal handling for graceful shutdown
     let (shutdown_tx, shutdown_rx) = crossbeam::channel::bounded(1);
     std::thread::spawn(move || {
@@ -120,6 +121,9 @@ fn main() -> Result<()> {
     // Keep the main thread alive and wait for shutdown signal
     if let Ok(_) = shutdown_rx.recv() {
         tracing::info!("Received shutdown signal, initiating graceful shutdown");
+        
+        // Stop the periodic client
+        periodic_client_handle.stop();
         
         // Trigger a final snapshot before shutdown
         if let Ok(snapshot) = core_handle.take_snapshot() {
