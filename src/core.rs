@@ -23,24 +23,16 @@ pub struct CoreConfig {
     /// Port for unified client and peer communication
     pub port: u16,
     /// Machine ID for request origination
-    pub machine_id: String,
+    pub machine: String,
 }
 
 impl From<&crate::Config> for CoreConfig {
     fn from(config: &crate::Config) -> Self {
         Self {
             port: config.port,
-            machine_id: config.machine.clone(),
+            machine: config.machine.clone(),
         }
     }
-}
-
-/// Fire-and-forget request types (no response needed)
-#[derive(Debug)]
-pub enum CoreCommand {
-    HandleMiscOperations,
-    HandleHeartbeat,
-    HandlePeerOperations,
 }
 
 /// Core service request types
@@ -510,30 +502,6 @@ impl CoreService {
                         CoreResponse::Unit // Still return unit, but log the error
                     }
                 }
-            }
-        }
-    }
-    
-    /// Handle fire-and-forget commands
-    fn handle_command(&mut self, command: CoreCommand) -> bool {
-        match command {
-            CoreCommand::HandleMiscOperations => {
-                if let Err(e) = self.handle_misc_operations() {
-                    error!(error = %e, "Failed to handle misc operations");
-                }
-                false
-            }
-            CoreCommand::HandleHeartbeat => {
-                if let Err(e) = self.handle_heartbeat() {
-                    error!(error = %e, "Failed to handle heartbeat");
-                }
-                false
-            }
-            CoreCommand::HandlePeerOperations => {
-                if let Err(e) = self.handle_peer_operations() {
-                    error!(error = %e, "Failed to handle peer operations");
-                }
-                false
             }
         }
     }
@@ -1158,8 +1126,9 @@ impl CoreService {
                     subject_name = %subject_name,
                     "Processing authentication request"
                 );
-                
-                match self.authenticate_subject(&subject_name, &credential) {
+
+                let auth_config = AuthConfig::default();
+                match authenticate_subject(&mut self.store, &subject_name, &credential, &auth_config) {
                     Ok(subject_id) => {
                         // Update connection state
                         if let Some(connection) = self.connections.get_mut(&token) {
@@ -1173,12 +1142,13 @@ impl CoreService {
                             "Client authenticated successfully"
                         );
                         
+                        let subject_type = subject_id.get_type().to_string();
                         Ok(StoreMessage::AuthenticateResponse {
                             id,
                             response: Ok(AuthenticationResult {
                                 subject_id,
-                                subject_type: "User".to_string(), // TODO: determine actual subject type
-                            }),
+                                subject_type,
+                            })
                         })
                     }
                     Err(e) => {
@@ -1274,7 +1244,7 @@ impl CoreService {
                             "Processing GetEntitySchema request"
                         );
                         
-                        match self.get_entity_schema(&entity_type) {
+                        match self.store.get_entity_schema(&entity_type) {
                             Ok(schema) => Ok(StoreMessage::GetEntitySchemaResponse {
                                 id,
                                 response: Ok(Some(schema)),
@@ -1293,7 +1263,7 @@ impl CoreService {
                             "Processing GetCompleteEntitySchema request"
                         );
                         
-                        match self.get_complete_entity_schema(&entity_type) {
+                        match self.store.get_complete_entity_schema(&entity_type) {
                             Ok(schema) => Ok(StoreMessage::GetCompleteEntitySchemaResponse {
                                 id,
                                 response: Ok(schema),
@@ -1313,7 +1283,7 @@ impl CoreService {
                             "Processing GetFieldSchema request"
                         );
                         
-                        match self.get_field_schema(&entity_type, &field_type) {
+                        match self.store.get_field_schema(&entity_type, &field_type) {
                             Ok(schema) => Ok(StoreMessage::GetFieldSchemaResponse {
                                 id,
                                 response: Ok(Some(schema)),
@@ -1331,8 +1301,8 @@ impl CoreService {
                             entity_id = %entity_id,
                             "Processing EntityExists request"
                         );
-                        
-                        let exists = self.entity_exists(&entity_id);
+
+                        let exists = self.store.entity_exists(&entity_id);
                         Ok(StoreMessage::EntityExistsResponse {
                             id,
                             response: exists,
@@ -1346,8 +1316,8 @@ impl CoreService {
                             field_type = %field_type,
                             "Processing FieldExists request"
                         );
-                        
-                        let exists = self.field_exists(&entity_type, &field_type);
+
+                        let exists = self.store.field_exists(&entity_type, &field_type);
                         Ok(StoreMessage::FieldExistsResponse {
                             id,
                             response: exists,
@@ -1360,8 +1330,8 @@ impl CoreService {
                             entity_type = %entity_type,
                             "Processing FindEntities request"
                         );
-                        
-                        match self.find_entities_paginated(&entity_type, page_opts, filter) {
+
+                        match self.store.find_entities_paginated(&entity_type, page_opts, filter) {
                             Ok(result) => Ok(StoreMessage::FindEntitiesResponse {
                                 id,
                                 response: Ok(result),
@@ -1379,8 +1349,8 @@ impl CoreService {
                             entity_type = %entity_type,
                             "Processing FindEntitiesExact request"
                         );
-                        
-                        match self.find_entities_exact(&entity_type, page_opts, filter) {
+
+                        match self.store.find_entities_exact(&entity_type, page_opts, filter) {
                             Ok(result) => Ok(StoreMessage::FindEntitiesExactResponse {
                                 id,
                                 response: Ok(result),
@@ -1397,8 +1367,8 @@ impl CoreService {
                             client_addr = %addr_string,
                             "Processing GetEntityTypes request"
                         );
-                        
-                        match self.get_entity_types_paginated(page_opts) {
+
+                        match self.store.get_entity_types_paginated(page_opts) {
                             Ok(result) => Ok(StoreMessage::GetEntityTypesResponse {
                                 id,
                                 response: Ok(result),
@@ -1590,13 +1560,11 @@ impl CoreService {
     /// Handle fault tolerance and leader management when this instance is the leader
     fn handle_fault_tolerance_management(&mut self) -> Result<()> {
         // Find us as a candidate
-        let me_as_candidate = {
-            let machine = &self.config.machine_id;
-            
+        let me_as_candidate = {            
             let candidates = self.store.find_entities_paginated(
                 &qlib_rs::et::candidate(), 
                 None,
-                Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))
+                Some(format!("Name == 'qcore' && Parent->Name == '{}'", self.config.machine))
             )?;
             
             candidates.items.first().cloned()
@@ -1687,7 +1655,7 @@ impl CoreService {
     
     /// Handle heartbeat writing for this machine
     fn write_heartbeat(&mut self) -> Result<()> {
-        let machine = &self.config.machine_id;
+        let machine = &self.config.machine;
         
         let candidates = self.store.find_entities_paginated(
             &qlib_rs::et::candidate(), 
@@ -1743,63 +1711,6 @@ impl CoreService {
         }
         
         Ok(authorized_requests)
-    }
-    
-    /// Authenticate a subject with credentials
-    fn authenticate_subject(
-        &mut self,
-        subject_name: &str,
-        credential: &str,
-    ) -> Result<EntityId> {
-        let auth_config = AuthConfig::default(); // Use default auth config
-        authenticate_subject(&mut self.store, subject_name, credential, &auth_config)
-            .map_err(|e| anyhow::anyhow!("Authentication error: {}", e))
-    }
-    
-    /// Get entity schema
-    pub fn get_entity_schema(&self, entity_type: &EntityType) -> Result<qlib_rs::EntitySchema<qlib_rs::Single>> {
-        self.store.get_entity_schema(entity_type)
-            .map_err(|e| anyhow::anyhow!("Failed to get entity schema: {}", e))
-    }
-    
-    /// Get complete entity schema
-    pub fn get_complete_entity_schema(&self, entity_type: &EntityType) -> Result<qlib_rs::EntitySchema<qlib_rs::Complete>> {
-        self.store.get_complete_entity_schema(entity_type)
-            .map_err(|e| anyhow::anyhow!("Failed to get complete entity schema: {}", e))
-    }
-    
-    /// Get field schema
-    pub fn get_field_schema(&self, entity_type: &EntityType, field_type: &FieldType) -> Result<qlib_rs::FieldSchema> {
-        self.store.get_field_schema(entity_type, field_type)
-            .map_err(|e| anyhow::anyhow!("Failed to get field schema: {}", e))
-    }
-    
-    /// Check if entity exists
-    pub fn entity_exists(&self, entity_id: &EntityId) -> bool {
-        self.store.entity_exists(entity_id)
-    }
-    
-    /// Check if field exists
-    pub fn field_exists(&self, entity_type: &EntityType, field_type: &FieldType) -> bool {
-        self.store.field_exists(entity_type, field_type)
-    }
-    
-    /// Find entities with pagination
-    pub fn find_entities_paginated(&self, entity_type: &EntityType, page_opts: Option<PageOpts>, filter: Option<String>) -> Result<PageResult<EntityId>> {
-        self.store.find_entities_paginated(entity_type, page_opts, filter)
-            .map_err(|e| anyhow::anyhow!("Failed to find entities: {}", e))
-    }
-    
-    /// Find entities exact match
-    pub fn find_entities_exact(&self, entity_type: &EntityType, page_opts: Option<PageOpts>, filter: Option<String>) -> Result<PageResult<EntityId>> {
-        self.store.find_entities_exact(entity_type, page_opts, filter)
-            .map_err(|e| anyhow::anyhow!("Failed to find entities exact: {}", e))
-    }
-    
-    /// Get entity types with pagination
-    pub fn get_entity_types_paginated(&self, page_opts: Option<PageOpts>) -> Result<PageResult<EntityType>> {
-        self.store.get_entity_types_paginated(page_opts)
-            .map_err(|e| anyhow::anyhow!("Failed to get entity types: {}", e))
     }
     
     /// Register notification configuration for a specific client
