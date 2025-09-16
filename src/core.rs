@@ -17,13 +17,14 @@ use qlib_rs::{
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
 use crate::peers::AvailabilityState;
+use crate::peer_manager::PeerManager;
 use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer};
 
 /// Configuration for the core service
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
-    /// Port for client communication (StoreProxy clients)
-    pub client_port: u16,
+    /// Port for unified client and peer communication
+    pub port: u16,
     /// Machine ID for request origination
     pub machine_id: String,
 }
@@ -31,7 +32,7 @@ pub struct CoreConfig {
 impl From<&crate::Config> for CoreConfig {
     fn from(config: &crate::Config) -> Self {
         Self {
-            client_port: config.client_port,
+            port: config.client_port, // For now use client_port, will be unified later
             machine_id: config.machine.clone(),
         }
     }
@@ -56,7 +57,6 @@ pub enum CoreRequest {
     },
     ForceDisconnectAllClients,
     SetHandles {
-        peer_handle: crate::peers::PeerHandle,
         snapshot_handle: crate::snapshot::SnapshotHandle,
         wal_handle: crate::wal::WalHandle,
     },
@@ -134,12 +134,11 @@ impl CoreHandle {
     /// Set handles to other services (called from main)
     pub fn set_handles(
         &self,
-        peer_handle: crate::peers::PeerHandle,
         snapshot_handle: crate::snapshot::SnapshotHandle,
         wal_handle: crate::wal::WalHandle,
     ) -> Result<()> {
         let (response_tx, response_rx) = unbounded();
-        self.request_sender.send((CoreRequest::SetHandles { peer_handle, snapshot_handle, wal_handle }, response_tx))
+        self.request_sender.send((CoreRequest::SetHandles { snapshot_handle, wal_handle }, response_tx))
             .map_err(|e| anyhow::anyhow!("Core service has stopped: {}", e))?;
         
         match response_rx.recv()
@@ -179,12 +178,101 @@ struct ClientConnection {
     message_buffer: MessageBuffer,        // For handling partial reads
 }
 
-/// Core service that handles both client connections and misc operations
+/// Connection type to distinguish between clients and peers
+#[derive(Debug)]
+enum Connection {
+    Client(ClientConnection),
+    Peer(crate::peer_manager::PeerConnection),
+}
+
+impl Connection {
+    fn get_stream_mut(&mut self) -> &mut MioTcpStream {
+        match self {
+            Connection::Client(client) => &mut client.stream,
+            Connection::Peer(peer) => peer.get_stream_mut(),
+        }
+    }
+    
+    fn addr_string(&self) -> &str {
+        match self {
+            Connection::Client(client) => &client.addr_string,
+            Connection::Peer(peer) => &peer.addr_string,
+        }
+    }
+    
+    fn get_message_buffer_mut(&mut self) -> &mut MessageBuffer {
+        match self {
+            Connection::Client(client) => &mut client.message_buffer,
+            Connection::Peer(peer) => &mut peer.message_buffer,
+        }
+    }
+    
+    fn queue_outbound_message(&mut self, data: Vec<u8>) {
+        match self {
+            Connection::Client(client) => client.outbound_messages.push_back(data),
+            Connection::Peer(peer) => peer.queue_message(data),
+        }
+    }
+    
+    fn get_outbound_messages_mut(&mut self) -> &mut VecDeque<Vec<u8>> {
+        match self {
+            Connection::Client(client) => &mut client.outbound_messages,
+            Connection::Peer(peer) => &mut peer.outbound_messages,
+        }
+    }
+    
+    // Client-specific accessors
+    fn authenticated(&self) -> bool {
+        match self {
+            Connection::Client(client) => client.authenticated,
+            Connection::Peer(_) => false, // Peers don't use the same auth model
+        }
+    }
+    
+    fn set_authenticated(&mut self, auth: bool) {
+        if let Connection::Client(client) = self {
+            client.authenticated = auth;
+        }
+    }
+    
+    fn client_id(&self) -> &Option<EntityId> {
+        match self {
+            Connection::Client(client) => &client.client_id,
+            Connection::Peer(_) => &None,
+        }
+    }
+    
+    fn set_client_id(&mut self, id: Option<EntityId>) {
+        if let Connection::Client(client) = self {
+            client.client_id = id;
+        }
+    }
+    
+    fn notification_queue(&self) -> Option<&NotificationQueue> {
+        match self {
+            Connection::Client(client) => Some(&client.notification_queue),
+            Connection::Peer(_) => None,
+        }
+    }
+    
+    fn notification_configs_mut(&mut self) -> Option<&mut HashSet<NotifyConfig>> {
+        match self {
+            Connection::Client(client) => Some(&mut client.notification_configs),
+            Connection::Peer(_) => None,
+        }
+    }
+    
+    fn is_client(&self) -> bool {
+        matches!(self, Connection::Client(_))
+    }
+}
+
+/// Core service that handles both client and peer connections
 pub struct CoreService {
     config: CoreConfig,
     listener: MioTcpListener,
     poll: Poll,
-    connections: HashMap<Token, ClientConnection>,
+    connections: HashMap<Token, Connection>,
     next_token: usize,
     
     // Store and related components (replacing StoreService)
@@ -192,13 +280,18 @@ pub struct CoreService {
     permission_cache: Cache,
     cel_executor: CelExecutor,
     
-    // Handles to other services
-    peer_handle: Option<crate::peers::PeerHandle>,
+    // Peer management
+    peer_manager: PeerManager,
+    
+    // Handles to other services  
     snapshot_handle: Option<crate::snapshot::SnapshotHandle>,
     wal_handle: Option<crate::wal::WalHandle>,
     
     // Channel for receiving requests from other services
     request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>,
+    
+    // Channel for sending requests to other services
+    request_sender: Sender<(CoreRequest, Sender<CoreResponse>)>,
     
     // Queue for fire-and-forget commands
     command_queue: Arc<SegQueue<CoreCommand>>,
@@ -209,19 +302,21 @@ const MISC_INTERVAL_MS: u64 = 10;
 const HEARTBEAT_INTERVAL_SECS: u64 = 1;
 
 impl CoreService {
-    /// Create a new core service
+    /// Create a new core service with peer configuration
     pub fn new(
-        config: CoreConfig, 
+        config: CoreConfig,
+        peer_config: crate::peers::PeerConfig,
         request_receiver: Receiver<(CoreRequest, Sender<CoreResponse>)>,
-        command_queue: Arc<SegQueue<CoreCommand>>
+        command_queue: Arc<SegQueue<CoreCommand>>,
+        request_sender: Sender<(CoreRequest, Sender<CoreResponse>)>
     ) -> Result<Self> {
-        let addr = format!("0.0.0.0:{}", config.client_port).parse()?;
+        let addr = format!("0.0.0.0:{}", config.port).parse()?;
         let mut listener = MioTcpListener::bind(addr)?;
         let poll = Poll::new()?;
         
         poll.registry().register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
         
-        info!(bind_address = %addr, "Core service TCP server initialized");
+        info!(bind_address = %addr, "Core service unified TCP server initialized");
         
         // Initialize store with snowflake
         let snowflake = Snowflake::new(); // TODO: configure these properly
@@ -244,16 +339,17 @@ impl CoreService {
             store,
             permission_cache,
             cel_executor,
-            peer_handle: None,
+            peer_manager: PeerManager::new(peer_config),
             snapshot_handle: None,
             wal_handle: None,
             request_receiver,
+            request_sender,
             command_queue,
         })
     }
 
     /// Spawn the core service in its own thread and return a handle
-    pub fn spawn(config: CoreConfig) -> Result<CoreHandle> {
+    pub fn spawn(config: CoreConfig, peer_config: crate::peers::PeerConfig) -> Result<CoreHandle> {
         let (request_sender, request_receiver) = unbounded();
         let command_queue = Arc::new(SegQueue::new());
         
@@ -264,8 +360,9 @@ impl CoreService {
         
         // Spawn the main core service thread (I/O event loop)
         let command_queue_for_service = command_queue.clone();
+        let request_sender_for_service = request_sender.clone();
         thread::spawn(move || {
-            let mut service = match Self::new(config, request_receiver, command_queue_for_service) {
+            let mut service = match Self::new(config, peer_config, request_receiver, command_queue_for_service, request_sender_for_service) {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to create core service: {}", e);
@@ -376,6 +473,9 @@ impl CoreService {
             // Process any pending write requests from the store
             self.process_write_requests()?;
             
+            // Handle peer management operations
+            self.handle_peer_operations()?;
+            
             // Poll for OS events - rely on OS notifications
             self.poll.poll(&mut events, None)?;
             
@@ -388,7 +488,7 @@ impl CoreService {
                         }
                     }
                     token => {
-                        self.handle_client_event(token, event.is_readable(), event.is_writable())?;
+                        self.handle_connection_event(token, event.is_readable(), event.is_writable())?;
                     }
                 }
             }
@@ -420,10 +520,17 @@ impl CoreService {
                 self.disconnect_all_clients();
                 CoreResponse::Unit
             }
-            CoreRequest::SetHandles { peer_handle, snapshot_handle, wal_handle } => {
-                self.peer_handle = Some(peer_handle);
-                self.snapshot_handle = Some(snapshot_handle);
+            CoreRequest::SetHandles { snapshot_handle, wal_handle } => {
+                self.snapshot_handle = Some(snapshot_handle.clone());
                 self.wal_handle = Some(wal_handle);
+                
+                // Set handles for peer manager
+                self.peer_manager.set_snapshot_handle(snapshot_handle);
+                self.peer_manager.set_core_handle(CoreHandle {
+                    request_sender: self.request_sender.clone(),
+                    command_queue: self.command_queue.clone(),
+                });
+                
                 CoreResponse::Unit
             }
             CoreRequest::InitializeStore => {
@@ -489,7 +596,7 @@ impl CoreService {
                         message_buffer: MessageBuffer::new(),
                     };
                     
-                    self.connections.insert(token, connection);
+                    self.connections.insert(token, Connection::Client(connection));
                     debug!(client_addr = %addr, "TCP connection established");
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -504,7 +611,7 @@ impl CoreService {
         Ok(())
     }
     
-    fn handle_client_event(&mut self, token: Token, readable: bool, writable: bool) -> Result<()> {
+    fn handle_connection_event(&mut self, token: Token, readable: bool, writable: bool) -> Result<()> {
         if !self.connections.contains_key(&token) {
             return Ok(());
         }
@@ -512,41 +619,82 @@ impl CoreService {
         let mut should_remove = false;
         let mut messages_processed = false;
         
+        // Determine connection type and handle appropriately
+        let is_client = self.connections.get(&token).map(|c| c.is_client()).unwrap_or(false);
+        
         if readable {
-            match self.handle_client_read(token) {
-                Ok(false) => should_remove = true,
-                Err(e) => {
-                    if let Some(connection) = self.connections.get(&token) {
-                        error!(
-                            client_addr = %connection.addr_string,
-                            error = %e,
-                            "Error reading from client"
-                        );
+            if is_client {
+                match self.handle_client_read(token) {
+                    Ok(false) => should_remove = true,
+                    Err(e) => {
+                        if let Some(connection) = self.connections.get(&token) {
+                            error!(
+                                client_addr = %connection.addr_string(),
+                                error = %e,
+                                "Error reading from client"
+                            );
+                        }
+                        should_remove = true;
                     }
-                    should_remove = true;
+                    Ok(true) => {
+                        messages_processed = true;
+                    }
                 }
-                Ok(true) => {
-                    messages_processed = true;
+            } else {
+                // Handle peer read
+                match self.handle_peer_read(token) {
+                    Ok(false) => should_remove = true,
+                    Err(e) => {
+                        if let Some(connection) = self.connections.get(&token) {
+                            error!(
+                                peer_addr = %connection.addr_string(),
+                                error = %e,
+                                "Error reading from peer"
+                            );
+                        }
+                        should_remove = true;
+                    }
+                    Ok(true) => {
+                        messages_processed = true;
+                    }
                 }
             }
         }
         
         // If we processed messages or if writable event occurred, try to write
         if (writable || messages_processed) && !should_remove {
-            if let Err(e) = self.handle_client_write(token) {
-                if let Some(connection) = self.connections.get(&token) {
-                    error!(
-                        client_addr = %connection.addr_string,
-                        error = %e,
-                        "Error writing to client"
-                    );
+            if is_client {
+                if let Err(e) = self.handle_client_write(token) {
+                    if let Some(connection) = self.connections.get(&token) {
+                        error!(
+                            client_addr = %connection.addr_string(),
+                            error = %e,
+                            "Error writing to client"
+                        );
+                    }
+                    should_remove = true;
                 }
-                should_remove = true;
+            } else {
+                // Handle peer write
+                if let Err(e) = self.handle_peer_write(token) {
+                    if let Some(connection) = self.connections.get(&token) {
+                        error!(
+                            peer_addr = %connection.addr_string(),
+                            error = %e,
+                            "Error writing to peer"
+                        );
+                    }
+                    should_remove = true;
+                }
             }
         }
         
         if should_remove {
-            self.remove_client(token);
+            if is_client {
+                self.remove_client(token);
+            } else {
+                self.remove_peer_connection(token);
+            }
         }
         
         Ok(())
@@ -561,7 +709,7 @@ impl CoreService {
             let mut read_buffer = [0u8; 8192]; // 8KB read buffer
             
             loop {
-                match connection.stream.read(&mut read_buffer) {
+                match connection.get_stream_mut().read(&mut read_buffer) {
                     Ok(0) => {
                         // Connection closed by client
                         should_close = true;
@@ -569,43 +717,43 @@ impl CoreService {
                     }
                     Ok(bytes_read) => {
                         debug!(
-                            client_addr = %connection.addr_string,
+                            client_addr = %connection.addr_string(),
                             bytes_read = bytes_read,
                             "Read data from TCP client"
                         );
                         
                         // Add data to buffer
-                        connection.message_buffer.add_data(&read_buffer[..bytes_read]);
+                        connection.get_message_buffer_mut().add_data(&read_buffer[..bytes_read]);
                         
                         // Try to decode messages from buffer
-                        while let Some(protocol_message) = connection.message_buffer.try_decode()? {
+                        while let Some(protocol_message) = connection.get_message_buffer_mut().try_decode()? {
                             match protocol_message {
                                 ProtocolMessage::Store(store_msg) => {
                                     messages_to_process.push(store_msg);
                                 }
                                 ProtocolMessage::Error { id: _, message } => {
                                     error!(
-                                        client_addr = %connection.addr_string,
+                                        client_addr = %connection.addr_string(),
                                         error = %message,
                                         "Received error message from client"
                                     );
                                 }
                                 _ => {
                                     warn!(
-                                        client_addr = %connection.addr_string,
+                                        client_addr = %connection.addr_string(),
                                         "Received unexpected message type from client"
                                     );
                                 }
                             }
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // No more data available
                         break;
                     }
                     Err(e) => {
                         error!(
-                            client_addr = %connection.addr_string,
+                            client_addr = %connection.addr_string(),
                             error = %e,
                             "TCP read error"
                         );
@@ -624,11 +772,11 @@ impl CoreService {
                 Ok(response_bytes) => {
                     if let Some(conn) = self.connections.get_mut(&token) {
                         debug!(
-                            client_addr = %conn.addr_string,
+                            client_addr = %conn.addr_string(),
                             message_length = response_bytes.len(),
                             "Queueing response message"
                         );
-                        conn.outbound_messages.push_back(response_bytes);
+                        conn.queue_outbound_message(response_bytes);
                     }
                 }
                 Err(e) => {
@@ -642,29 +790,29 @@ impl CoreService {
     
     fn handle_client_write(&mut self, token: Token) -> Result<()> {
         if let Some(connection) = self.connections.get_mut(&token) {
-            while let Some(message_bytes) = connection.outbound_messages.pop_front() {
-                match connection.stream.write(&message_bytes) {
+            while let Some(message_bytes) = connection.get_outbound_messages_mut().pop_front() {
+                match connection.get_stream_mut().write(&message_bytes) {
                     Ok(bytes_written) => {
                         if bytes_written < message_bytes.len() {
                             // Partial write - put remaining bytes back
                             let remaining = message_bytes[bytes_written..].to_vec();
-                            connection.outbound_messages.push_front(remaining);
+                            connection.get_outbound_messages_mut().push_front(remaining);
                             break;
                         }
                         debug!(
-                            client_addr = %connection.addr_string,
+                            client_addr = %connection.addr_string(),
                             bytes_written = bytes_written,
                             "Sent message to TCP client"
                         );
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // Put the message back and try again later
-                        connection.outbound_messages.push_front(message_bytes);
+                        connection.get_outbound_messages_mut().push_front(message_bytes);
                         break;
                     }
                     Err(e) => {
                         error!(
-                            client_addr = %connection.addr_string,
+                            client_addr = %connection.addr_string(),
                             error = %e,
                             "Failed to write to TCP client"
                         );
@@ -678,11 +826,13 @@ impl CoreService {
     
     fn remove_client(&mut self, token: Token) {
         if let Some(connection) = self.connections.remove(&token) {
-            info!(client_addr = %connection.addr_string, "Removing client connection");
+            info!(client_addr = %connection.addr_string(), "Removing client connection");
             
-            // Unregister all notifications for this client
-            for config in &connection.notification_configs {
-                self.store.unregister_notification(config, &connection.notification_queue);
+            // Only unregister notifications for client connections
+            if let Connection::Client(client_conn) = connection {
+                for config in &client_conn.notification_configs {
+                    self.store.unregister_notification(config, &client_conn.notification_queue);
+                }
             }
         }
     }
@@ -690,26 +840,28 @@ impl CoreService {
     fn process_notifications(&mut self) -> Result<()> {
         // Check each client for new notifications and queue them for sending
         for connection in self.connections.values_mut() {
-            // Pop notifications from the queue and add to pending
-            while let Some(notification) = connection.notification_queue.pop() {
-                connection.pending_notifications.push_back(notification);
-            }
-            
-            // Send pending notifications as messages
-            while let Some(notification) = connection.pending_notifications.pop_front() {
-                let notification_message = StoreMessage::Notification { notification };
-                let protocol_message = ProtocolMessage::Store(notification_message);
+            if let Connection::Client(client_conn) = connection {
+                // Pop notifications from the queue and add to pending
+                while let Some(notification) = client_conn.notification_queue.pop() {
+                    client_conn.pending_notifications.push_back(notification);
+                }
                 
-                match ProtocolCodec::encode(&protocol_message) {
-                    Ok(message_bytes) => {
-                        connection.outbound_messages.push_back(message_bytes);
-                    }
-                    Err(e) => {
-                        error!(
-                            client_addr = %connection.addr_string,
-                            error = %e,
-                            "Failed to encode notification message"
-                        );
+                // Send pending notifications as messages
+                while let Some(notification) = client_conn.pending_notifications.pop_front() {
+                    let notification_message = StoreMessage::Notification { notification };
+                    let protocol_message = ProtocolMessage::Store(notification_message);
+                    
+                    match ProtocolCodec::encode(&protocol_message) {
+                        Ok(message_bytes) => {
+                            client_conn.outbound_messages.push_back(message_bytes);
+                        }
+                        Err(e) => {
+                            error!(
+                                client_addr = %client_conn.addr_string,
+                                error = %e,
+                                "Failed to encode notification message"
+                            );
+                        }
                     }
                 }
             }
@@ -721,7 +873,7 @@ impl CoreService {
         // Get connection info
         let (addr_string, authenticated, client_id) = {
             if let Some(connection) = self.connections.get(&token) {
-                (connection.addr_string.clone(), connection.authenticated, connection.client_id.clone())
+                (connection.addr_string().to_string(), connection.authenticated(), connection.client_id().clone())
             } else {
                 return Err(anyhow::anyhow!("Client connection not found"));
             }
@@ -739,8 +891,8 @@ impl CoreService {
                     Ok(subject_id) => {
                         // Update connection state
                         if let Some(connection) = self.connections.get_mut(&token) {
-                            connection.authenticated = true;
-                            connection.client_id = Some(subject_id.clone());
+                            connection.set_authenticated(true);
+                            connection.set_client_id(Some(subject_id.clone()));
                         }
                         
                         info!(
@@ -1047,9 +1199,8 @@ impl CoreService {
             }
             
             // Send to peers for synchronization
-            if let Some(peer_handle) = &self.peer_handle {
-                peer_handle.send_sync_message(requests_to_write);
-            }
+            // TODO: Implement peer synchronization
+            // self.peer_manager.send_sync_message(requests_to_write);
         }
         
         Ok(())
@@ -1057,11 +1208,90 @@ impl CoreService {
     
     /// Handle misc operations (fault tolerance, etc.)
     fn handle_misc_operations(&mut self) -> Result<()> {
-        if let Some(peer_handle) = &self.peer_handle {
-            let (is_leader, _) = peer_handle.get_leadership_info();
+        // TODO: Implement leadership check via peer_manager
+        // if let (is_leader, _) = self.peer_manager.get_leadership_info() {
+        //     if is_leader {
+        //         self.handle_fault_tolerance_management()?;
+        //     }
+        // }
+        
+        Ok(())
+    }
+    
+    /// Handle peer management operations
+    fn handle_peer_operations(&mut self) -> Result<()> {
+        // Get list of existing peer connections
+        let existing_peer_connections: Vec<String> = self.connections
+            .values()
+            .filter_map(|conn| {
+                if let Connection::Peer(peer_conn) = conn {
+                    Some(peer_conn.addr_string.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Handle periodic peer operations (leadership, reconnection, etc.)
+        let (connection_results, disconnected_peers) = self.peer_manager
+            .handle_periodic_operations(&existing_peer_connections);
+        
+        // Process new outbound connections
+        for result in connection_results {
+            match result {
+                crate::peer_manager::ConnectionResult::OutboundSuccess { peer_addr, stream } => {
+                    // Register the new peer connection
+                    let token = Token(self.next_token);
+                    self.next_token += 1;
+                    
+                    let peer_connection = self.peer_manager.handle_new_peer_connection(peer_addr.clone(), stream);
+                    self.connections.insert(token, Connection::Peer(peer_connection));
+                    
+                    // Register with poll for events
+                    if let Some(Connection::Peer(peer_conn)) = self.connections.get_mut(&token) {
+                        self.poll.registry().register(
+                            peer_conn.get_stream_mut(),
+                            token,
+                            Interest::READABLE | Interest::WRITABLE
+                        )?;
+                    }
+                    
+                    info!(
+                        peer_addr = %peer_addr,
+                        token = ?token,
+                        "New outbound peer connection established"
+                    );
+                }
+                crate::peer_manager::ConnectionResult::OutboundFailure { peer_addr, error } => {
+                    warn!(
+                        peer_addr = %peer_addr,
+                        error = %error,
+                        "Failed to establish outbound peer connection"
+                    );
+                }
+            }
+        }
+        
+        // Handle disconnected peers
+        for peer_addr in disconnected_peers {
+            // Find and remove the connection
+            let mut token_to_remove = None;
+            for (token, connection) in &self.connections {
+                if let Connection::Peer(peer_conn) = connection {
+                    if peer_conn.addr_string == peer_addr {
+                        token_to_remove = Some(*token);
+                        break;
+                    }
+                }
+            }
             
-            if is_leader {
-                self.handle_fault_tolerance_management()?;
+            if let Some(token) = token_to_remove {
+                self.connections.remove(&token);
+                info!(
+                    peer_addr = %peer_addr,
+                    token = ?token,
+                    "Peer connection removed"
+                );
             }
         }
         
@@ -1293,13 +1523,13 @@ impl CoreService {
     fn register_notification_for_client(&mut self, token: Token, config: NotifyConfig) -> Result<()> {
         if let Some(connection) = self.connections.get_mut(&token) {
             // Register the notification with the store
-            self.store.register_notification(config.clone(), connection.notification_queue.clone())?;
+            self.store.register_notification(config.clone(), connection.notification_queue().unwrap().clone())?;
             
             // Track this config for the client
-            connection.notification_configs.insert(config);
+            connection.notification_configs_mut().unwrap().insert(config);
             
             debug!(
-                client_addr = %connection.addr_string,
+                client_addr = %connection.addr_string(),
                 "Registered notification configuration for client"
             );
             
@@ -1313,13 +1543,13 @@ impl CoreService {
     fn unregister_notification_for_client(&mut self, token: Token, config: NotifyConfig) -> bool {
         if let Some(connection) = self.connections.get_mut(&token) {
             // Unregister from store
-            let unregistered = self.store.unregister_notification(&config, &connection.notification_queue);
+            let unregistered = self.store.unregister_notification(&config, connection.notification_queue().unwrap());
             
             // Remove from client's config set
-            connection.notification_configs.remove(&config);
+            connection.notification_configs_mut().unwrap().remove(&config);
             
             debug!(
-                client_addr = %connection.addr_string,
+                client_addr = %connection.addr_string(),
                 unregistered = unregistered,
                 "Unregistered notification configuration for client"
             );
@@ -1327,6 +1557,81 @@ impl CoreService {
             unregistered
         } else {
             false
+        }
+    }
+    
+    /// Handle reading from peer connection
+    fn handle_peer_read(&mut self, token: Token) -> Result<bool> {
+        let mut messages_to_process = Vec::new();
+        let mut should_close = false;
+        let mut peer_addr = String::new();
+        
+        if let Some(Connection::Peer(peer_conn)) = self.connections.get_mut(&token) {
+            peer_addr = peer_conn.addr_string.clone();
+            match self.peer_manager.handle_peer_read(peer_conn) {
+                Ok(peer_messages) => {
+                    for message in peer_messages {
+                        messages_to_process.push(message);
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        peer_addr = %peer_conn.addr_string,
+                        error = %e,
+                        "Failed to read from peer"
+                    );
+                    should_close = true;
+                }
+            }
+        }
+        
+        // Process peer messages
+        for message in messages_to_process {
+            let responses = self.peer_manager.handle_peer_message(message, &peer_addr);
+            
+            // Queue responses back to peers
+            for (target_peer, response_data) in responses {
+                if target_peer == peer_addr {
+                    // Queue message for this peer
+                    if let Some(Connection::Peer(peer_conn)) = self.connections.get_mut(&token) {
+                        peer_conn.queue_message(response_data);
+                    }
+                } else {
+                    // Find and queue message for other peer
+                    for connection in self.connections.values_mut() {
+                        if let Connection::Peer(other_peer) = connection {
+                            if other_peer.addr_string == target_peer {
+                                other_peer.queue_message(response_data.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(!should_close)
+    }
+    
+    /// Handle writing to peer connection
+    fn handle_peer_write(&mut self, token: Token) -> Result<()> {
+        if let Some(Connection::Peer(peer_conn)) = self.connections.get_mut(&token) {
+            self.peer_manager.handle_peer_write(peer_conn)?;
+        }
+        Ok(())
+    }
+    
+    /// Remove peer connection and notify peer manager
+    fn remove_peer_connection(&mut self, token: Token) {
+        if let Some(Connection::Peer(peer_conn)) = self.connections.remove(&token) {
+            info!(
+                peer_addr = %peer_conn.addr_string,
+                token = ?token,
+                "Removing peer connection"
+            );
+            
+            // Notify peer manager about disconnection
+            self.peer_manager.handle_peer_disconnection(&peer_conn.addr_string);
         }
     }
 }

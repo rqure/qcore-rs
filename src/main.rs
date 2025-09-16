@@ -1,5 +1,6 @@
 mod wal;
 mod peers;
+mod peer_manager;
 mod snapshot;
 mod files;
 mod core;
@@ -12,7 +13,7 @@ use tracing::error;
 
 use crate::{
     core::{CoreConfig, CoreService},
-    peers::{PeerConfig, PeerService},
+    peers::PeerConfig,
     snapshot::{SnapshotConfig, SnapshotService},
     wal::{WalConfig, WalService}
 };
@@ -95,19 +96,15 @@ fn main() -> Result<()> {
         snapshot_wal_interval: config.snapshot_wal_interval,
     });
     
-    let peer_handle = PeerService::spawn(PeerConfig::from(&config));
-    
-    // Create the core service (runs in its own thread)
-    let core_handle = CoreService::spawn(CoreConfig::from(&config))?;
+    // Create the core service (runs in its own thread) with peer configuration
+    let core_handle = CoreService::spawn(CoreConfig::from(&config), PeerConfig::from(&config))?;
     
     // Set up dependencies
     wal_handle.set_snapshot_handle(snapshot_handle.clone());
     wal_handle.set_core_handle(core_handle.clone());
-    peer_handle.set_snapshot_handle(snapshot_handle.clone());
-    peer_handle.set_core_handle(core_handle.clone());
     
     // Set handles for the core service
-    core_handle.set_handles(peer_handle, snapshot_handle.clone(), wal_handle)?;
+    core_handle.set_handles(snapshot_handle.clone(), wal_handle)?;
     
     // Initialize store from snapshots and WAL replay
     core_handle.initialize_store()?;
