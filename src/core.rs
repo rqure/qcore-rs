@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
+use std::time::Duration;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
@@ -172,7 +173,7 @@ impl CoreService {
             loop {                
                 // Poll for I/O events with no timeout for maximum responsiveness
                 // Periodic operations are now handled by the self-connecting periodic client
-                service.poll.poll(&mut events, None);
+                service.poll.poll(&mut events, Some(Duration::from_millis(100))).unwrap();
                 
                 // Handle all mio events
                 for event in events.iter() {
@@ -185,6 +186,12 @@ impl CoreService {
                         token => {
                             
                         }
+                    }
+                }
+
+                while let Ok(request) = receiver.try_recv() {
+                    match request {
+                        CoreCommand::Perform { requests } => {}
                     }
                 }
 

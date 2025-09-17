@@ -8,7 +8,6 @@ use std::path::PathBuf;
 
 use crate::core::CoreHandle;
 use crate::files::{FileConfig, FileInfo, FileManager, FileManagerTrait};
-use crate::snapshot::SnapshotHandle;
 
 /// Configuration for WAL manager operations
 #[derive(Debug, Clone)]
