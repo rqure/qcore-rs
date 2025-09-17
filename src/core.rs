@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
@@ -433,10 +433,15 @@ impl CoreService {
     
     /// Handle a store message from a client
     fn handle_store_message(&mut self, token: Token, message: StoreMessage) -> Result<()> {
-        let connection = self.connections.get(&token)
-            .ok_or_else(|| anyhow::anyhow!("Connection not found for token {:?}", token))?;
+        let start_time = Instant::now();
         
-        debug!("Processing store message from {}: {:?}", connection.addr_string, message);
+        let addr_string = {
+            let connection = self.connections.get(&token)
+                .ok_or_else(|| anyhow::anyhow!("Connection not found for token {:?}", token))?;
+            connection.addr_string.clone()
+        };
+        
+        debug!("Processing store message from {}: {:?}", addr_string, message);
         
         let response = match &message {
             StoreMessage::Authenticate { id, subject_name, credential } => {
@@ -444,7 +449,11 @@ impl CoreService {
             }
             _ => {
                 // All other messages require authentication
-                if !connection.authenticated {
+                let is_authenticated = self.connections.get(&token)
+                    .map(|conn| conn.authenticated)
+                    .unwrap_or(false);
+                    
+                if !is_authenticated {
                     StoreMessage::Error {
                         id: self.extract_message_id(&message).unwrap_or_else(|| "unknown".to_string()),
                         error: "Authentication required".to_string(),
@@ -454,6 +463,9 @@ impl CoreService {
                 }
             }
         };
+        
+        let processing_time = start_time.elapsed();
+        debug!("Message processed in {:?} for connection {}", processing_time, addr_string);
         
         self.send_response(token, response)?;
         Ok(())
