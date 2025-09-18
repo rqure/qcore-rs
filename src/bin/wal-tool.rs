@@ -552,7 +552,7 @@ impl WalReader {
         };
 
         match request {
-            Request::Read { entity_id, field_type, value, writer_id, .. } => {
+            Request::Read { entity_id, field_types: field_type, value, writer_id, .. } => {
                 WalReadWriteEntry {
                     timestamp: timestamp_str,
                     operation: "READ".to_string(),
@@ -566,7 +566,7 @@ impl WalReader {
                     location,
                 }
             },
-            Request::Write { entity_id, field_type, value, push_condition, adjust_behavior, writer_id, originator, .. } => {
+            Request::Write { entity_id, field_types: field_type, value, push_condition, adjust_behavior, writer_id, originator, .. } => {
                 WalReadWriteEntry {
                     timestamp: timestamp_str,
                     operation: "WRITE".to_string(),

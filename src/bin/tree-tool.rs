@@ -134,7 +134,7 @@ fn build_tree(
     // Check depth limit
     if max_depth > 0 && current_depth >= max_depth {
         return Ok(TreeNode {
-            entity_id: entity_id.clone(),
+            entity_id: entity_id,
             entity_type: "...".to_string(),
             name: "...".to_string(),
             children: vec![],
@@ -179,14 +179,14 @@ fn build_tree(
 }
 
 /// Get the entity type for a given entity ID
-fn get_entity_type(_store: &mut StoreProxy, entity_id: &EntityId) -> Result<String> {
+fn get_entity_type(_store: &mut StoreProxy, entity_id: EntityId) -> Result<String> {
     // The entity type is stored in the entity ID itself
     Ok(entity_id.get_type().as_ref().to_string())
 }
 
 /// Get the name of an entity
-fn get_entity_name(store: &mut StoreProxy, entity_id: &EntityId) -> Result<String> {
-    let results = store.perform(vec![qlib_rs::sread!(entity_id.clone(), ft::name())])?;
+fn get_entity_name(store: &mut StoreProxy, entity_id: EntityId) -> Result<String> {
+    let results = store.perform(vec![qlib_rs::sread!(entity_id, ft::name())])?;
     
     if let Some(request) = results.first() {
         if let Some(Value::String(name)) = request.value() {
@@ -198,8 +198,8 @@ fn get_entity_name(store: &mut StoreProxy, entity_id: &EntityId) -> Result<Strin
 }
 
 /// Get the children of an entity
-fn get_entity_children(store: &mut StoreProxy, entity_id: &EntityId) -> Result<Vec<EntityId>> {
-    let results = store.perform(vec![qlib_rs::sread!(entity_id.clone(), ft::children())])?;
+fn get_entity_children(store: &mut StoreProxy, entity_id: EntityId) -> Result<Vec<EntityId>> {
+    let results = store.perform(vec![qlib_rs::sread!(entity_id, ft::children())])?;
 
     if let Some(request) = results.first() {
         if let Some(Value::EntityList(children)) = request.value() {

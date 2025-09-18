@@ -218,8 +218,8 @@ impl CoreService {
         for request in requests {
             // Extract entity_id and field_type from the request
             let authorization_needed = match &request {
-                Request::Read { entity_id, field_type, .. } => Some((entity_id, field_type)),
-                Request::Write { entity_id, field_type, .. } => Some((entity_id, field_type)),
+                Request::Read { entity_id, field_types: field_type, .. } => Some((entity_id, field_type)),
+                Request::Write { entity_id, field_types: field_type, .. } => Some((entity_id, field_type)),
                 Request::Create { .. } => None, // No field-level authorization for creation
                 Request::Delete { .. } => None, // No field-level authorization for deletion
                 Request::SchemaUpdate { .. } => None, // No field-level authorization for schema updates

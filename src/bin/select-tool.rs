@@ -362,7 +362,7 @@ fn main() -> Result<()> {
 /// Execute the query against the store
 fn execute_query(
     store: &mut StoreProxy,
-    entity_type: &EntityType,
+    entity_type: EntityType,
     filter: Option<&str>,
     exact: bool,
     limit: usize,
@@ -443,14 +443,14 @@ fn fetch_entity_data(
         let mut reqs = Vec::new();
 
         for field in fields {
-            reqs.push(sread!(entity_id.clone(), FieldType::from(field.as_str())));
+            reqs.push(sread!(entity_id, FieldType::from(field.as_str())));
         }
 
         match store.perform(reqs) {
             Ok(res) => {
                 fields_fetched += fields.len();
                 results.push(EntityDisplay {
-                    entity_id: entity_id.clone(),
+                    entity_id: entity_id,
                     entity_type: entity_id.get_type().to_string(),
                     fields: res.into_iter().enumerate().map(|(i, r)| {
                         let field_name = fields[i].clone();

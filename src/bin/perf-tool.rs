@@ -244,7 +244,7 @@ fn perform_test_operation(
     config: &Config,
     client_id: usize,
     test_entities: &[EntityId],
-    test_entity_id: &EntityId,
+    test_entity_id: EntityId,
 ) -> Result<()> {
     match config.test_type {
         TestType::ReadOnly => {
@@ -256,9 +256,9 @@ fn perform_test_operation(
         TestType::WriteOnly => {
             // Use the existing TestEntity from the topology for all write operations
             store.perform(vec![
-                swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
-                swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
-                swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(fastrand::bool()))),
+                swrite!(test_entity_id, FieldType::from("TestValue"), sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
+                swrite!(test_entity_id, FieldType::from("TestString"), sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
+                swrite!(test_entity_id, FieldType::from("TestFlag"), Some(Value::Bool(fastrand::bool()))),
             ])?;
         }
         TestType::Mixed => {
@@ -271,8 +271,8 @@ fn perform_test_operation(
             } else if client_id % 3 == 1 {
                 // Write operation to test entity only
                 store.perform(vec![
-                    swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("MixedTest_Client_{}", client_id))),
-                    swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(client_id as i64)),
+                    swrite!(test_entity_id, FieldType::from("TestString"), sstr!(format!("MixedTest_Client_{}", client_id))),
+                    swrite!(test_entity_id, FieldType::from("TestValue"), sint!(client_id as i64)),
                 ])?;
             } else {
                 // Search operation
@@ -283,9 +283,9 @@ fn perform_test_operation(
         TestType::Create => {
             // Update the existing test entity instead of creating new ones
             store.perform(vec![
-                swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
-                swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(fastrand::i64(..))),
-                swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(true))),
+                swrite!(test_entity_id, FieldType::from("TestString"), sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
+                swrite!(test_entity_id, FieldType::from("TestValue"), sint!(fastrand::i64(..))),
+                swrite!(test_entity_id, FieldType::from("TestFlag"), Some(Value::Bool(true))),
             ])?;
         }
         TestType::Search => {
@@ -300,10 +300,10 @@ fn perform_test_operation(
             // Multiple writes to the existing test entity
             let mut requests = Vec::new();
             for i in 0..10 {
-                requests.push(swrite!(test_entity_id.clone(), FieldType::from("TestString"), sstr!(format!("BulkTest_{}_{}", client_id, i))));
-                requests.push(swrite!(test_entity_id.clone(), FieldType::from("TestValue"), sint!(client_id as i64 * 10 + i as i64)));
+                requests.push(swrite!(test_entity_id, FieldType::from("TestString"), sstr!(format!("BulkTest_{}_{}", client_id, i))));
+                requests.push(swrite!(test_entity_id, FieldType::from("TestValue"), sint!(client_id as i64 * 10 + i as i64)));
                 if i % 2 == 0 {
-                    requests.push(swrite!(test_entity_id.clone(), FieldType::from("TestFlag"), Some(Value::Bool(i % 4 == 0))));
+                    requests.push(swrite!(test_entity_id, FieldType::from("TestFlag"), Some(Value::Bool(i % 4 == 0))));
                 }
             }
             store.perform(requests)?;
@@ -372,7 +372,7 @@ fn main() -> Result<()> {
         for i in 0..warmup_config.clients {
             let warmup_config_clone = warmup_config.clone();
             let test_entities_clone = test_entities.clone();
-            let test_entity_id_clone = test_entity_id.clone();
+            let test_entity_id_clone = test_entity_id;
             let core_url = config.core_urls[i % config.core_urls.len()].clone();
             
             let handle = thread::spawn(move || {
@@ -406,7 +406,7 @@ fn main() -> Result<()> {
     for i in 0..config.clients {
         let config_clone = config.clone();
         let test_entities_clone = test_entities.clone();
-        let test_entity_id_clone = test_entity_id.clone();
+        let test_entity_id_clone = test_entity_id;
         let core_url = config.core_urls[i % config.core_urls.len()].clone();
         
         let handle = thread::spawn(move || {
