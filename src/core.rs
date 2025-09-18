@@ -128,7 +128,7 @@ impl CoreService {
         
         info!(bind_address = %addr, "Core service unified TCP server initialized");
         
-        let mut store = Store::new(Snowflake::new());
+        let mut store = Store::new();
         
         let (permission_cache, _notification_queue) = Cache::new(
             &mut store,
