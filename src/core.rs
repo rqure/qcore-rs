@@ -744,6 +744,58 @@ impl CoreService {
                 }
             }
             
+            StoreMessage::GetEntityType { id, name } => {
+                match self.store.get_entity_type(&name) {
+                    Ok(entity_type) => Ok(StoreMessage::GetEntityTypeResponse {
+                        id,
+                        response: Ok(entity_type),
+                    }),
+                    Err(e) => Ok(StoreMessage::GetEntityTypeResponse {
+                        id,
+                        response: Err(format!("{:?}", e)),
+                    }),
+                }
+            }
+            
+            StoreMessage::ResolveEntityType { id, entity_type } => {
+                match self.store.resolve_entity_type(entity_type) {
+                    Ok(name) => Ok(StoreMessage::ResolveEntityTypeResponse {
+                        id,
+                        response: Ok(name),
+                    }),
+                    Err(e) => Ok(StoreMessage::ResolveEntityTypeResponse {
+                        id,
+                        response: Err(format!("{:?}", e)),
+                    }),
+                }
+            }
+            
+            StoreMessage::GetFieldType { id, name } => {
+                match self.store.get_field_type(&name) {
+                    Ok(field_type) => Ok(StoreMessage::GetFieldTypeResponse {
+                        id,
+                        response: Ok(field_type),
+                    }),
+                    Err(e) => Ok(StoreMessage::GetFieldTypeResponse {
+                        id,
+                        response: Err(format!("{:?}", e)),
+                    }),
+                }
+            }
+            
+            StoreMessage::ResolveFieldType { id, field_type } => {
+                match self.store.resolve_field_type(field_type) {
+                    Ok(name) => Ok(StoreMessage::ResolveFieldTypeResponse {
+                        id,
+                        response: Ok(name),
+                    }),
+                    Err(e) => Ok(StoreMessage::ResolveFieldTypeResponse {
+                        id,
+                        response: Err(format!("{:?}", e)),
+                    }),
+                }
+            }
+            
             _ => {
                 Ok(StoreMessage::Error {
                     id: self.extract_message_id(&message).unwrap_or_else(|| "unknown".to_string()),
