@@ -108,7 +108,7 @@ pub struct CoreService {
     
     // Store and related components (replacing StoreService)
     store: Store,
-    permission_cache: Cache,
+    permission_cache: Option<Cache>,
     cel_executor: CelExecutor,
     
     // Handles to other services  
@@ -119,6 +119,66 @@ pub struct CoreService {
 const LISTENER_TOKEN: Token = Token(0);
 
 impl CoreService {
+    /// Attempt to create a permission cache with the current store state
+    fn create_permission_cache(&mut self) -> Option<Cache> {
+        // Get values needed for cache creation
+        let permission_entity_type = match self.store.get_entity_type(qlib_rs::et::PERMISSION) {
+            Ok(et) => et,
+            Err(e) => {
+                debug!("Failed to get permission entity type: {}", e);
+                return None;
+            }
+        };
+        
+        let resource_type_field = match self.store.get_field_type(qlib_rs::ft::RESOURCE_TYPE) {
+            Ok(ft) => ft,
+            Err(e) => {
+                debug!("Failed to get resource type field: {}", e);
+                return None;
+            }
+        };
+        
+        let resource_field_field = match self.store.get_field_type(qlib_rs::ft::RESOURCE_FIELD) {
+            Ok(ft) => ft,
+            Err(e) => {
+                debug!("Failed to get resource field field: {}", e);
+                return None;
+            }
+        };
+        
+        let scope_field = match self.store.get_field_type(qlib_rs::ft::SCOPE) {
+            Ok(ft) => ft,
+            Err(e) => {
+                debug!("Failed to get scope field: {}", e);
+                return None;
+            }
+        };
+        
+        let condition_field = match self.store.get_field_type(qlib_rs::ft::CONDITION) {
+            Ok(ft) => ft,
+            Err(e) => {
+                debug!("Failed to get condition field: {}", e);
+                return None;
+            }
+        };
+        
+        match Cache::new(
+            &mut self.store,
+            permission_entity_type,
+            vec![resource_type_field, resource_field_field],
+            vec![scope_field, condition_field]
+        ) {
+            Ok((cache, _notification_queue)) => {
+                debug!("Successfully created permission cache");
+                Some(cache)
+            }
+            Err(e) => {
+                debug!("Failed to create permission cache: {}", e);
+                None
+            }
+        }
+    }
+
     /// Create a new core service with peer configuration
     pub fn new(
         config: CoreConfig,
@@ -131,35 +191,26 @@ impl CoreService {
         
         info!(bind_address = %addr, "Core service unified TCP server initialized");
         
-        let mut store = Store::new();
-        
-        // Get values needed for cache creation
-        let permission_entity_type = store.get_entity_type(qlib_rs::et::PERMISSION)?;
-        let resource_type_field = store.get_field_type(qlib_rs::ft::RESOURCE_TYPE)?;
-        let resource_field_field = store.get_field_type(qlib_rs::ft::RESOURCE_FIELD)?;
-        let scope_field = store.get_field_type(qlib_rs::ft::SCOPE)?;
-        let condition_field = store.get_field_type(qlib_rs::ft::CONDITION)?;
-        
-        let (permission_cache, _notification_queue) = Cache::new(
-            &mut store,
-            permission_entity_type,
-            vec![resource_type_field, resource_field_field],
-            vec![scope_field, condition_field]
-        ).map_err(|e| anyhow::anyhow!("Failed to create permission cache: {}", e))?;
+        let store = Store::new();
         let cel_executor = CelExecutor::new();
         
-        Ok(Self {
+        let mut service = Self {
             config,
             listener,
             poll,
             connections: HashMap::new(),
             next_token: 1,
             store,
-            permission_cache,
+            permission_cache: None,
             cel_executor,
             snapshot_handle: None,
             wal_handle: None,
-        })
+        };
+        
+        // Attempt to create permission cache
+        service.permission_cache = service.create_permission_cache();
+        
+        Ok(service)
     }
 
     /// Spawn the core service in its own thread and return a handle
@@ -237,10 +288,20 @@ impl CoreService {
             };
             
             if let Some((entity_id, field_types)) = authorization_needed {
+                // If we don't have a permission cache, skip authorization
+                let cache = match &self.permission_cache {
+                    Some(cache) => cache,
+                    None => {
+                        debug!("No permission cache available, skipping authorization check");
+                        authorized_requests.push(request);
+                        continue;
+                    }
+                };
+                
                 // For authorization, we check against the final field in the indirection chain
                 let (final_entity_id, final_field_type) = resolve_indirection(&self.store, *entity_id, field_types)?;
                 
-                let scope = get_scope(&self.store, &mut self.cel_executor, &self.permission_cache, client_id, final_entity_id, final_field_type)?;
+                let scope = get_scope(&self.store, &mut self.cel_executor, cache, client_id, final_entity_id, final_field_type)?;
                 
                 match scope {
                     AuthorizationScope::ReadOnly | AuthorizationScope::ReadWrite => {
@@ -738,6 +799,15 @@ impl CoreService {
             CoreCommand::RestoreSnapshot { snapshot } => {
                 debug!("Handling restore snapshot command");
                 self.store.restore_snapshot(snapshot);
+                
+                // Recreate the permission cache after restoring the snapshot
+                self.permission_cache = self.create_permission_cache();
+                
+                if self.permission_cache.is_some() {
+                    debug!("Permission cache recreated after snapshot restore");
+                } else {
+                    warn!("Failed to recreate permission cache after snapshot restore");
+                }
             }
             CoreCommand::SetSnapshotHandle { snapshot_handle } => {
                 debug!("Setting snapshot handle");
