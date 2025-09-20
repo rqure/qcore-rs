@@ -128,10 +128,10 @@ impl DisplayValue {
             Some(Value::Int(i)) => DisplayValue::Integer(*i),
             Some(Value::Float(f)) => DisplayValue::Float(*f),
             Some(Value::Bool(b)) => DisplayValue::Boolean(*b),
-            Some(Value::EntityReference(Some(entity_id))) => DisplayValue::EntityRef(entity_id.to_string()),
+            Some(Value::EntityReference(Some(entity_id))) => DisplayValue::EntityRef(format_entity_id(*entity_id)),
             Some(Value::EntityReference(None)) => DisplayValue::None,
             Some(Value::EntityList(list)) => {
-                DisplayValue::EntityList(list.iter().map(|e| e.to_string()).collect())
+                DisplayValue::EntityList(list.iter().map(|e| format_entity_id(*e)).collect())
             },
             Some(Value::Choice(choice)) => DisplayValue::Integer(*choice as i64),
             Some(Value::Timestamp(ts)) => {
@@ -153,6 +153,11 @@ struct EntityDisplay {
     entity_id: EntityId,
     entity_type: String,
     fields: HashMap<String, DisplayValue>,
+}
+
+/// Helper function to format EntityId for display
+fn format_entity_id(entity_id: EntityId) -> String {
+    format!("{}:{}", entity_id.extract_type().0, entity_id.extract_id())
 }
 
 /// Performance metrics for query execution
@@ -311,11 +316,12 @@ fn main() -> Result<()> {
     info!("Connected successfully");
 
     // Parse entity type
-    let entity_type = EntityType::from(config.entity_type.as_str());
+    let entity_type = store.get_entity_type(&config.entity_type)
+        .context("Failed to get entity type")?;
 
     // Execute the query
     let query_start = Instant::now();
-    let (results, pages_fetched) = execute_query(&mut store, &entity_type, config.filter.as_deref(), config.exact, config.limit, config.page_size)
+    let (results, pages_fetched) = execute_query(&mut store, entity_type, config.filter.as_deref(), config.exact, config.limit, config.page_size)
         .context("Failed to execute query")?;
     metrics.query_time = query_start.elapsed();
     metrics.entities_found = results.len();
@@ -324,7 +330,8 @@ fn main() -> Result<()> {
     info!("Found {} matching entities", results.len());
 
     // Parse fields to display
-    let fields_to_display = parse_fields(&config.fields);
+    let fields_to_display = parse_fields(&mut store, &config.fields)
+        .context("Failed to parse field types")?;
 
     // Fetch field values for the results
     let field_fetch_start = Instant::now();
@@ -374,7 +381,7 @@ fn execute_query(
     let mut pages_fetched = 0;
 
     info!(
-        entity_type = %entity_type.as_ref(),
+        entity_type = ?entity_type,
         filter = ?filter,
         exact = exact,
         "Executing query"
@@ -416,44 +423,62 @@ fn execute_query(
     Ok((results, pages_fetched))
 }
 
-/// Parse the fields parameter into a list of field names
-fn parse_fields(fields: &Option<String>) -> Vec<String> {
-    match fields {
+/// Parse the fields parameter into a list of field paths (Vec<FieldType> for each field)
+fn parse_fields(store: &mut StoreProxy, fields: &Option<String>) -> Result<Vec<(String, Vec<FieldType>)>> {
+    let field_names = match fields {
         Some(fields_str) => fields_str
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect(),
         None => vec!["Name".to_string()], // Default to Name field
+    };
+
+    let mut parsed_fields = Vec::new();
+    for field_name in field_names {
+        // Parse field indirection syntax (e.g., "Parent->Name")
+        let field_parts: Vec<&str> = field_name.split("->").collect();
+        let mut field_types = Vec::new();
+        
+        for part in field_parts {
+            let field_type = store.get_field_type(part)
+                .with_context(|| format!("Failed to get field type for '{}'", part))?;
+            field_types.push(field_type);
+        }
+        
+        parsed_fields.push((field_name, field_types));
     }
+    
+    Ok(parsed_fields)
 }
 
 /// Fetch field data for the given entities
 fn fetch_entity_data(
     store: &mut StoreProxy,
     entity_ids: &[EntityId],
-    fields: &[String],
+    fields: &[(String, Vec<FieldType>)],
 ) -> Result<(Vec<EntityDisplay>, usize)> {
     let mut results = Vec::new();
     let mut fields_fetched = 0;
 
 
     for entity_id in entity_ids {
-        debug!("Fetching data for entity: {}", entity_id);
+        debug!("Fetching data for entity: {:?}", entity_id);
         let mut reqs = Vec::new();
 
-        for field in fields {
-            reqs.push(sread!(entity_id, FieldType::from(field.as_str())));
+        for (_, field_types) in fields {
+            reqs.push(sread!(*entity_id, field_types.clone()));
         }
 
         match store.perform(reqs) {
             Ok(res) => {
                 fields_fetched += fields.len();
                 results.push(EntityDisplay {
-                    entity_id: entity_id,
-                    entity_type: entity_id.get_type().to_string(),
+                    entity_id: *entity_id,
+                    entity_type: store.resolve_entity_type(entity_id.extract_type())
+                        .unwrap_or_else(|_| format!("Unknown({})", entity_id.extract_type().0)),
                     fields: res.into_iter().enumerate().map(|(i, r)| {
-                        let field_name = fields[i].clone();
+                        let field_name = fields[i].0.clone();
                         let display_value = r.value()
                             .map(|v| DisplayValue::from_value(Some(&v)))
                             .unwrap_or(DisplayValue::None);
@@ -478,7 +503,7 @@ fn display_results(entities: &[EntityDisplay], config: &Config) -> Result<()> {
         }
         OutputFormat::Ids => {
             for entity in entities {
-                println!("{}", entity.entity_id);
+                println!("{}", format_entity_id(entity.entity_id));
             }
         }
         OutputFormat::Json => {
@@ -503,7 +528,7 @@ fn display_json(entities: &[EntityDisplay], config: &Config) -> Result<()> {
         let mut json_entity = serde_json::Map::new();
 
         if config.show_ids {
-            json_entity.insert("id".to_string(), serde_json::Value::String(entity.entity_id.to_string()));
+            json_entity.insert("id".to_string(), serde_json::Value::String(format_entity_id(entity.entity_id)));
         }
 
         if config.show_types {
@@ -577,7 +602,7 @@ fn display_csv(entities: &[EntityDisplay], config: &Config) -> Result<()> {
         let mut row = Vec::new();
 
         if config.show_ids {
-            row.push(csv_escape(&entity.entity_id.to_string()));
+            row.push(csv_escape(&format_entity_id(entity.entity_id)));
         }
 
         if config.show_types {
@@ -630,7 +655,7 @@ fn display_table(entities: &[EntityDisplay], config: &Config) -> Result<()> {
     if config.show_ids {
         let mut max_width = 2; // "id"
         for entity in entities {
-            max_width = max_width.max(entity.entity_id.to_string().len());
+            max_width = max_width.max(format_entity_id(entity.entity_id).len());
         }
         column_widths.insert("id".to_string(), max_width);
     }
@@ -684,7 +709,7 @@ fn display_table(entities: &[EntityDisplay], config: &Config) -> Result<()> {
         let mut row = Vec::new();
 
         if config.show_ids {
-            row.push(format!("{:width$}", entity.entity_id.to_string(), width = column_widths["id"]));
+            row.push(format!("{:width$}", format_entity_id(entity.entity_id), width = column_widths["id"]));
         }
 
         if config.show_types {
@@ -718,7 +743,7 @@ fn export_results(entities: &[EntityDisplay], export_path: &std::path::PathBuf) 
     for entity in entities {
         let mut json_entity = serde_json::Map::new();
 
-        json_entity.insert("id".to_string(), serde_json::Value::String(entity.entity_id.to_string()));
+        json_entity.insert("id".to_string(), serde_json::Value::String(format_entity_id(entity.entity_id)));
         json_entity.insert("type".to_string(), serde_json::Value::String(entity.entity_type.clone()));
 
         for (field_name, field_value) in &entity.fields {

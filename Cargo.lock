@@ -1292,6 +1292,7 @@ dependencies = [
  "argon2",
  "base64",
  "bincode",
+ "bytes",
  "cel",
  "chrono",
  "crossbeam",
@@ -1301,7 +1302,6 @@ dependencies = [
  "lru",
  "mio",
  "rand 0.8.5",
- "rkyv",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -1612,6 +1612,9 @@ name = "sorted-vec"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f58d7b0190c7f12df7e8be6b79767a0836059159811b869d5ab55721fe14d0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "stable_deref_trait"

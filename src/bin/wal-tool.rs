@@ -373,6 +373,10 @@ impl WalReader {
                 Request::Delete { .. } => "Delete",
                 Request::SchemaUpdate { .. } => "SchemaUpdate",
                 Request::Snapshot { .. } => "Snapshot",
+                Request::GetEntityType { .. } => "GetEntityType",
+                Request::ResolveEntityType { .. } => "ResolveEntityType",
+                Request::GetFieldType { .. } => "GetFieldType",
+                Request::ResolveFieldType { .. } => "ResolveFieldType",
             };
             
             if !types.contains(&request_type.to_string()) {
@@ -398,7 +402,8 @@ impl WalReader {
         // Check entity ID filter
         if let Some(ref filter_entity_id) = self.config.entity_id {
             if let Some(entity_id) = request.entity_id() {
-                if entity_id.get_id().to_string() != *filter_entity_id {
+                let formatted_id = format!("{}:{}", entity_id.extract_type().0, entity_id.extract_id());
+                if formatted_id != *filter_entity_id {
                     return false;
                 }
             } else {
@@ -408,8 +413,12 @@ impl WalReader {
 
         // Check field type filter
         if let Some(ref filter_field_type) = self.config.field_type {
-            if let Some(field_type) = request.field_type() {
-                if field_type.as_ref() != filter_field_type {
+            if let Some(field_types) = request.field_type() {
+                // For now, we can't easily convert FieldType IDs back to names without a store
+                // We'll skip field type filtering or implement a basic check
+                // This is a limitation of the current architecture
+                let field_ids: Vec<String> = field_types.iter().map(|ft| format!("{}", ft.0)).collect();
+                if !field_ids.iter().any(|id| id == filter_field_type) {
                     return false;
                 }
             } else {
@@ -421,22 +430,30 @@ impl WalReader {
         if let Some(ref filter_entity_type) = self.config.entity_type {
             match request {
                 Request::Read { entity_id, .. } | Request::Write { entity_id, .. } | Request::Delete { entity_id, .. } => {
-                    if entity_id.get_type().as_ref() != filter_entity_type {
+                    // For now, we need a way to convert EntityType to string for comparison
+                    // This is a limitation since we don't have a store reference here
+                    // We'll use the raw type ID for comparison
+                    if format!("{}", entity_id.extract_type().0) != *filter_entity_type {
                         return false;
                     }
                 },
                 Request::Create { entity_type, .. } => {
-                    if entity_type.as_ref() != filter_entity_type {
+                    if format!("{}", entity_type.0) != *filter_entity_type {
                         return false;
                     }
                 },
                 Request::SchemaUpdate { schema, .. } => {
-                    if schema.entity_type.as_ref() != filter_entity_type {
+                    if schema.entity_type != *filter_entity_type {
                         return false;
                     }
                 },
                 Request::Snapshot { .. } => {
                     // Snapshots don't have entity types, so they don't match entity type filters
+                    return false;
+                },
+                Request::GetEntityType { .. } | Request::ResolveEntityType { .. } | 
+                Request::GetFieldType { .. } | Request::ResolveFieldType { .. } => {
+                    // These request types don't have entity types to filter on
                     return false;
                 }
             }
@@ -490,6 +507,13 @@ impl WalReader {
                 let table = Table::new(&[entry]);
                 println!("{}", table);
             },
+            Request::GetEntityType { .. } | Request::ResolveEntityType { .. } | 
+            Request::GetFieldType { .. } | Request::ResolveFieldType { .. } => {
+                // These are internal requests, unlikely to appear in WAL files
+                let entry = self.create_system_entry(request, wal_path, entry_index);
+                let table = Table::new(&[entry]);
+                println!("{}", table);
+            },
         }
     }
 
@@ -509,6 +533,12 @@ impl WalReader {
                 self.delete_entries.push(entry);
             },
             Request::SchemaUpdate { .. } | Request::Snapshot { .. } => {
+                let entry = self.create_system_entry(request, wal_path, entry_index);
+                self.system_entries.push(entry);
+            },
+            Request::GetEntityType { .. } | Request::ResolveEntityType { .. } | 
+            Request::GetFieldType { .. } | Request::ResolveFieldType { .. } => {
+                // These are internal requests, unlikely to appear in WAL files
                 let entry = self.create_system_entry(request, wal_path, entry_index);
                 self.system_entries.push(entry);
             },
@@ -557,7 +587,7 @@ impl WalReader {
                     timestamp: timestamp_str,
                     operation: "READ".to_string(),
                     entity: Self::format_entity_id(entity_id),
-                    field: field_type.as_ref().to_string(),
+                    field: Self::format_field_types(field_type),
                     value: Self::format_value_clean(value),
                     push: "-".to_string(),
                     adjust: "-".to_string(),
@@ -571,7 +601,7 @@ impl WalReader {
                     timestamp: timestamp_str,
                     operation: "WRITE".to_string(),
                     entity: Self::format_entity_id(entity_id),
-                    field: field_type.as_ref().to_string(),
+                    field: Self::format_field_types(field_type),
                     value: Self::format_value_clean(value),
                     push: format!("{:?}", push_condition),
                     adjust: format!("{}", adjust_behavior),
@@ -598,7 +628,7 @@ impl WalReader {
                 WalCreateEntry {
                     timestamp: timestamp_str,
                     operation: "CREATE".to_string(),
-                    entity_type: entity_type.as_ref().to_string(),
+                    entity_type: format!("{}", entity_type.0),
                     name: name.clone(),
                     parent: parent_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "root".to_string()),
                     created_id: created_entity_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "auto".to_string()),
@@ -647,7 +677,7 @@ impl WalReader {
                 WalSystemEntry {
                     timestamp: timestamp_str,
                     operation: "SCHEMA".to_string(),
-                    target: schema.entity_type.as_ref().to_string(),
+                    target: schema.entity_type.clone(),
                     originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
                     location,
                 }
@@ -682,7 +712,20 @@ impl WalReader {
 
     /// Format entity ID in a clean, readable way
     fn format_entity_id(entity_id: &qlib_rs::EntityId) -> String {
-        format!("{}${}", entity_id.get_type().as_ref(), entity_id.get_id())
+        format!("{}:{}", entity_id.extract_type().0, entity_id.extract_id())
+    }
+
+    /// Format field types as a readable string
+    fn format_field_types(field_types: &Vec<qlib_rs::FieldType>) -> String {
+        if field_types.len() == 1 {
+            format!("{}", field_types[0].0)
+        } else {
+            // For indirection, show as field1->field2->...
+            field_types.iter()
+                .map(|ft| format!("{}", ft.0))
+                .collect::<Vec<_>>()
+                .join("->")
+        }
     }
 
     /// Format value in a clean way without Rust type annotations

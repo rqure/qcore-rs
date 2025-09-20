@@ -86,8 +86,16 @@ fn main() -> Result<()> {
 
     // Determine the starting entity
     let root_entity_id = if let Some(start_id) = &config.start_from {
-        EntityId::try_from(start_id.as_str())
-            .map_err(|e| anyhow::anyhow!("Invalid entity ID format '{}': {}", start_id, e))?
+        // Parse entity ID from string format "type:id"
+        let parts: Vec<&str> = start_id.split(':').collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("Invalid entity ID format '{}'. Expected format: 'type_id:entity_id'", start_id));
+        }
+        let type_id: u32 = parts[0].parse()
+            .map_err(|e| anyhow::anyhow!("Invalid entity type ID '{}': {}", parts[0], e))?;
+        let entity_id: u32 = parts[1].parse()
+            .map_err(|e| anyhow::anyhow!("Invalid entity ID '{}': {}", parts[1], e))?;
+        EntityId::new(EntityType(type_id), entity_id)
     } else {
         // Find the Root entity
         find_root_entity(&mut store)
@@ -109,8 +117,9 @@ fn main() -> Result<()> {
 /// Find the Root entity in the data store
 fn find_root_entity(store: &mut StoreProxy) -> Result<EntityId> {
     // Look for entities of type "Root"
-    let root_type = EntityType::from("Root");
-    let entities = store.find_entities(&root_type, None)
+    let root_type = store.get_entity_type("Root")
+        .context("Failed to get Root entity type")?;
+    let entities = store.find_entities(root_type, None)
         .context("Failed to find Root entities")?;
 
     if entities.is_empty() {
@@ -142,21 +151,21 @@ fn build_tree(
     }
 
     // Get entity type
-    let entity_type = get_entity_type(store, &entity_id)
-        .with_context(|| format!("Failed to get entity type for {}", entity_id.get_id()))?;
+    let entity_type = get_entity_type(store, entity_id)
+        .with_context(|| format!("Failed to get entity type for {:?}", entity_id))?;
 
     // Get entity name
-    let name = get_entity_name(store, &entity_id)
-        .with_context(|| format!("Failed to get entity name for {}", entity_id.get_id()))?;
+    let name = get_entity_name(store, entity_id)
+        .with_context(|| format!("Failed to get entity name for {:?}", entity_id))?;
 
     // Get children
-    let children_ids = get_entity_children(store, &entity_id)
-        .with_context(|| format!("Failed to get children for {}", entity_id.get_id()))?;
+    let children_ids = get_entity_children(store, entity_id)
+        .with_context(|| format!("Failed to get children for {:?}", entity_id))?;
 
     // Recursively build child nodes
     let mut children = Vec::new();
     for child_id in children_ids {
-        let child_id_str = child_id.get_id().to_string();
+        let child_id_str = format!("{}:{}", child_id.extract_type().0, child_id.extract_id());
         match build_tree(store, child_id, max_depth, current_depth + 1) {
             Ok(child_node) => children.push(child_node),
             Err(e) => {
@@ -179,14 +188,18 @@ fn build_tree(
 }
 
 /// Get the entity type for a given entity ID
-fn get_entity_type(_store: &mut StoreProxy, entity_id: EntityId) -> Result<String> {
-    // The entity type is stored in the entity ID itself
-    Ok(entity_id.get_type().as_ref().to_string())
+fn get_entity_type(store: &mut StoreProxy, entity_id: EntityId) -> Result<String> {
+    // Extract the entity type from the entity ID and resolve it to a string
+    let entity_type = entity_id.extract_type();
+    store.resolve_entity_type(entity_type)
+        .with_context(|| format!("Failed to resolve entity type {:?}", entity_type))
 }
 
 /// Get the name of an entity
 fn get_entity_name(store: &mut StoreProxy, entity_id: EntityId) -> Result<String> {
-    let results = store.perform(vec![qlib_rs::sread!(entity_id, ft::name())])?;
+    let name_ft = store.get_field_type(ft::NAME)
+        .context("Failed to get Name field type")?;
+    let results = store.perform(vec![qlib_rs::sread!(entity_id, vec![name_ft])])?;
     
     if let Some(request) = results.first() {
         if let Some(Value::String(name)) = request.value() {
@@ -199,7 +212,9 @@ fn get_entity_name(store: &mut StoreProxy, entity_id: EntityId) -> Result<String
 
 /// Get the children of an entity
 fn get_entity_children(store: &mut StoreProxy, entity_id: EntityId) -> Result<Vec<EntityId>> {
-    let results = store.perform(vec![qlib_rs::sread!(entity_id, ft::children())])?;
+    let children_ft = store.get_field_type(ft::CHILDREN)
+        .context("Failed to get Children field type")?;
+    let results = store.perform(vec![qlib_rs::sread!(entity_id, vec![children_ft])])?;
 
     if let Some(request) = results.first() {
         if let Some(Value::EntityList(children)) = request.value() {
@@ -212,13 +227,16 @@ fn get_entity_children(store: &mut StoreProxy, entity_id: EntityId) -> Result<Ve
 
 /// Print the tree structure using ASCII tree characters
 fn print_tree(node: &TreeNode, prefix: &str, is_last: bool, config: &Config) {
+    // Helper function to format entity ID
+    let format_entity_id = || format!("{}:{}", node.entity_id.extract_type().0, node.entity_id.extract_id());
+    
     // Determine what to display
     let display_text = if config.verbose {
-        format!("{} ({}) [{}]", node.name, node.entity_type, node.entity_id.get_id())
+        format!("{} ({}) [{}]", node.name, node.entity_type, format_entity_id())
     } else if config.show_types {
         node.entity_type.clone()
     } else if config.show_ids {
-        format!("{} [{}]", node.name, node.entity_id.get_id())
+        format!("{} [{}]", node.name, format_entity_id())
     } else {
         node.name.clone()
     };

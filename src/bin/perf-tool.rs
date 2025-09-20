@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{StoreProxy, EntityType, EntityId, Value, FieldType, PageOpts, swrite, sstr, sint};
+use qlib_rs::{StoreProxy, EntityId, Value, PageOpts, swrite, sstr, sint};
 use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -140,10 +140,11 @@ fn load_existing_entities_from_topology(config: &Config) -> Result<Vec<EntityId>
         &config.password,
     ).context("Failed to connect for topology loading")?;
     
-    let entity_type_filter = EntityType::from(config.entity_type.as_str());
+    let entity_type_filter = store.get_entity_type(&config.entity_type)
+        .context("Failed to get entity type")?;
     
     // Find existing entities of the specified type
-    let found_entities = store.find_entities(&entity_type_filter, None)
+    let found_entities = store.find_entities(entity_type_filter, None)
         .context("Failed to find entities")?;
     entities.extend(found_entities);
     
@@ -158,10 +159,11 @@ fn find_test_entity(config: &Config) -> Result<EntityId> {
         &config.password,
     ).context("Failed to connect for finding test entity")?;
     
-    let perf_test_entity_type = EntityType::from("PerfTestEntity");
+    let perf_test_entity_type = store.get_entity_type("PerfTestEntity")
+        .context("Failed to get PerfTestEntity type")?;
     
     // Find the TestEntity by searching for entities with Name = "TestEntity"
-    let entities = store.find_entities(&perf_test_entity_type, Some("Name == 'TestEntity'".to_string()))
+    let entities = store.find_entities(perf_test_entity_type, Some("Name == 'TestEntity'".to_string()))
         .context("Failed to find test entity")?;
     
     if entities.is_empty() {
@@ -214,7 +216,7 @@ fn run_test_client(
             &config,
             client_id,
             &test_entities,
-            &test_entity_id,
+            test_entity_id,
         ) {
             Ok(_) => true,
             Err(e) => {
@@ -250,15 +252,20 @@ fn perform_test_operation(
         TestType::ReadOnly => {
             if !test_entities.is_empty() {
                 let entity_id = &test_entities[client_id % test_entities.len()];
-                let _exists = store.entity_exists(entity_id);
+                let _exists = store.entity_exists(*entity_id);
             }
         }
         TestType::WriteOnly => {
+            // Get field types from store
+            let test_value_ft = store.get_field_type("TestValue").context("Failed to get TestValue field type")?;
+            let test_string_ft = store.get_field_type("TestString").context("Failed to get TestString field type")?;
+            let test_flag_ft = store.get_field_type("TestFlag").context("Failed to get TestFlag field type")?;
+            
             // Use the existing TestEntity from the topology for all write operations
             store.perform(vec![
-                swrite!(test_entity_id, FieldType::from("TestValue"), sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
-                swrite!(test_entity_id, FieldType::from("TestString"), sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
-                swrite!(test_entity_id, FieldType::from("TestFlag"), Some(Value::Bool(fastrand::bool()))),
+                swrite!(test_entity_id, vec![test_value_ft], sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
+                swrite!(test_entity_id, vec![test_string_ft], sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
+                swrite!(test_entity_id, vec![test_flag_ft], Some(Value::Bool(fastrand::bool()))),
             ])?;
         }
         TestType::Mixed => {
@@ -266,44 +273,58 @@ fn perform_test_operation(
                 // Read operation
                 if !test_entities.is_empty() {
                     let entity_id = &test_entities[client_id % test_entities.len()];
-                    let _exists = store.entity_exists(entity_id);
+                    let _exists = store.entity_exists(*entity_id);
                 }
             } else if client_id % 3 == 1 {
+                // Get field types from store
+                let test_string_ft = store.get_field_type("TestString").context("Failed to get TestString field type")?;
+                let test_value_ft = store.get_field_type("TestValue").context("Failed to get TestValue field type")?;
+                
                 // Write operation to test entity only
                 store.perform(vec![
-                    swrite!(test_entity_id, FieldType::from("TestString"), sstr!(format!("MixedTest_Client_{}", client_id))),
-                    swrite!(test_entity_id, FieldType::from("TestValue"), sint!(client_id as i64)),
+                    swrite!(test_entity_id, vec![test_string_ft], sstr!(format!("MixedTest_Client_{}", client_id))),
+                    swrite!(test_entity_id, vec![test_value_ft], sint!(client_id as i64)),
                 ])?;
             } else {
                 // Search operation
-                let entity_type = EntityType::from(config.entity_type.as_str());
-                let _result = store.find_entities_paginated(&entity_type, Some(PageOpts::new(20, None)), Some(format!("Name != 'NonExistent_{}'", client_id)))?;
+                let entity_type = store.get_entity_type(&config.entity_type).context("Failed to get entity type")?;
+                let _result = store.find_entities_paginated(entity_type, Some(PageOpts::new(20, None)), Some(format!("Name != 'NonExistent_{}'", client_id)))?;
             }
         }
         TestType::Create => {
+            // Get field types from store
+            let test_string_ft = store.get_field_type("TestString").context("Failed to get TestString field type")?;
+            let test_value_ft = store.get_field_type("TestValue").context("Failed to get TestValue field type")?;
+            let test_flag_ft = store.get_field_type("TestFlag").context("Failed to get TestFlag field type")?;
+            
             // Update the existing test entity instead of creating new ones
             store.perform(vec![
-                swrite!(test_entity_id, FieldType::from("TestString"), sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
-                swrite!(test_entity_id, FieldType::from("TestValue"), sint!(fastrand::i64(..))),
-                swrite!(test_entity_id, FieldType::from("TestFlag"), Some(Value::Bool(true))),
+                swrite!(test_entity_id, vec![test_string_ft], sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
+                swrite!(test_entity_id, vec![test_value_ft], sint!(fastrand::i64(..))),
+                swrite!(test_entity_id, vec![test_flag_ft], Some(Value::Bool(true))),
             ])?;
         }
         TestType::Search => {
-            let entity_type = EntityType::from(config.entity_type.as_str());
+            let entity_type = store.get_entity_type(&config.entity_type).context("Failed to get entity type")?;
             let _result = store.find_entities_paginated(
-                &entity_type,
+                entity_type,
                 Some(PageOpts::new(20, None)),
                 Some(format!("Name != 'NonExistent_{}'", client_id))
             )?;
         }
         TestType::Bulk => {
+            // Get field types from store
+            let test_string_ft = store.get_field_type("TestString").context("Failed to get TestString field type")?;
+            let test_value_ft = store.get_field_type("TestValue").context("Failed to get TestValue field type")?;
+            let test_flag_ft = store.get_field_type("TestFlag").context("Failed to get TestFlag field type")?;
+            
             // Multiple writes to the existing test entity
             let mut requests = Vec::new();
             for i in 0..10 {
-                requests.push(swrite!(test_entity_id, FieldType::from("TestString"), sstr!(format!("BulkTest_{}_{}", client_id, i))));
-                requests.push(swrite!(test_entity_id, FieldType::from("TestValue"), sint!(client_id as i64 * 10 + i as i64)));
+                requests.push(swrite!(test_entity_id, vec![test_string_ft], sstr!(format!("BulkTest_{}_{}", client_id, i))));
+                requests.push(swrite!(test_entity_id, vec![test_value_ft], sint!(client_id as i64 * 10 + i as i64)));
                 if i % 2 == 0 {
-                    requests.push(swrite!(test_entity_id, FieldType::from("TestFlag"), Some(Value::Bool(i % 4 == 0))));
+                    requests.push(swrite!(test_entity_id, vec![test_flag_ft], Some(Value::Bool(i % 4 == 0))));
                 }
             }
             store.perform(requests)?;

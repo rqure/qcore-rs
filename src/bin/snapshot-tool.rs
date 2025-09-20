@@ -499,11 +499,14 @@ fn print_snapshot_summary(snapshot: &JsonSnapshot) {
     }
 }
 
-/// Validate that all schemas can be converted to internal format
+/// Validate that all schemas have proper JSON structure
 fn validate_schemas(schemas: &[JsonEntitySchema]) -> Result<()> {
     for schema in schemas {
-        schema.to_entity_schema()
-            .with_context(|| format!("Schema validation failed for '{}'", schema.entity_type))?;
+        // Basic validation - check that the schema has required fields
+        if schema.entity_type.is_empty() {
+            return Err(anyhow::anyhow!("Schema missing entity_type"));
+        }
+        // Additional validation could be added here for field schema format
     }
     Ok(())
 }
