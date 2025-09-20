@@ -252,6 +252,10 @@ impl CoreService {
                     service.handle_command(request);
                 }
 
+                if let Some(cache) = &mut service.permission_cache {
+                    cache.process_notifications();
+                }
+
                 // Process pending notifications for all connections
                 service.process_notifications();
 
