@@ -3,6 +3,19 @@ set -euo pipefail
 
 # Start all servers simultaneously and stop them all on Ctrl-C
 
+# Number of nodes to spawn (default: 3)
+NUM_NODES=${1:-3}
+BASE_PORT=9100
+
+# Validate input
+if ! [[ "$NUM_NODES" =~ ^[0-9]+$ ]] || [ "$NUM_NODES" -lt 1 ]; then
+    echo "Usage: $0 [number_of_nodes]"
+    echo "  number_of_nodes: positive integer (default: 3)"
+    exit 1
+fi
+
+echo "Starting cluster with $NUM_NODES nodes..."
+
 # Prefer release binaries, fall back to debug if not found
 BIN_DIR=${BIN_DIR:-./target/release}
 if [ ! -x "$BIN_DIR/qcore-rs" ] || [ ! -x "$BIN_DIR/snapshot-tool" ]; then
@@ -13,9 +26,33 @@ fi
 
 rm -rf ./data
 
+# Generate node name (e.g., qos-a for node 0, qos-b for node 1, etc.)
+get_node_name() {
+    local node_id=$1
+    local letters="abcdefghijklmnopqrstuvwxyz"
+    echo "qos-${letters:$node_id:1}"
+}
+
+# Generate peer addresses for a node (all other nodes)
+get_peer_addresses() {
+    local current_node=$1
+    local peers=""
+    for ((i=0; i<NUM_NODES; i++)); do
+        if [ $i -ne $current_node ]; then
+            if [ -n "$peers" ]; then
+                peers="${peers},"
+            fi
+            peers="${peers}localhost:$((BASE_PORT + i))"
+        fi
+    done
+    echo "$peers"
+}
+
+# Use first node for factory-restore
+FIRST_NODE=$(get_node_name 0)
 "$BIN_DIR"/snapshot-tool factory-restore \
     --input base-topology.json \
-    --machine qos-a \
+    --machine "$FIRST_NODE" \
     --force
 
 # -------- cleanup handler --------
@@ -36,22 +73,19 @@ start_node() {
     "$@" &
 }
 
-start_node qos-a "$BIN_DIR"/qcore-rs \
-    --machine qos-a \
-    --peer-addresses localhost:9101,localhost:9102 \
-    --port 9100
+# Start all nodes dynamically
+for ((i=0; i<NUM_NODES; i++)); do
+    NODE_NAME=$(get_node_name $i)
+    NODE_PORT=$((BASE_PORT + i))
+    PEER_ADDRESSES=$(get_peer_addresses $i)
+    
+    start_node "$NODE_NAME" "$BIN_DIR"/qcore-rs \
+        --machine "$NODE_NAME" \
+        --peer-addresses "$PEER_ADDRESSES" \
+        --port "$NODE_PORT"
+done
 
-start_node qos-b "$BIN_DIR"/qcore-rs \
-    --machine qos-b \
-    --peer-addresses localhost:9100,localhost:9102 \
-    --port 9101
-
-start_node qos-c "$BIN_DIR"/qcore-rs \
-    --machine qos-c \
-    --peer-addresses localhost:9100,localhost:9101 \
-    --port 9102
-
-echo "All nodes started."
+echo "All $NUM_NODES nodes started."
 echo "Press Ctrl-C to stop the cluster."
 
 # -------- wait for first exit --------
