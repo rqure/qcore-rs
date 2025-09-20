@@ -4,13 +4,14 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
+use qlib_rs::resolve_indirection;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::thread;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
     AuthenticationResult, Store, Cache, CelExecutor,
-    Request, Snapshot, Snowflake, AuthConfig,
+    Request, Snapshot, AuthConfig, StoreTrait,
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
 use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer};
@@ -24,6 +25,7 @@ pub struct CoreConfig {
     /// Port for unified client and peer communication
     pub port: u16,
     /// Machine ID for request origination
+    #[allow(dead_code)]
     pub machine: String,
 }
 
@@ -97,6 +99,7 @@ struct Connection {
 
 /// Core service that handles both client and peer connections
 pub struct CoreService {
+    #[allow(dead_code)]
     config: CoreConfig,
     listener: MioTcpListener,
     poll: Poll,
@@ -130,11 +133,18 @@ impl CoreService {
         
         let mut store = Store::new();
         
+        // Get values needed for cache creation
+        let permission_entity_type = store.get_entity_type(qlib_rs::et::PERMISSION)?;
+        let resource_type_field = store.get_field_type(qlib_rs::ft::RESOURCE_TYPE)?;
+        let resource_field_field = store.get_field_type(qlib_rs::ft::RESOURCE_FIELD)?;
+        let scope_field = store.get_field_type(qlib_rs::ft::SCOPE)?;
+        let condition_field = store.get_field_type(qlib_rs::ft::CONDITION)?;
+        
         let (permission_cache, _notification_queue) = Cache::new(
             &mut store,
-            qlib_rs::et::permission(),
-            vec![qlib_rs::ft::resource_type(), qlib_rs::ft::resource_field()],
-            vec![qlib_rs::ft::scope(), qlib_rs::ft::condition()]
+            permission_entity_type,
+            vec![resource_type_field, resource_field_field],
+            vec![scope_field, condition_field]
         ).map_err(|e| anyhow::anyhow!("Failed to create permission cache: {}", e))?;
         let cel_executor = CelExecutor::new();
         
@@ -218,16 +228,19 @@ impl CoreService {
         for request in requests {
             // Extract entity_id and field_type from the request
             let authorization_needed = match &request {
-                Request::Read { entity_id, field_types: field_type, .. } => Some((entity_id, field_type)),
-                Request::Write { entity_id, field_types: field_type, .. } => Some((entity_id, field_type)),
+                Request::Read { entity_id, field_types, .. } => Some((entity_id, field_types)),
+                Request::Write { entity_id, field_types, .. } => Some((entity_id, field_types)),
                 Request::Create { .. } => None, // No field-level authorization for creation
                 Request::Delete { .. } => None, // No field-level authorization for deletion
                 Request::SchemaUpdate { .. } => None, // No field-level authorization for schema updates
                 _ => None, // For other request types, skip authorization check
             };
             
-            if let Some((entity_id, field_type)) = authorization_needed {
-                let scope = get_scope(&self.store, &mut self.cel_executor, &self.permission_cache, &client_id, entity_id, field_type)?;
+            if let Some((entity_id, field_types)) = authorization_needed {
+                // For authorization, we check against the final field in the indirection chain
+                let (final_entity_id, final_field_type) = resolve_indirection(&self.store, *entity_id, field_types)?;
+                
+                let scope = get_scope(&self.store, &mut self.cel_executor, &self.permission_cache, client_id, final_entity_id, final_field_type)?;
                 
                 match scope {
                     AuthorizationScope::ReadOnly | AuthorizationScope::ReadWrite => {
@@ -481,12 +494,11 @@ impl CoreService {
                 if let Some(connection) = self.connections.get_mut(&token) {
                     connection.authenticated = true;
                     connection.client_id = Some(subject_id.clone());
-                    info!("Client {} authenticated as {}", connection.addr_string, subject_id);
+                    info!("Client {} authenticated as {:?}", connection.addr_string, subject_id);
                 }
                 
                 let auth_result = AuthenticationResult {
                     subject_id: subject_id.clone(),
-                    subject_type: subject_id.get_type().to_string(),
                 };
                 
                 Ok(StoreMessage::AuthenticateResponse {
@@ -514,7 +526,7 @@ impl CoreService {
         
         match message {
             StoreMessage::GetEntitySchema { id, entity_type } => {
-                match self.store.get_entity_schema(&entity_type) {
+                match self.store.get_entity_schema(entity_type) {
                     Ok(schema) => Ok(StoreMessage::GetEntitySchemaResponse {
                         id,
                         response: Ok(Some(schema)),
@@ -527,7 +539,7 @@ impl CoreService {
             }
             
             StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
-                match self.store.get_complete_entity_schema(&entity_type) {
+                match self.store.get_complete_entity_schema(entity_type) {
                     Ok(schema) => Ok(StoreMessage::GetCompleteEntitySchemaResponse {
                         id,
                         response: Ok(schema),
@@ -540,7 +552,7 @@ impl CoreService {
             }
             
             StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
-                match self.store.get_field_schema(&entity_type, &field_type) {
+                match self.store.get_field_schema(entity_type, field_type) {
                     Ok(schema) => Ok(StoreMessage::GetFieldSchemaResponse {
                         id,
                         response: Ok(Some(schema)),
@@ -553,7 +565,7 @@ impl CoreService {
             }
             
             StoreMessage::EntityExists { id, entity_id } => {
-                let exists = self.store.entity_exists(&entity_id);
+                let exists = self.store.entity_exists(entity_id);
                 Ok(StoreMessage::EntityExistsResponse {
                     id,
                     response: exists,
@@ -561,7 +573,7 @@ impl CoreService {
             }
             
             StoreMessage::FieldExists { id, entity_type, field_type } => {
-                let exists = self.store.field_exists(&entity_type, &field_type);
+                let exists = self.store.field_exists(entity_type, field_type);
                 Ok(StoreMessage::FieldExistsResponse {
                     id,
                     response: exists,
@@ -590,7 +602,7 @@ impl CoreService {
             }
             
             StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
-                match self.store.find_entities_paginated(&entity_type, page_opts, filter) {
+                match self.store.find_entities_paginated(entity_type, page_opts, filter) {
                     Ok(result) => Ok(StoreMessage::FindEntitiesResponse {
                         id,
                         response: Ok(result),
@@ -603,7 +615,7 @@ impl CoreService {
             }
             
             StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
-                match self.store.find_entities_exact(&entity_type, page_opts, filter) {
+                match self.store.find_entities_exact(entity_type, page_opts, filter) {
                     Ok(result) => Ok(StoreMessage::FindEntitiesExactResponse {
                         id,
                         response: Ok(result),
