@@ -19,6 +19,46 @@ use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer};
 use crate::snapshot::SnapshotHandle;
 use crate::wal::WalHandle;
 
+/// Get the type name of a store message without expensive debug formatting
+fn message_type_name(message: &StoreMessage) -> &'static str {
+    match message {
+        StoreMessage::Authenticate { .. } => "Authenticate",
+        StoreMessage::AuthenticateResponse { .. } => "AuthenticateResponse",
+        StoreMessage::GetEntitySchema { .. } => "GetEntitySchema",
+        StoreMessage::GetEntitySchemaResponse { .. } => "GetEntitySchemaResponse",
+        StoreMessage::GetCompleteEntitySchema { .. } => "GetCompleteEntitySchema",
+        StoreMessage::GetCompleteEntitySchemaResponse { .. } => "GetCompleteEntitySchemaResponse",
+        StoreMessage::GetFieldSchema { .. } => "GetFieldSchema",
+        StoreMessage::GetFieldSchemaResponse { .. } => "GetFieldSchemaResponse",
+        StoreMessage::EntityExists { .. } => "EntityExists",
+        StoreMessage::EntityExistsResponse { .. } => "EntityExistsResponse",
+        StoreMessage::FieldExists { .. } => "FieldExists",
+        StoreMessage::FieldExistsResponse { .. } => "FieldExistsResponse",
+        StoreMessage::Perform { .. } => "Perform",
+        StoreMessage::PerformResponse { .. } => "PerformResponse",
+        StoreMessage::FindEntities { .. } => "FindEntities",
+        StoreMessage::FindEntitiesResponse { .. } => "FindEntitiesResponse",
+        StoreMessage::FindEntitiesExact { .. } => "FindEntitiesExact",
+        StoreMessage::FindEntitiesExactResponse { .. } => "FindEntitiesExactResponse",
+        StoreMessage::GetEntityTypes { .. } => "GetEntityTypes",
+        StoreMessage::GetEntityTypesResponse { .. } => "GetEntityTypesResponse",
+        StoreMessage::RegisterNotification { .. } => "RegisterNotification",
+        StoreMessage::RegisterNotificationResponse { .. } => "RegisterNotificationResponse",
+        StoreMessage::UnregisterNotification { .. } => "UnregisterNotification",
+        StoreMessage::UnregisterNotificationResponse { .. } => "UnregisterNotificationResponse",
+        StoreMessage::GetEntityType { .. } => "GetEntityType",
+        StoreMessage::GetEntityTypeResponse { .. } => "GetEntityTypeResponse",
+        StoreMessage::ResolveEntityType { .. } => "ResolveEntityType",
+        StoreMessage::ResolveEntityTypeResponse { .. } => "ResolveEntityTypeResponse",
+        StoreMessage::GetFieldType { .. } => "GetFieldType",
+        StoreMessage::GetFieldTypeResponse { .. } => "GetFieldTypeResponse",
+        StoreMessage::ResolveFieldType { .. } => "ResolveFieldType",
+        StoreMessage::ResolveFieldTypeResponse { .. } => "ResolveFieldTypeResponse",
+        StoreMessage::Notification { .. } => "Notification",
+        StoreMessage::Error { .. } => "Error",
+    }
+}
+
 /// Configuration for the core service
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
@@ -511,15 +551,25 @@ impl CoreService {
     
     /// Handle a store message from a client
     fn handle_store_message(&mut self, token: Token, message: StoreMessage) -> Result<()> {
-        let start_time = Instant::now();
-        
-        let addr_string = {
-            let connection = self.connections.get(&token)
-                .ok_or_else(|| anyhow::anyhow!("Connection not found for token {:?}", token))?;
-            connection.addr_string.clone()
+        let start_time = if tracing::enabled!(tracing::Level::DEBUG) {
+            Some(Instant::now())
+        } else {
+            None
         };
         
-        debug!("Processing store message from {}: {:?}", addr_string, message);
+        // Get connection info for debug logging
+        let addr_string = if start_time.is_some() {
+            self.connections.get(&token)
+                .map(|conn| conn.addr_string.clone())
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            String::new() // Won't be used
+        };
+        
+        // Only log if debug logging is enabled
+        if start_time.is_some() {
+            debug!("Processing store message from {}: {}", addr_string, message_type_name(&message));
+        }
         
         let response = match &message {
             StoreMessage::Authenticate { id, subject_name, credential } => {
@@ -542,8 +592,10 @@ impl CoreService {
             }
         };
         
-        let processing_time = start_time.elapsed();
-        debug!("Message processed in {:?} for connection {}", processing_time, addr_string);
+        if let Some(start) = start_time {
+            let processing_time = start.elapsed();
+            debug!("Message processed in {:?} for connection {}", processing_time, addr_string);
+        }
         
         self.send_response(token, response)?;
         Ok(())
