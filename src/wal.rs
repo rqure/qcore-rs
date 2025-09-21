@@ -1,4 +1,5 @@
 use crossbeam::channel::Sender;
+use qlib_rs::{Request, Requests};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::thread;
@@ -40,7 +41,7 @@ pub trait WalTrait {
     fn append_request(&mut self, request: &qlib_rs::Request) -> Result<()>;
 
     /// Replay WAL files to restore store state
-    fn replay(&self) -> Result<Vec<qlib_rs::Request>>;
+    fn replay(&self) -> Result<Requests>;
 
     /// Initialize WAL counter from existing files
     fn initialize_counter(&mut self) -> Result<()>;
@@ -220,7 +221,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
 
 impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     /// Write a request to WAL with file rotation and snapshot handling
-    fn append_request(&mut self, request: &qlib_rs::Request) -> Result<()> {
+    fn append_request(&mut self, request: &Request) -> Result<()> {
         // Serialize the request
         let serialized = bincode::serialize(request)?;
         
@@ -236,12 +237,12 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     }
     
     /// Replay WAL files to restore store state
-    fn replay(&self) -> Result<Vec<qlib_rs::Request>> {
+    fn replay(&self) -> Result<Requests> {
         let wal_files = self.file_manager.scan_files(&self.wal_config.wal_dir, &self.file_config)?;
         
         if wal_files.is_empty() {
             info!("No WAL files found");
-            return Ok(Vec::new());
+            return Ok(Requests::new());
         }
         
         // Find the most recent snapshot marker
@@ -392,8 +393,8 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
     
     /// Perform the actual replay operation
-    fn perform_replay(&self, wal_files: &[FileInfo], most_recent_snapshot: Option<(PathBuf, u64, usize)>) -> Result<Vec<qlib_rs::Request>> {
-        let mut requests = Vec::new();
+    fn perform_replay(&self, wal_files: &[FileInfo], most_recent_snapshot: Option<(PathBuf, u64, usize)>) -> Result<Requests> {
+        let mut requests = Requests::new();
         
         match most_recent_snapshot {
             Some((snapshot_file, snapshot_counter, offset)) => {
@@ -432,14 +433,14 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
     
     /// Replay a single WAL file from a specific offset
-    fn replay_file_from_offset(&self, wal_path: &PathBuf, start_offset: usize) -> Result<Vec<qlib_rs::Request>> {
+    fn replay_file_from_offset(&self, wal_path: &PathBuf, start_offset: usize) -> Result<Requests> {
         let mut file = File::open(wal_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
         
         let adjusted_offset = self.validate_start_offset(&buffer, start_offset, wal_path)?;
         let mut reader = WalEntryReader::from_offset(buffer, adjusted_offset);
-        let mut requests = Vec::new();
+        let mut requests = Requests::new();
         
         info!(
             wal_file = %wal_path.display(),

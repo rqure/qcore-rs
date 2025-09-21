@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::resolve_indirection;
+use qlib_rs::{resolve_indirection, Requests};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::thread;
@@ -82,7 +82,7 @@ impl From<&crate::Config> for CoreConfig {
 #[derive(Debug)]
 pub enum CoreCommand {
     Perform {
-        requests: Vec<Request>,
+        requests: Requests,
     },
     TakeSnapshot,
     RestoreSnapshot {
@@ -103,7 +103,7 @@ pub struct CoreHandle {
 }
 
 impl CoreHandle {
-    pub fn perform(&self, requests: Vec<Request>) {
+    pub fn perform(&self, requests: Requests) {
         self.sender.send(CoreCommand::Perform { requests }).unwrap();
     }
 
@@ -316,9 +316,9 @@ impl CoreService {
     fn check_requests_authorization(
         &mut self,
         client_id: EntityId,
-        requests: Vec<Request>,
-    ) -> Result<Vec<Request>> {
-        let mut authorized_requests = Vec::new();
+        requests: Requests,
+    ) -> Result<Requests> {
+        let mut authorized_requests = Requests::new();
         
         for request in requests {
             // Extract entity_id and field_type from the request
