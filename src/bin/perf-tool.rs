@@ -319,7 +319,7 @@ fn perform_test_operation(
             let test_flag_ft = store.get_field_type("TestFlag").context("Failed to get TestFlag field type")?;
             
             // Multiple writes to the existing test entity
-            let mut requests = Requests::new();
+            let requests = Requests::new(vec![]);
             for i in 0..10 {
                 requests.push(swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("BulkTest_{}_{}", client_id, i))));
                 requests.push(swrite!(test_entity_id, sfield![test_value_ft], sint!(client_id as i64 * 10 + i as i64)));

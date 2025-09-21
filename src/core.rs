@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::{resolve_indirection, Requests};
+use qlib_rs::{Requests};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::thread;
@@ -300,9 +300,9 @@ impl CoreService {
                 service.process_notifications();
 
                 // Drain the write queue from the store
-                while let Some(request) = service.store.write_queue.pop() {
+                while let Some(requests) = service.store.write_queue.pop_front() {
                     if let Some(wal_handle) = &service.wal_handle {
-                        wal_handle.append_request(request.clone());
+                        wal_handle.append_requests(requests.clone());
                     }
                 }
             }
@@ -318,9 +318,7 @@ impl CoreService {
         client_id: EntityId,
         requests: Requests,
     ) -> Result<Requests> {
-        let mut authorized_requests = Requests::new();
-        
-        for request in requests {
+        for request in requests.read().iter() {
             // Extract entity_id and field_type from the request
             let authorization_needed = match &request {
                 Request::Read { entity_id, field_types, .. } => Some((entity_id, field_types)),
@@ -337,31 +335,36 @@ impl CoreService {
                     Some(cache) => cache,
                     None => {
                         debug!("No permission cache available, skipping authorization check");
-                        authorized_requests.push(request);
                         continue;
                     }
                 };
                 
                 // For authorization, we check against the final field in the indirection chain
-                let (final_entity_id, final_field_type) = resolve_indirection(&self.store, *entity_id, field_types)?;
+                let (final_entity_id, final_field_type) = self.store.resolve_indirection(*entity_id, field_types)?;
                 
                 let scope = get_scope(&self.store, &mut self.cel_executor, cache, client_id, final_entity_id, final_field_type)?;
                 
                 match scope {
-                    AuthorizationScope::ReadOnly | AuthorizationScope::ReadWrite => {
-                        authorized_requests.push(request);
-                    }
                     AuthorizationScope::None => {
                         return Err(anyhow::anyhow!("Client not authorized for request: {}", request));
                     }
+                    AuthorizationScope::ReadOnly => {
+                        if let Request::Write { .. } = request {
+                            return Err(anyhow::anyhow!("Client not authorized for write request: {}", request));
+                        } else if let Request::Create { .. } = request {
+                            return Err(anyhow::anyhow!("Client not authorized for create request: {}", request));
+                        } else if let Request::Delete { .. } = request {
+                            return Err(anyhow::anyhow!("Client not authorized for delete request: {}", request));
+                        } else if let Request::SchemaUpdate { .. } = request {
+                            return Err(anyhow::anyhow!("Client not authorized for schema update request: {}", request));
+                        }
+                    }
+                    _ => {}
                 }
-            } else {
-                // No authorization needed for this request type
-                authorized_requests.push(request);
             }
         }
         
-        Ok(authorized_requests)
+        Ok(requests)
     }
     
     /// Accept new incoming connections

@@ -464,7 +464,7 @@ fn fetch_entity_data(
 
     for entity_id in entity_ids {
         debug!("Fetching data for entity: {:?}", entity_id);
-        let mut reqs = Requests::new();
+        let reqs = Requests::new(vec![]);
 
         for (_, field_types) in fields {
             reqs.push(sread!(*entity_id, field_types.clone()));
@@ -477,7 +477,9 @@ fn fetch_entity_data(
                     entity_id: *entity_id,
                     entity_type: store.resolve_entity_type(entity_id.extract_type())
                         .unwrap_or_else(|_| format!("Unknown({})", entity_id.extract_type().0)),
-                    fields: res.into_iter().enumerate().map(|(i, r)| {
+                    fields: res
+                        .read()
+                        .iter().enumerate().map(|(i, r)| {
                         let field_name = fields[i].0.clone();
                         let display_value = r.value()
                             .map(|v| DisplayValue::from_value(Some(&v)))
