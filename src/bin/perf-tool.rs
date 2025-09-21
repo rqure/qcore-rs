@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{sfield, sint, sstr, swrite, EntityId, PageOpts, StoreProxy, Value};
+use qlib_rs::{sfield, sint, sreq, sstr, swrite, EntityId, PageOpts, Requests, StoreProxy, Value};
 use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -262,7 +262,7 @@ fn perform_test_operation(
             let test_flag_ft = store.get_field_type("TestFlag").context("Failed to get TestFlag field type")?;
             
             // Use the existing TestEntity from the topology for all write operations
-            store.perform(vec![
+            store.perform(sreq![
                 swrite!(test_entity_id, sfield![test_value_ft], sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
                 swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
                 swrite!(test_entity_id, sfield![test_flag_ft], Some(Value::Bool(fastrand::bool()))),
@@ -281,7 +281,7 @@ fn perform_test_operation(
                 let test_value_ft = store.get_field_type("TestValue").context("Failed to get TestValue field type")?;
                 
                 // Write operation to test entity only
-                store.perform(vec![
+                store.perform(sreq![
                     swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("MixedTest_Client_{}", client_id))),
                     swrite!(test_entity_id, sfield![test_value_ft], sint!(client_id as i64)),
                 ])?;
@@ -298,7 +298,7 @@ fn perform_test_operation(
             let test_flag_ft = store.get_field_type("TestFlag").context("Failed to get TestFlag field type")?;
             
             // Update the existing test entity instead of creating new ones
-            store.perform(vec![
+            store.perform(sreq![
                 swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
                 swrite!(test_entity_id, sfield![test_value_ft], sint!(fastrand::i64(..))),
                 swrite!(test_entity_id, sfield![test_flag_ft], Some(Value::Bool(true))),
@@ -319,7 +319,7 @@ fn perform_test_operation(
             let test_flag_ft = store.get_field_type("TestFlag").context("Failed to get TestFlag field type")?;
             
             // Multiple writes to the existing test entity
-            let mut requests = Vec::new();
+            let mut requests = Requests::new();
             for i in 0..10 {
                 requests.push(swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("BulkTest_{}_{}", client_id, i))));
                 requests.push(swrite!(test_entity_id, sfield![test_value_ft], sint!(client_id as i64 * 10 + i as i64)));

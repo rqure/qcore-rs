@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{sread, EntityId, EntityType, IndirectFieldType, PageOpts, PageResult, StoreProxy, Value};
+use qlib_rs::{sread, EntityId, EntityType, IndirectFieldType, PageOpts, PageResult, Requests, StoreProxy, Value};
 use std::collections::HashMap;
 use tracing::{info, debug};
 use serde_json;
@@ -464,7 +464,7 @@ fn fetch_entity_data(
 
     for entity_id in entity_ids {
         debug!("Fetching data for entity: {:?}", entity_id);
-        let mut reqs = Vec::new();
+        let mut reqs = Requests::new();
 
         for (_, field_types) in fields {
             reqs.push(sread!(*entity_id, field_types.clone()));

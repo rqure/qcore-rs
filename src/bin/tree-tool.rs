@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{ft, sfield, EntityId, EntityType, StoreProxy, Value};
+use qlib_rs::{ft, sfield, sread, sreq, EntityId, EntityType, StoreProxy, Value, Requests};
 use tracing::{info, warn};
 
 /// Command-line tool for displaying the tree structure of the QCore data store
@@ -199,7 +199,7 @@ fn get_entity_type(store: &mut StoreProxy, entity_id: EntityId) -> Result<String
 fn get_entity_name(store: &mut StoreProxy, entity_id: EntityId) -> Result<String> {
     let name_ft = store.get_field_type(ft::NAME)
         .context("Failed to get Name field type")?;
-    let results = store.perform(vec![qlib_rs::sread!(entity_id, sfield![name_ft])])?;
+    let results = store.perform(sreq![sread!(entity_id, sfield![name_ft])])?;
     
     if let Some(request) = results.first() {
         if let Some(Value::String(name)) = request.value() {
@@ -214,7 +214,7 @@ fn get_entity_name(store: &mut StoreProxy, entity_id: EntityId) -> Result<String
 fn get_entity_children(store: &mut StoreProxy, entity_id: EntityId) -> Result<Vec<EntityId>> {
     let children_ft = store.get_field_type(ft::CHILDREN)
         .context("Failed to get Children field type")?;
-    let results = store.perform(vec![qlib_rs::sread!(entity_id, sfield![children_ft])])?;
+    let results = store.perform(sreq![sread!(entity_id, sfield![children_ft])])?;
 
     if let Some(request) = results.first() {
         if let Some(Value::EntityList(children)) = request.value() {
