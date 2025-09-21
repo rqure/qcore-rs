@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{StoreProxy, EntityId, Value, PageOpts, swrite, sstr, sint};
+use qlib_rs::{sfield, sint, sstr, swrite, EntityId, PageOpts, StoreProxy, Value};
 use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -263,9 +263,9 @@ fn perform_test_operation(
             
             // Use the existing TestEntity from the topology for all write operations
             store.perform(vec![
-                swrite!(test_entity_id, vec![test_value_ft], sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
-                swrite!(test_entity_id, vec![test_string_ft], sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
-                swrite!(test_entity_id, vec![test_flag_ft], Some(Value::Bool(fastrand::bool()))),
+                swrite!(test_entity_id, sfield![test_value_ft], sint!(client_id as i64 * 1000 + fastrand::i64(1..1000))),
+                swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("PerfTest_Client_{}_Time_{}", client_id, chrono::Utc::now().timestamp()))),
+                swrite!(test_entity_id, sfield![test_flag_ft], Some(Value::Bool(fastrand::bool()))),
             ])?;
         }
         TestType::Mixed => {
@@ -282,8 +282,8 @@ fn perform_test_operation(
                 
                 // Write operation to test entity only
                 store.perform(vec![
-                    swrite!(test_entity_id, vec![test_string_ft], sstr!(format!("MixedTest_Client_{}", client_id))),
-                    swrite!(test_entity_id, vec![test_value_ft], sint!(client_id as i64)),
+                    swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("MixedTest_Client_{}", client_id))),
+                    swrite!(test_entity_id, sfield![test_value_ft], sint!(client_id as i64)),
                 ])?;
             } else {
                 // Search operation
@@ -299,9 +299,9 @@ fn perform_test_operation(
             
             // Update the existing test entity instead of creating new ones
             store.perform(vec![
-                swrite!(test_entity_id, vec![test_string_ft], sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
-                swrite!(test_entity_id, vec![test_value_ft], sint!(fastrand::i64(..))),
-                swrite!(test_entity_id, vec![test_flag_ft], Some(Value::Bool(true))),
+                swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("CreateTest_{}_{}_{}", client_id, chrono::Utc::now().timestamp(), fastrand::u32(..)))),
+                swrite!(test_entity_id, sfield![test_value_ft], sint!(fastrand::i64(..))),
+                swrite!(test_entity_id, sfield![test_flag_ft], Some(Value::Bool(true))),
             ])?;
         }
         TestType::Search => {
@@ -321,10 +321,10 @@ fn perform_test_operation(
             // Multiple writes to the existing test entity
             let mut requests = Vec::new();
             for i in 0..10 {
-                requests.push(swrite!(test_entity_id, vec![test_string_ft], sstr!(format!("BulkTest_{}_{}", client_id, i))));
-                requests.push(swrite!(test_entity_id, vec![test_value_ft], sint!(client_id as i64 * 10 + i as i64)));
+                requests.push(swrite!(test_entity_id, sfield![test_string_ft], sstr!(format!("BulkTest_{}_{}", client_id, i))));
+                requests.push(swrite!(test_entity_id, sfield![test_value_ft], sint!(client_id as i64 * 10 + i as i64)));
                 if i % 2 == 0 {
-                    requests.push(swrite!(test_entity_id, vec![test_flag_ft], Some(Value::Bool(i % 4 == 0))));
+                    requests.push(swrite!(test_entity_id, sfield![test_flag_ft], Some(Value::Bool(i % 4 == 0))));
                 }
             }
             store.perform(requests)?;

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{sread, EntityId, EntityType, FieldType, PageOpts, PageResult, StoreProxy, Value};
+use qlib_rs::{sread, EntityId, EntityType, IndirectFieldType, PageOpts, PageResult, StoreProxy, Value};
 use std::collections::HashMap;
 use tracing::{info, debug};
 use serde_json;
@@ -424,7 +424,7 @@ fn execute_query(
 }
 
 /// Parse the fields parameter into a list of field paths (Vec<FieldType> for each field)
-fn parse_fields(store: &mut StoreProxy, fields: &Option<String>) -> Result<Vec<(String, Vec<FieldType>)>> {
+fn parse_fields(store: &mut StoreProxy, fields: &Option<String>) -> Result<Vec<(String, IndirectFieldType)>> {
     let field_names = match fields {
         Some(fields_str) => fields_str
             .split(',')
@@ -438,7 +438,7 @@ fn parse_fields(store: &mut StoreProxy, fields: &Option<String>) -> Result<Vec<(
     for field_name in field_names {
         // Parse field indirection syntax (e.g., "Parent->Name")
         let field_parts: Vec<&str> = field_name.split("->").collect();
-        let mut field_types = Vec::new();
+        let mut field_types = IndirectFieldType::new();
         
         for part in field_parts {
             let field_type = store.get_field_type(part)
@@ -456,7 +456,7 @@ fn parse_fields(store: &mut StoreProxy, fields: &Option<String>) -> Result<Vec<(
 fn fetch_entity_data(
     store: &mut StoreProxy,
     entity_ids: &[EntityId],
-    fields: &[(String, Vec<FieldType>)],
+    fields: &[(String, IndirectFieldType)],
 ) -> Result<(Vec<EntityDisplay>, usize)> {
     let mut results = Vec::new();
     let mut fields_fetched = 0;

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::Request;
+use qlib_rs::{IndirectFieldType, Request};
 use std::path::PathBuf;
 use tabled::{Table, Tabled};
 use std::fs::{File, read_dir};
@@ -716,7 +716,7 @@ impl WalReader {
     }
 
     /// Format field types as a readable string
-    fn format_field_types(field_types: &Vec<qlib_rs::FieldType>) -> String {
+    fn format_field_types(field_types: &IndirectFieldType) -> String {
         if field_types.len() == 1 {
             format!("{}", field_types[0].0)
         } else {
