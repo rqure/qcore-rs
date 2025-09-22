@@ -638,7 +638,7 @@ impl CoreService {
             StoreMessage::Perform { id, requests } => {
                 match self.check_requests_authorization(client_id, requests) {
                     Ok(authorized_requests) => {
-                        match self.store.perform(authorized_requests) {
+                        match self.store.perform_mut(authorized_requests) {
                             Ok(results) => Ok(StoreMessage::PerformResponse {
                                 id,
                                 response: Ok(results),
