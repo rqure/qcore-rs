@@ -662,7 +662,7 @@ impl CoreService {
                 match self.store.get_complete_entity_schema(entity_type) {
                     Ok(schema) => Ok(StoreMessage::GetCompleteEntitySchemaResponse {
                         id,
-                        response: Ok(schema),
+                        response: Ok(schema.clone()),
                     }),
                     Err(e) => Ok(StoreMessage::GetCompleteEntitySchemaResponse {
                         id,
