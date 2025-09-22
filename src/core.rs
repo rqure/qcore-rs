@@ -25,15 +25,22 @@ pub struct CoreConfig {
     /// Port for unified client and peer communication
     pub port: u16,
     /// Machine ID for request origination
-    #[allow(dead_code)]
     pub machine: String,
+    /// Peer mapping (machine_id -> address)
+    pub peers: HashMap<String, String>,
 }
 
 impl From<&crate::Config> for CoreConfig {
     fn from(config: &crate::Config) -> Self {
+        let peers = config.peer_addresses
+            .as_ref()
+            .map(|p| p.peers.clone())
+            .unwrap_or_default();
+            
         Self {
             port: config.port,
             machine: config.machine.clone(),
+            peers,
         }
     }
 }

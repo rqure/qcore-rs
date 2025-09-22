@@ -4,6 +4,7 @@ mod files;
 mod core;
 
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 use anyhow::Result;
 use clap::Parser;
@@ -14,6 +15,53 @@ use crate::{
     snapshot::{SnapshotConfig, SnapshotService},
     wal::{WalConfig, WalService},
 };
+
+/// Peer configuration mapping machine ID to address
+#[derive(Clone, Debug)]
+pub struct PeerMapping {
+    pub peers: HashMap<String, String>,
+}
+
+impl std::str::FromStr for PeerMapping {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let mut peers = HashMap::new();
+        
+        if s.trim().is_empty() {
+            return Ok(PeerMapping { peers });
+        }
+        
+        for pair in s.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            
+            let parts: Vec<&str> = pair.split('=').collect();
+            if parts.len() != 2 {
+                return Err(anyhow::anyhow!(
+                    "Invalid peer format '{}'. Expected format: machine_id=host:port", 
+                    pair
+                ));
+            }
+            
+            let machine_id = parts[0].trim().to_string();
+            let address = parts[1].trim().to_string();
+            
+            if machine_id.is_empty() || address.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Machine ID and address cannot be empty in '{}'", 
+                    pair
+                ));
+            }
+            
+            peers.insert(machine_id, address);
+        }
+        
+        Ok(PeerMapping { peers })
+    }
+}
 
 /// Configuration passed via CLI arguments
 #[derive(Parser, Clone, Debug)]
@@ -47,9 +95,10 @@ pub struct Config {
     #[arg(long, default_value_t = 9100)]
     pub port: u16,
 
-    /// List of peer addresses to connect to (format: host:port)
-    #[arg(long, value_delimiter = ',')]
-    pub peer_addresses: Vec<String>,
+    /// List of peer addresses to connect to (format: machine_id=host:port)
+    /// Example: qos-b=localhost:9101,qos-c=localhost:9102
+    #[arg(long)]
+    pub peer_addresses: Option<PeerMapping>,
 }
 
 fn main() -> Result<()> {

@@ -42,7 +42,8 @@ get_peer_addresses() {
             if [ -n "$peers" ]; then
                 peers="${peers},"
             fi
-            peers="${peers}localhost:$((BASE_PORT + i))"
+            local peer_name=$(get_node_name $i)
+            peers="${peers}${peer_name}=localhost:$((BASE_PORT + i))"
         fi
     done
     echo "$peers"
