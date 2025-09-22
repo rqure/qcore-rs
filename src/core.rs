@@ -576,7 +576,7 @@ impl CoreService {
         
         let response = match &message {
             StoreMessage::Authenticate { id, subject_name, credential } => {
-                self.handle_authentication(token, id.clone(), subject_name.clone(), credential.clone())?
+                self.handle_authentication(token, *id, subject_name.clone(), credential.clone())?
             }
             _ => {
                 // All other messages require authentication
@@ -586,7 +586,7 @@ impl CoreService {
                     
                 if !is_authenticated {
                     StoreMessage::Error {
-                        id: self.extract_message_id(&message).unwrap_or_else(|| "unknown".to_string()),
+                        id: self.extract_message_id(&message).unwrap_or(0),
                         error: "Authentication required".to_string(),
                     }
                 } else {
@@ -605,7 +605,7 @@ impl CoreService {
     }
     
     /// Handle authentication message
-    fn handle_authentication(&mut self, token: Token, id: String, subject_name: String, credential: String) -> Result<StoreMessage> {
+    fn handle_authentication(&mut self, token: Token, id: u64, subject_name: String, credential: String) -> Result<StoreMessage> {
         let auth_config = AuthConfig::default();
         
         match authenticate_subject(&mut self.store, &subject_name, &credential, &auth_config) {
@@ -853,7 +853,7 @@ impl CoreService {
             
             _ => {
                 Ok(StoreMessage::Error {
-                    id: self.extract_message_id(&message).unwrap_or_else(|| "unknown".to_string()),
+                    id: self.extract_message_id(&message).unwrap_or(0),
                     error: "Unsupported message type".to_string(),
                 })
             }
@@ -932,7 +932,7 @@ impl CoreService {
     }
     
     /// Extract message ID from a store message
-    fn extract_message_id(&self, message: &StoreMessage) -> Option<String> {
+    fn extract_message_id(&self, message: &StoreMessage) -> Option<u64> {
         qlib_rs::data::extract_message_id(message)
     }
     
