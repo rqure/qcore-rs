@@ -831,7 +831,7 @@ impl CoreService {
         match command {
             CoreCommand::Perform { requests } => {
                 debug!("Handling perform command with {} requests", requests.len());
-                if let Err(e) = self.store.perform(requests) {
+                if let Err(e) = self.store.perform_mut(requests) {
                     error!("Error performing requests: {}", e);
                 }
             }
