@@ -1014,6 +1014,14 @@ impl CoreService {
             CoreCommand::PeerConnected { machine_id, mut stream } => {
                 debug!("Adding peer connection for machine {}", machine_id);
                 
+                // Check if peer is already connected
+                if let Some((existing_token_opt, _entity_id_opt)) = self.peers.get(&machine_id) {
+                    if existing_token_opt.is_some() {
+                        warn!("Peer {} is already connected, ignoring new connection", machine_id);
+                        return;
+                    }
+                }
+                
                 let token = Token(self.next_token);
                 self.next_token += 1;
                 
@@ -1039,7 +1047,7 @@ impl CoreService {
                 let connection = Connection {
                     stream,
                     addr_string: addr,
-                    authenticated: true,
+                    authenticated: false, // Start as unauthenticated
                     client_id,
                     notification_queue: NotificationQueue::new(),
                     notification_configs: HashSet::new(),
@@ -1049,6 +1057,18 @@ impl CoreService {
                 
                 self.connections.insert(token, connection);
                 info!("Peer {} connected with token {:?}", machine_id, token);
+                
+                // Send authentication message to the peer
+                let auth_message = StoreMessage::Authenticate {
+                    id: 1, // Simple ID for peer authentication
+                    subject_name: self.config.machine.clone(),
+                    credential: "peer".to_string(), // Simple peer credential
+                };
+                
+                if let Err(e) = self.send_response(token, auth_message) {
+                    error!("Failed to send authentication to peer {}: {}", machine_id, e);
+                    self.remove_connection(token);
+                }
             }
             CoreCommand::GetPeers { respond_to } => {
                 let peers = self.peers.clone();
