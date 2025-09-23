@@ -69,7 +69,7 @@ pub enum CoreCommand {
     },
     GetPeers {
         respond_to: Sender<AHashMap<String, (Option<Token>, Option<EntityId>)>>,
-    }
+    },
 }
 
 /// Handle for communicating with core service
@@ -150,6 +150,7 @@ pub struct CoreService {
     peers: AHashMap<String, PeerInfo>,
     next_token: usize,
     start_time: u64, // Unix timestamp when this service started
+    is_leader: bool, // Whether this service is currently the leader
     
     // Store and related components (replacing StoreService)
     store: Store,
@@ -253,6 +254,7 @@ impl CoreService {
             peers: AHashMap::default(),
             next_token: 1,
             start_time,
+            is_leader: true, // Start as leader until we learn about older peers
             store,
             permission_cache: None,
             cel_executor,
@@ -666,6 +668,9 @@ impl CoreService {
                 }
             }
         }
+
+        // Re-evaluate leadership after restoration
+        self.evaluate_leadership();
     }
 
     /// Handle peer handshake message
@@ -698,6 +703,33 @@ impl CoreService {
         self.evaluate_sync_needs();
         
         Ok(())
+    }
+    
+    /// Evaluate leadership status based on start times
+    fn evaluate_leadership(&mut self) {
+        // Find the peer with the earliest start time (longest running)
+        let mut oldest_start_time = self.start_time;
+        let mut has_older_peer = false;
+        
+        for (_machine_id, peer_info) in &self.peers {
+            if let Some(start_time) = peer_info.start_time {
+                if start_time < oldest_start_time {
+                    oldest_start_time = start_time;
+                    has_older_peer = true;
+                }
+            }
+        }
+        
+        let was_leader = self.is_leader;
+        self.is_leader = !has_older_peer;
+        
+        if was_leader != self.is_leader {
+            if self.is_leader {
+                info!("This service is now the leader (started at {})", self.start_time);
+            } else {
+                info!("This service is no longer the leader (older peer found with start time {})", oldest_start_time);
+            }
+        }
     }
     
     /// Evaluate if we need to sync and from which peer
@@ -739,6 +771,9 @@ impl CoreService {
             // We are the oldest peer, no need to sync
             debug!("We are the oldest peer (started at {}), no sync needed", self.start_time);
         }
+        
+        // Always evaluate leadership after checking sync needs
+        self.evaluate_leadership();
     }
     
     /// Handle peer full sync request
@@ -1169,7 +1204,7 @@ impl CoreService {
                             // Remove the peer's start time
                             peer_info.start_time = None;
                             
-                            // Re-evaluate sync needs with remaining peers
+                            // Re-evaluate sync needs and leadership with remaining peers
                             self.evaluate_sync_needs();
                             
                             break;
