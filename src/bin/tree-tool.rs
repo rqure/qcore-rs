@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{ft, sfield, sread, sreq, EntityId, EntityType, StoreProxy, Value, Requests};
+use qlib_rs::{ft, sfield, sread, sreq, EntityId, EntityType, StoreProxy, Value};
 use tracing::{info, warn};
 
 /// Command-line tool for displaying the tree structure of the QCore data store
