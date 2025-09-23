@@ -110,6 +110,24 @@ impl CoreHandle {
     }
 }
 
+/// Peer connection information
+#[derive(Debug, Clone)]
+struct PeerInfo {
+    token: Option<Token>,
+    entity_id: Option<EntityId>,
+    start_time: Option<u64>,
+}
+
+impl PeerInfo {
+    fn new() -> Self {
+        Self {
+            token: None,
+            entity_id: None,
+            start_time: None,
+        }
+    }
+}
+
 /// Client connection information  
 #[derive(Debug)]
 struct Connection {
@@ -129,8 +147,7 @@ pub struct CoreService {
     listener: MioTcpListener,
     poll: Poll,
     connections: FxHashMap<Token, Connection>,
-    peers: AHashMap<String, (Option<Token>, Option<EntityId>)>,
-    peer_start_times: AHashMap<String, u64>, // Track start times of all peers
+    peers: AHashMap<String, PeerInfo>,
     next_token: usize,
     start_time: u64, // Unix timestamp when this service started
     
@@ -234,7 +251,6 @@ impl CoreService {
             poll,
             connections: FxHashMap::default(),
             peers: AHashMap::default(),
-            peer_start_times: AHashMap::default(),
             next_token: 1,
             start_time,
             store,
@@ -249,7 +265,7 @@ impl CoreService {
 
         // Create initial peer entries
         for (machine_id, _address) in &service.config.peers {
-            service.peers.insert(machine_id.clone(), (None, None));
+            service.peers.insert(machine_id.clone(), PeerInfo::new());
         }
         
         Ok(service)
@@ -614,12 +630,14 @@ impl CoreService {
         }
 
         // Clear peer start times since we have new data
-        self.peer_start_times.clear();
+        for (_machine_id, peer_info) in self.peers.iter_mut() {
+            peer_info.start_time = None;
+        }
 
         // Clear machine ids in peers to force re-resolution
-        for (_machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
-            *entity_id_opt = None;
-            if let Some(token) = token_opt {
+        for (_machine_id, peer_info) in self.peers.iter_mut() {
+            peer_info.entity_id = None;
+            if let Some(token) = peer_info.token {
                 self.connections.get_mut(&token).map(|conn| {
                     conn.client_id = None;
                     conn.authenticated = false;
@@ -629,11 +647,11 @@ impl CoreService {
 
         // Update peer entity ids based on restored data
         if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
-            for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
+            for (machine_id, peer_info) in self.peers.iter_mut() {
                 if let Some(machines) = self.store.find_entities(etype, Some(format!("Name == '{}'", machine_id))).ok() {
                     if let Some(machine) = machines.first() {
-                        *entity_id_opt = Some(*machine);
-                        if let Some(token) = token_opt {
+                        peer_info.entity_id = Some(*machine);
+                        if let Some(token) = peer_info.token {
                             if let Some(connection) = self.connections.get_mut(&token) {
                                 connection.client_id = Some(*machine);
                                 connection.authenticated = true;
@@ -654,14 +672,16 @@ impl CoreService {
     fn handle_peer_handshake(&mut self, token: Token, peer_start_time: u64) -> Result<()> {
         // Find the machine ID for this peer connection
         let peer_machine_id = self.peers.iter()
-            .find(|(_, (token_opt, _))| token_opt.map_or(false, |t| t == token))
+            .find(|(_, peer_info)| peer_info.token.map_or(false, |t| t == token))
             .map(|(machine_id, _)| machine_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
             
         info!("Received handshake from peer {} with start time {}", peer_machine_id, peer_start_time);
         
         // Store this peer's start time
-        self.peer_start_times.insert(peer_machine_id.clone(), peer_start_time);
+        if let Some(peer_info) = self.peers.get_mut(&peer_machine_id) {
+            peer_info.start_time = Some(peer_start_time);
+        }
         
         // Send our handshake back with our start time
         let handshake_response = ProtocolMessage::PeerHandshake {
@@ -686,10 +706,12 @@ impl CoreService {
         let mut oldest_peer: Option<(String, u64)> = None;
         let mut oldest_start_time = self.start_time;
         
-        for (machine_id, start_time) in &self.peer_start_times {
-            if *start_time < oldest_start_time {
-                oldest_start_time = *start_time;
-                oldest_peer = Some((machine_id.clone(), *start_time));
+        for (machine_id, peer_info) in &self.peers {
+            if let Some(start_time) = peer_info.start_time {
+                if start_time < oldest_start_time {
+                    oldest_start_time = start_time;
+                    oldest_peer = Some((machine_id.clone(), start_time));
+                }
             }
         }
         
@@ -698,13 +720,17 @@ impl CoreService {
             info!("Found older peer {} (started at {}), requesting full sync", oldest_machine_id, oldest_time);
             
             // Find the token for this peer
-            if let Some((Some(peer_token), _)) = self.peers.get(&oldest_machine_id) {
-                let sync_request = ProtocolMessage::PeerFullSyncRequest;
-                
-                if let Err(e) = self.send_protocol_message(*peer_token, sync_request) {
-                    error!("Failed to send full sync request to older peer {}: {}", oldest_machine_id, e);
+            if let Some(peer_info) = self.peers.get(&oldest_machine_id) {
+                if let Some(peer_token) = peer_info.token {
+                    let sync_request = ProtocolMessage::PeerFullSyncRequest;
+                    
+                    if let Err(e) = self.send_protocol_message(peer_token, sync_request) {
+                        error!("Failed to send full sync request to older peer {}: {}", oldest_machine_id, e);
+                    } else {
+                        info!("Requested full sync from older peer {}", oldest_machine_id);
+                    }
                 } else {
-                    info!("Requested full sync from older peer {}", oldest_machine_id);
+                    warn!("Could not find connection token for older peer {}", oldest_machine_id);
                 }
             } else {
                 warn!("Could not find connection token for older peer {}", oldest_machine_id);
@@ -719,7 +745,7 @@ impl CoreService {
     fn handle_peer_full_sync_request(&mut self, token: Token) -> Result<()> {
         // Find the machine ID for this peer connection
         let requesting_machine_id = self.peers.iter()
-            .find(|(_, (token_opt, _))| token_opt.map_or(false, |t| t == token))
+            .find(|(_, peer_info)| peer_info.token.map_or(false, |t| t == token))
             .map(|(machine_id, _)| machine_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
             
@@ -817,11 +843,11 @@ impl CoreService {
                 
                 // Check if this authenticated client is a peer and update the peers map
                 let mut peer_handshake_info: Option<(Token, String)> = None;
-                for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
-                    if let Some(peer_entity_id) = entity_id_opt {
-                        if *peer_entity_id == subject_id {
+                for (machine_id, peer_info) in self.peers.iter_mut() {
+                    if let Some(peer_entity_id) = peer_info.entity_id {
+                        if peer_entity_id == subject_id {
                             info!("Authenticated client is known peer {}, updating token", machine_id);
-                            *token_opt = Some(token);
+                            peer_info.token = Some(token);
                             debug!("Updated peer {} with token {:?}", machine_id, token);
                             peer_handshake_info = Some((token, machine_id.clone()));
                             break;
@@ -1134,14 +1160,14 @@ impl CoreService {
             
             // If this is a peer connection, clear the token from peers mapping and start times
             if connection.authenticated && connection.client_id.is_some() {
-                for (machine_id, (token_opt, _entity_id_opt)) in self.peers.iter_mut() {
-                    if let Some(peer_token) = token_opt {
-                        if *peer_token == token {
+                for (machine_id, peer_info) in self.peers.iter_mut() {
+                    if let Some(peer_token) = peer_info.token {
+                        if peer_token == token {
                             info!("Clearing token for disconnected peer {}", machine_id);
-                            *token_opt = None;
+                            peer_info.token = None;
                             
                             // Remove the peer's start time
-                            self.peer_start_times.remove(machine_id);
+                            peer_info.start_time = None;
                             
                             // Re-evaluate sync needs with remaining peers
                             self.evaluate_sync_needs();
@@ -1188,8 +1214,8 @@ impl CoreService {
                 debug!("Adding peer connection for machine {}", machine_id);
                 
                 // Check if peer is already connected
-                if let Some((existing_token_opt, _entity_id_opt)) = self.peers.get(&machine_id) {
-                    if existing_token_opt.is_some() {
+                if let Some(peer_info) = self.peers.get(&machine_id) {
+                    if peer_info.token.is_some() {
                         warn!("Peer {} is already connected, ignoring new connection", machine_id);
                         return;
                     }
@@ -1209,10 +1235,10 @@ impl CoreService {
                 }
 
                 let addr = stream.peer_addr().map(|addr| addr.to_string()).expect("Failed to get peer address");
-                let client_id = if let Some((token_opt, entity_id_opt)) = self.peers.get_mut(&machine_id) {
+                let client_id = if let Some(peer_info) = self.peers.get_mut(&machine_id) {
                     // Update the token in the peers mapping
-                    *token_opt = Some(token);
-                    *entity_id_opt
+                    peer_info.token = Some(token);
+                    peer_info.entity_id
                 } else {
                     None
                 };
@@ -1244,8 +1270,13 @@ impl CoreService {
                 }
             }
             CoreCommand::GetPeers { respond_to } => {
-                let peers = self.peers.clone();
-                if let Err(e) = respond_to.send(peers) {
+                // Convert PeerInfo to the expected tuple format
+                let peers_response: AHashMap<String, (Option<Token>, Option<EntityId>)> = 
+                    self.peers.iter().map(|(machine_id, peer_info)| {
+                        (machine_id.clone(), (peer_info.token, peer_info.entity_id))
+                    }).collect();
+                
+                if let Err(e) = respond_to.send(peers_response) {
                     error!("Failed to send peers response: {}", e);
                 }
             }
