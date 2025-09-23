@@ -642,6 +642,18 @@ impl CoreService {
                     info!("Client {} authenticated as {:?}", connection.addr_string, subject_id);
                 }
                 
+                // Check if this authenticated client is a peer and update the peers map
+                for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
+                    if let Some(peer_entity_id) = entity_id_opt {
+                        if *peer_entity_id == subject_id {
+                            info!("Authenticated client is known peer {}, updating token", machine_id);
+                            *token_opt = Some(token);
+                            debug!("Updated peer {} with token {:?}", machine_id, token);
+                            break;
+                        }
+                    }
+                }
+                
                 let auth_result = AuthenticationResult {
                     subject_id: subject_id.clone(),
                 };
