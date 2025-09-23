@@ -913,6 +913,19 @@ impl CoreService {
             for config in &connection.notification_configs {
                 self.store.unregister_notification(config, &connection.notification_queue);
             }
+            
+            // If this is a peer connection, clear the token from peers mapping
+            if connection.authenticated && connection.client_id.is_some() {
+                for (machine_id, (token_opt, _entity_id_opt)) in self.peers.iter_mut() {
+                    if let Some(peer_token) = token_opt {
+                        if *peer_token == token {
+                            info!("Clearing token for disconnected peer {}", machine_id);
+                            *token_opt = None;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -1003,7 +1016,9 @@ impl CoreService {
                 }
 
                 let addr = stream.peer_addr().map(|addr| addr.to_string()).expect("Failed to get peer address");
-                let client_id = if let Some((_, entity_id_opt)) = self.peers.get_mut(&machine_id) {
+                let client_id = if let Some((token_opt, entity_id_opt)) = self.peers.get_mut(&machine_id) {
+                    // Update the token in the peers mapping
+                    *token_opt = Some(token);
                     *entity_id_opt
                 } else {
                     None
