@@ -599,6 +599,57 @@ impl CoreService {
         Ok(())
     }
     
+    /// Handle complete snapshot restoration including store, cache, and peer reinitialization
+    fn handle_snapshot_restoration(&mut self, snapshot: Snapshot) {
+        // Restore the snapshot to our store
+        self.store.restore_snapshot(snapshot);
+        
+        // Recreate permission cache after restoration
+        self.permission_cache = self.create_permission_cache();
+        
+        if self.permission_cache.is_some() {
+            debug!("Permission cache recreated after restore");
+        } else {
+            warn!("Failed to recreate permission cache after restore");
+        }
+
+        // Clear peer start times since we have new data
+        self.peer_start_times.clear();
+
+        // Clear machine ids in peers to force re-resolution
+        for (_machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
+            *entity_id_opt = None;
+            if let Some(token) = token_opt {
+                self.connections.get_mut(&token).map(|conn| {
+                    conn.client_id = None;
+                    conn.authenticated = false;
+                });
+            }
+        }
+
+        // Update peer entity ids based on restored data
+        if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
+            for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
+                if let Some(machines) = self.store.find_entities(etype, Some(format!("Name == '{}'", machine_id))).ok() {
+                    if let Some(machine) = machines.first() {
+                        *entity_id_opt = Some(*machine);
+                        if let Some(token) = token_opt {
+                            if let Some(connection) = self.connections.get_mut(&token) {
+                                connection.client_id = Some(*machine);
+                                connection.authenticated = true;
+                            }
+                        }
+                        debug!("Updated entity ID for peer {} after restore: {:?}", machine_id, machine);
+                    } else {
+                        warn!("No entity found for peer {} after restore", machine_id);
+                    }
+                } else {
+                    warn!("Failed to query entity for peer {} after restore", machine_id);
+                }
+            }
+        }
+    }
+
     /// Handle peer handshake message
     fn handle_peer_handshake(&mut self, token: Token, peer_start_time: u64) -> Result<()> {
         // Find the machine ID for this peer connection
@@ -694,53 +745,8 @@ impl CoreService {
     fn handle_peer_full_sync_response(&mut self, _token: Token, snapshot: Snapshot) -> Result<()> {
         info!("Received full sync response, restoring snapshot");
         
-        // Restore the snapshot to our store
-        self.store.restore_snapshot(snapshot);
-        
-        // Recreate permission cache after restoration
-        self.permission_cache = self.create_permission_cache();
-        
-        if self.permission_cache.is_some() {
-            debug!("Permission cache recreated after peer sync");
-        } else {
-            warn!("Failed to recreate permission cache after peer sync");
-        }
-
-        // Clear peer start times since we have new data
-        self.peer_start_times.clear();
-
-        // Clear machine ids in peers to force re-resolution
-        for (_machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
-            *entity_id_opt = None;
-            if let Some(token) = token_opt {
-                self.connections.get_mut(&token).map(|conn| {
-                    conn.client_id = None;
-                    conn.authenticated = false;
-                });
-            }
-        }
-
-        // Update peer entity ids based on restored data
-        if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
-            for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
-                if let Some(machines) = self.store.find_entities(etype, Some(format!("Name == '{}'", machine_id))).ok() {
-                    if let Some(machine) = machines.first() {
-                        *entity_id_opt = Some(*machine);
-                        if let Some(token) = token_opt {
-                            if let Some(connection) = self.connections.get_mut(&token) {
-                                connection.client_id = Some(*machine);
-                                connection.authenticated = true;
-                            }
-                        }
-                        debug!("Updated entity ID for peer {} after sync: {:?}", machine_id, machine);
-                    } else {
-                        warn!("No entity found for peer {} after sync", machine_id);
-                    }
-                } else {
-                    warn!("Failed to query entity for peer {} after sync", machine_id);
-                }
-            }
-        }
+        // Handle complete snapshot restoration
+        self.handle_snapshot_restoration(snapshot);
         
         info!("Full sync completed successfully");
         
@@ -1166,49 +1172,9 @@ impl CoreService {
             }
             CoreCommand::RestoreSnapshot { snapshot } => {
                 debug!("Handling restore snapshot command");
-                self.store.restore_snapshot(snapshot);
                 
-                // Recreate the permission cache after restoring the snapshot
-                self.permission_cache = self.create_permission_cache();
-                
-                if self.permission_cache.is_some() {
-                    debug!("Permission cache recreated after snapshot restore");
-                } else {
-                    warn!("Failed to recreate permission cache after snapshot restore");
-                }
-
-                // Clear machine ids in peers to force re-resolution
-                for (_machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
-                    *entity_id_opt = None;
-                    if let Some(token) = token_opt {
-                        self.connections.get_mut(&token).map(|conn| {
-                            conn.client_id = None;
-                            conn.authenticated = false;
-                        });
-                    }
-                }
-
-                // Update peer entity ids based on restored data
-                if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
-                    for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
-                        if let Some(machines) = self.store.find_entities(etype, Some(format!("Name == '{}'", machine_id))).ok() {
-                            if let Some(machine) = machines.first() {
-                                *entity_id_opt = Some(*machine);
-                                if let Some(token) = token_opt {
-                                    if let Some(connection) = self.connections.get_mut(&token) {
-                                        connection.client_id = Some(*machine);
-                                        connection.authenticated = true;
-                                    }
-                                }
-                                debug!("Updated entity ID for peer {}: {:?}", machine_id, machine);
-                            } else {
-                                warn!("No entity found for peer {}", machine_id);
-                            }
-                        } else {
-                            warn!("Failed to query entity for peer {}", machine_id);
-                        }
-                    }
-                }
+                // Handle complete snapshot restoration
+                self.handle_snapshot_restoration(snapshot);
             }
             CoreCommand::SetSnapshotHandle { snapshot_handle } => {
                 debug!("Setting snapshot handle");
