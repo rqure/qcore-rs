@@ -946,16 +946,28 @@ impl CoreService {
                 }
 
                 // Clear machine ids in peers to force re-resolution
-                for (_machine_id, (_token_opt, entity_id_opt)) in self.peers.iter_mut() {
+                for (_machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
                     *entity_id_opt = None;
+                    if let Some(token) = token_opt {
+                        self.connections.get_mut(&token).map(|conn| {
+                            conn.client_id = None;
+                            conn.authenticated = false;
+                        });
+                    }
                 }
 
                 // Update peer entity ids based on restored data
                 if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
-                    for (machine_id, (_token_opt, entity_id_opt)) in self.peers.iter_mut() {
+                    for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
                         if let Some(machines) = self.store.find_entities(etype, Some(format!("Name == '{}'", machine_id))).ok() {
                             if let Some(machine) = machines.first() {
                                 *entity_id_opt = Some(*machine);
+                                if let Some(token) = token_opt {
+                                    if let Some(connection) = self.connections.get_mut(&token) {
+                                        connection.client_id = Some(*machine);
+                                        connection.authenticated = true;
+                                    }
+                                }
                                 debug!("Updated entity ID for peer {}: {:?}", machine_id, machine);
                             } else {
                                 warn!("No entity found for peer {}", machine_id);
@@ -991,12 +1003,17 @@ impl CoreService {
                 }
 
                 let addr = stream.peer_addr().map(|addr| addr.to_string()).expect("Failed to get peer address");
+                let client_id = if let Some((_, entity_id_opt)) = self.peers.get_mut(&machine_id) {
+                    *entity_id_opt
+                } else {
+                    None
+                };
 
                 let connection = Connection {
                     stream,
                     addr_string: addr,
                     authenticated: true,
-                    client_id: None,
+                    client_id,
                     notification_queue: NotificationQueue::new(),
                     notification_configs: HashSet::new(),
                     outbound_messages: VecDeque::new(),
