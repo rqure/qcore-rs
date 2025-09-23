@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ahash::AHashMap;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::{et, Requests};
+use qlib_rs::{et, schoice, sfield, sreq, swrite, Requests};
 use rustc_hash::FxHashMap;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
@@ -150,6 +150,8 @@ pub struct CoreService {
     peers: AHashMap<String, PeerInfo>,
     next_token: usize,
     start_time: u64, // Unix timestamp when this service started
+    last_heartbeat_tick: Instant,
+    last_fault_tolerance_tick: Instant,
     is_leader: bool, // Whether this service is currently the leader
     
     // Store and related components (replacing StoreService)
@@ -254,6 +256,8 @@ impl CoreService {
             peers: AHashMap::default(),
             next_token: 1,
             start_time,
+            last_heartbeat_tick: Instant::now(),
+            last_fault_tolerance_tick: Instant::now(),
             is_leader: true, // Start as leader until we learn about older peers
             store,
             permission_cache: None,
@@ -313,6 +317,18 @@ impl CoreService {
                             service.handle_connection_event(token, event);
                         }
                     }
+                }
+
+                // Run periodic maintenance tasks before processing commands
+                let now = Instant::now();
+                if now.duration_since(service.last_heartbeat_tick) >= Duration::from_secs(1) {
+                    service.last_heartbeat_tick = now;
+                    service.write_heartbeat();
+                }
+
+                if now.duration_since(service.last_fault_tolerance_tick) >= Duration::from_millis(100) {
+                    service.last_fault_tolerance_tick = now;
+                    service.manage_fault_tolerance();
                 }
 
                 while let Ok(request) = receiver.try_recv() {
@@ -1351,6 +1367,79 @@ impl CoreService {
         for token in tokens_to_remove {
             self.remove_connection(token);
         }
+    }
+
+    fn write_heartbeat(&mut self) {
+        let et_candidate = {
+            if let Some(et) = self.store.et {
+                if let Some(candidate) = et.candidate {
+                    candidate
+                } else {
+                    warn!("Entity type 'Candidate' not found in store");
+                    return;
+                }
+            } else {
+                warn!("Entity type 'Candidate' not found in store");
+                return;
+            }
+        };
+
+        let ft_heartbeat = {
+            if let Some(ft) = self.store.ft {
+                if let Some(field) = ft.heartbeat {
+                    field
+                } else {
+                    warn!("Field type 'Heartbeat' not found in store");
+                    return;
+                }
+            } else {
+                warn!("Field type 'Heartbeat' not found in store");
+                return;
+            }
+        };
+
+        let ft_make_me = {
+            if let Some(ft) = self.store.ft {
+                if let Some(field) = ft.make_me {
+                    field
+                } else {
+                    warn!("Field type 'MakeMe' not found in store");
+                    return;
+                }
+            } else {
+                warn!("Field type 'MakeMe' not found in store");
+                return;
+            }
+        };
+
+        let machine = &self.config.machine;
+
+        let candidates = {
+            let result = self.store.find_entities(
+            et_candidate, 
+            Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine)))
+
+            match result {
+                Ok(ents) => ents,
+                Err(e) => {
+                    warn!("Failed to query candidate entity for heartbeat: {}", e);
+                    return;
+                }
+            }
+        };
+
+        if let Some(candidate) = candidates.first() {
+            self.store.perform_mut(sreq![
+                swrite!(*candidate, sfield![ft_heartbeat], schoice!(0)),
+                swrite!(*candidate, sfield![ft_make_me], schoice!(1), PushCondition::Changes)
+            ]).unwrap_or_else(|e| {
+                warn!("Failed to write heartbeat fields: {}", e);
+            });
+        }
+    }
+
+    fn manage_fault_tolerance(&mut self) {
+
     }
     
 }
