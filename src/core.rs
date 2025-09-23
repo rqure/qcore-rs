@@ -5,7 +5,7 @@ use ahash::AHashMap;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::{et, schoice, sfield, sreq, swrite, Requests};
+use qlib_rs::{et, schoice, sfield, sreq, swrite, Requests, PushCondition};
 use rustc_hash::FxHashMap;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
@@ -1371,7 +1371,7 @@ impl CoreService {
 
     fn write_heartbeat(&mut self) {
         let et_candidate = {
-            if let Some(et) = self.store.et {
+            if let Some(et) = self.store.et.as_ref() {
                 if let Some(candidate) = et.candidate {
                     candidate
                 } else {
@@ -1385,7 +1385,7 @@ impl CoreService {
         };
 
         let ft_heartbeat = {
-            if let Some(ft) = self.store.ft {
+            if let Some(ft) = self.store.ft.as_ref() {
                 if let Some(field) = ft.heartbeat {
                     field
                 } else {
@@ -1399,7 +1399,7 @@ impl CoreService {
         };
 
         let ft_make_me = {
-            if let Some(ft) = self.store.ft {
+            if let Some(ft) = self.store.ft.as_ref() {
                 if let Some(field) = ft.make_me {
                     field
                 } else {
@@ -1417,7 +1417,7 @@ impl CoreService {
         let candidates = {
             let result = self.store.find_entities(
             et_candidate, 
-            Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine)))
+            Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine)));
 
             match result {
                 Ok(ents) => ents,
@@ -1429,12 +1429,12 @@ impl CoreService {
         };
 
         if let Some(candidate) = candidates.first() {
-            self.store.perform_mut(sreq![
+            if let Err(e) = self.store.perform_mut(sreq![
                 swrite!(*candidate, sfield![ft_heartbeat], schoice!(0)),
                 swrite!(*candidate, sfield![ft_make_me], schoice!(1), PushCondition::Changes)
-            ]).unwrap_or_else(|e| {
+            ]) {
                 warn!("Failed to write heartbeat fields: {}", e);
-            });
+            }
         }
     }
 
