@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::time::{Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ahash::AHashMap;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
@@ -130,7 +130,9 @@ pub struct CoreService {
     poll: Poll,
     connections: FxHashMap<Token, Connection>,
     peers: AHashMap<String, (Option<Token>, Option<EntityId>)>,
+    peer_start_times: AHashMap<String, u64>, // Track start times of all peers
     next_token: usize,
+    start_time: u64, // Unix timestamp when this service started
     
     // Store and related components (replacing StoreService)
     store: Store,
@@ -220,13 +222,21 @@ impl CoreService {
         let store = Store::new();
         let cel_executor = CelExecutor::new();
         
+        // Capture start time as Unix timestamp
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
         let mut service = Self {
             config,
             listener,
             poll,
             connections: FxHashMap::default(),
             peers: AHashMap::default(),
+            peer_start_times: AHashMap::default(),
             next_token: 1,
+            start_time,
             store,
             permission_cache: None,
             cel_executor,
@@ -589,14 +599,171 @@ impl CoreService {
         Ok(())
     }
     
+    /// Handle peer handshake message
+    fn handle_peer_handshake(&mut self, token: Token, peer_start_time: u64) -> Result<()> {
+        // Find the machine ID for this peer connection
+        let peer_machine_id = self.peers.iter()
+            .find(|(_, (token_opt, _))| token_opt.map_or(false, |t| t == token))
+            .map(|(machine_id, _)| machine_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+            
+        info!("Received handshake from peer {} with start time {}", peer_machine_id, peer_start_time);
+        
+        // Store this peer's start time
+        self.peer_start_times.insert(peer_machine_id.clone(), peer_start_time);
+        
+        // Send our handshake back with our start time
+        let handshake_response = ProtocolMessage::PeerHandshake {
+            start_time: self.start_time,
+        };
+        
+        if let Err(e) = self.send_protocol_message(token, handshake_response) {
+            error!("Failed to send handshake response to peer {}: {}", peer_machine_id, e);
+        } else {
+            info!("Sent handshake response to peer {} with our start time {}", peer_machine_id, self.start_time);
+        }
+        
+        // Check if we should sync based on all known peers
+        self.evaluate_sync_needs();
+        
+        Ok(())
+    }
+    
+    /// Evaluate if we need to sync and from which peer
+    fn evaluate_sync_needs(&mut self) {
+        // Find the peer with the earliest start time (longest running)
+        let mut oldest_peer: Option<(String, u64)> = None;
+        let mut oldest_start_time = self.start_time;
+        
+        for (machine_id, start_time) in &self.peer_start_times {
+            if *start_time < oldest_start_time {
+                oldest_start_time = *start_time;
+                oldest_peer = Some((machine_id.clone(), *start_time));
+            }
+        }
+        
+        // If we found an older peer, sync from them
+        if let Some((oldest_machine_id, oldest_time)) = oldest_peer {
+            info!("Found older peer {} (started at {}), requesting full sync", oldest_machine_id, oldest_time);
+            
+            // Find the token for this peer
+            if let Some((Some(peer_token), _)) = self.peers.get(&oldest_machine_id) {
+                let sync_request = ProtocolMessage::PeerFullSyncRequest;
+                
+                if let Err(e) = self.send_protocol_message(*peer_token, sync_request) {
+                    error!("Failed to send full sync request to older peer {}: {}", oldest_machine_id, e);
+                } else {
+                    info!("Requested full sync from older peer {}", oldest_machine_id);
+                }
+            } else {
+                warn!("Could not find connection token for older peer {}", oldest_machine_id);
+            }
+        } else {
+            // We are the oldest peer, no need to sync
+            debug!("We are the oldest peer (started at {}), no sync needed", self.start_time);
+        }
+    }
+    
+    /// Handle peer full sync request
+    fn handle_peer_full_sync_request(&mut self, token: Token) -> Result<()> {
+        // Find the machine ID for this peer connection
+        let requesting_machine_id = self.peers.iter()
+            .find(|(_, (token_opt, _))| token_opt.map_or(false, |t| t == token))
+            .map(|(machine_id, _)| machine_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+            
+        info!("Received full sync request from peer {}", requesting_machine_id);
+        
+        // Take a snapshot of our current store
+        let snapshot = self.store.take_snapshot();
+        
+        let sync_response = ProtocolMessage::PeerFullSyncResponse {
+            snapshot,
+        };
+        
+        if let Err(e) = self.send_protocol_message(token, sync_response) {
+            error!("Failed to send full sync response to peer {}: {}", requesting_machine_id, e);
+        } else {
+            info!("Sent full sync response to peer {}", requesting_machine_id);
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle peer full sync response
+    fn handle_peer_full_sync_response(&mut self, _token: Token, snapshot: Snapshot) -> Result<()> {
+        info!("Received full sync response, restoring snapshot");
+        
+        // Restore the snapshot to our store
+        self.store.restore_snapshot(snapshot);
+        
+        // Recreate permission cache after restoration
+        self.permission_cache = self.create_permission_cache();
+        
+        if self.permission_cache.is_some() {
+            debug!("Permission cache recreated after peer sync");
+        } else {
+            warn!("Failed to recreate permission cache after peer sync");
+        }
+
+        // Clear peer start times since we have new data
+        self.peer_start_times.clear();
+
+        // Clear machine ids in peers to force re-resolution
+        for (_machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
+            *entity_id_opt = None;
+            if let Some(token) = token_opt {
+                self.connections.get_mut(&token).map(|conn| {
+                    conn.client_id = None;
+                    conn.authenticated = false;
+                });
+            }
+        }
+
+        // Update peer entity ids based on restored data
+        if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
+            for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
+                if let Some(machines) = self.store.find_entities(etype, Some(format!("Name == '{}'", machine_id))).ok() {
+                    if let Some(machine) = machines.first() {
+                        *entity_id_opt = Some(*machine);
+                        if let Some(token) = token_opt {
+                            if let Some(connection) = self.connections.get_mut(&token) {
+                                connection.client_id = Some(*machine);
+                                connection.authenticated = true;
+                            }
+                        }
+                        debug!("Updated entity ID for peer {} after sync: {:?}", machine_id, machine);
+                    } else {
+                        warn!("No entity found for peer {} after sync", machine_id);
+                    }
+                } else {
+                    warn!("Failed to query entity for peer {} after sync", machine_id);
+                }
+            }
+        }
+        
+        info!("Full sync completed successfully");
+        
+        Ok(())
+    }
+    
     /// Handle a decoded protocol message
     fn handle_protocol_message(&mut self, token: Token, message: ProtocolMessage) -> Result<()> {
         match message {
             ProtocolMessage::Store(store_message) => {
                 self.handle_store_message(token, store_message)
             }
+            ProtocolMessage::PeerHandshake { start_time } => {
+                self.handle_peer_handshake(token, start_time)
+            }
+            ProtocolMessage::PeerFullSyncRequest => {
+                self.handle_peer_full_sync_request(token)
+            }
+            ProtocolMessage::PeerFullSyncResponse { snapshot } => {
+                self.handle_peer_full_sync_response(token, snapshot)
+            }
             _ => {
-                warn!("Received non-store protocol message from client");
+                warn!("Received unsupported protocol message from client");
                 Ok(())
             }
         }
@@ -643,14 +810,29 @@ impl CoreService {
                 }
                 
                 // Check if this authenticated client is a peer and update the peers map
+                let mut peer_handshake_info: Option<(Token, String)> = None;
                 for (machine_id, (token_opt, entity_id_opt)) in self.peers.iter_mut() {
                     if let Some(peer_entity_id) = entity_id_opt {
                         if *peer_entity_id == subject_id {
                             info!("Authenticated client is known peer {}, updating token", machine_id);
                             *token_opt = Some(token);
                             debug!("Updated peer {} with token {:?}", machine_id, token);
+                            peer_handshake_info = Some((token, machine_id.clone()));
                             break;
                         }
+                    }
+                }
+                
+                // Send handshake message if this was a peer
+                if let Some((peer_token, peer_machine_id)) = peer_handshake_info {
+                    let handshake_message = ProtocolMessage::PeerHandshake {
+                        start_time: self.start_time,
+                    };
+                    
+                    if let Err(e) = self.send_protocol_message(peer_token, handshake_message) {
+                        error!("Failed to send handshake to peer {}: {}", peer_machine_id, e);
+                    } else {
+                        info!("Sent handshake to peer {} with start time {}", peer_machine_id, self.start_time);
                     }
                 }
                 
@@ -897,6 +1079,24 @@ impl CoreService {
         }
     }
     
+    /// Send a protocol message to a connection
+    fn send_protocol_message(&mut self, token: Token, message: ProtocolMessage) -> Result<()> {
+        let encoded = ProtocolCodec::encode(&message)?;
+        
+        if let Some(connection) = self.connections.get_mut(&token) {
+            connection.outbound_messages.push_back(encoded);
+            
+            // Register for write events if we have messages to send
+            self.poll.registry().reregister(
+                &mut connection.stream,
+                token,
+                Interest::READABLE | Interest::WRITABLE
+            )?;
+        }
+        
+        Ok(())
+    }
+    
     /// Send a response message to a client
     fn send_response(&mut self, token: Token, response: StoreMessage) -> Result<()> {
         let protocol_message = ProtocolMessage::Store(response);
@@ -926,13 +1126,20 @@ impl CoreService {
                 self.store.unregister_notification(config, &connection.notification_queue);
             }
             
-            // If this is a peer connection, clear the token from peers mapping
+            // If this is a peer connection, clear the token from peers mapping and start times
             if connection.authenticated && connection.client_id.is_some() {
                 for (machine_id, (token_opt, _entity_id_opt)) in self.peers.iter_mut() {
                     if let Some(peer_token) = token_opt {
                         if *peer_token == token {
                             info!("Clearing token for disconnected peer {}", machine_id);
                             *token_opt = None;
+                            
+                            // Remove the peer's start time
+                            self.peer_start_times.remove(machine_id);
+                            
+                            // Re-evaluate sync needs with remaining peers
+                            self.evaluate_sync_needs();
+                            
                             break;
                         }
                     }
