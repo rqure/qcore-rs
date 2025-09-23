@@ -5,7 +5,7 @@ use ahash::AHashMap;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::{et, schoice, sfield, sreq, swrite, Requests, PushCondition};
+use qlib_rs::{et, schoice, sfield, sreq, sread, swrite, Requests, PushCondition};
 use rustc_hash::FxHashMap;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
@@ -1439,7 +1439,269 @@ impl CoreService {
     }
 
     fn manage_fault_tolerance(&mut self) {
+        if !self.is_leader {
+            return;
+        }
 
+        // Get required entity and field types
+        let (et_candidate, et_fault_tolerance, ft_candidate_list, ft_available_list, ft_current_leader, 
+             ft_make_me, ft_heartbeat, ft_death_detection_timeout) = {
+            let et = match self.store.et.as_ref() {
+                Some(et) => et,
+                None => {
+                    warn!("Entity types not available");
+                    return;
+                }
+            };
+            
+            let ft = match self.store.ft.as_ref() {
+                Some(ft) => ft,
+                None => {
+                    warn!("Field types not available");
+                    return;
+                }
+            };
+
+            let et_candidate = match et.candidate {
+                Some(candidate) => candidate,
+                None => {
+                    warn!("Entity type 'Candidate' not found");
+                    return;
+                }
+            };
+
+            let et_fault_tolerance = match et.fault_tolerance {
+                Some(ft) => ft,
+                None => {
+                    warn!("Entity type 'FaultTolerance' not found");
+                    return;
+                }
+            };
+
+            let ft_candidate_list = match ft.candidate_list {
+                Some(field) => field,
+                None => {
+                    warn!("Field type 'CandidateList' not found");
+                    return;
+                }
+            };
+
+            let ft_available_list = match ft.available_list {
+                Some(field) => field,
+                None => {
+                    warn!("Field type 'AvailableList' not found");
+                    return;
+                }
+            };
+
+            let ft_current_leader = match ft.current_leader {
+                Some(field) => field,
+                None => {
+                    warn!("Field type 'CurrentLeader' not found");
+                    return;
+                }
+            };
+
+            let ft_make_me = match ft.make_me {
+                Some(field) => field,
+                None => {
+                    warn!("Field type 'MakeMe' not found");
+                    return;
+                }
+            };
+
+            let ft_heartbeat = match ft.heartbeat {
+                Some(field) => field,
+                None => {
+                    warn!("Field type 'Heartbeat' not found");
+                    return;
+                }
+            };
+
+            let ft_death_detection_timeout = match ft.death_detection_timeout {
+                Some(field) => field,
+                None => {
+                    warn!("Field type 'DeathDetectionTimeout' not found");
+                    return;
+                }
+            };
+
+            (et_candidate, et_fault_tolerance, ft_candidate_list, ft_available_list, ft_current_leader,
+             ft_make_me, ft_heartbeat, ft_death_detection_timeout)
+        };
+
+        // Find us as a candidate
+        let me_as_candidate = {
+            let machine = &self.config.machine;
+            let candidates_result = self.store.find_entities(
+                et_candidate, 
+                Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))
+            );
+
+            match candidates_result {
+                Ok(mut candidates) => candidates.pop(),
+                Err(e) => {
+                    warn!("Failed to find candidate entity: {}", e);
+                    return;
+                }
+            }
+        };
+
+        // Get all fault tolerance entities
+        let fault_tolerances = match self.store.find_entities(et_fault_tolerance, None) {
+            Ok(entities) => entities,
+            Err(e) => {
+                warn!("Failed to find fault tolerance entities: {}", e);
+                return;
+            }
+        };
+
+        let now = qlib_rs::data::now();
+
+        for ft_entity_id in fault_tolerances {
+            // Read fault tolerance fields
+            let ft_read_requests = sreq![
+                sread!(ft_entity_id, sfield![ft_candidate_list]),
+                sread!(ft_entity_id, sfield![ft_available_list]),
+                sread!(ft_entity_id, sfield![ft_current_leader])
+            ];
+
+            let ft_results = match self.store.perform_mut(ft_read_requests) {
+                Ok(results) => results,
+                Err(e) => {
+                    warn!("Failed to read fault tolerance fields: {}", e);
+                    continue;
+                }
+            };
+
+            let candidates = if let Some(Request::Read { value: Some(qlib_rs::Value::EntityList(candidates)), .. }) = ft_results.read().get(0) {
+                candidates.clone()
+            } else {
+                warn!("Failed to get candidate list");
+                continue;
+            };
+
+            let current_leader = if let Some(Request::Read { value: Some(qlib_rs::Value::EntityReference(leader)), .. }) = ft_results.read().get(2) {
+                leader.clone()
+            } else {
+                None
+            };
+
+            // Check availability of each candidate
+            let mut available = Vec::new();
+            for candidate_id in &candidates {
+                let candidate_read_requests = sreq![
+                    sread!(*candidate_id, sfield![ft_make_me]),
+                    sread!(*candidate_id, sfield![ft_heartbeat]),
+                    sread!(*candidate_id, sfield![ft_death_detection_timeout])
+                ];
+
+                let candidate_results = match self.store.perform_mut(candidate_read_requests) {
+                    Ok(results) => results,
+                    Err(e) => {
+                        warn!("Failed to read candidate fields for {:?}: {}", candidate_id, e);
+                        continue;
+                    }
+                };
+
+                let make_me = if let Some(Request::Read { value: Some(qlib_rs::Value::Choice(choice)), .. }) = candidate_results.read().get(0) {
+                    *choice
+                } else {
+                    0 // Default to unavailable
+                };
+
+                let heartbeat_time = if let Some(Request::Read { write_time: Some(time), .. }) = candidate_results.read().get(1) {
+                    *time
+                } else {
+                    qlib_rs::data::epoch() // Default to epoch to make it invalid
+                };
+
+                let death_detection_timeout_millis = if let Some(Request::Read { value: Some(qlib_rs::Value::Int(timeout)), .. }) = candidate_results.read().get(2) {
+                    *timeout
+                } else {
+                    5000 // Default 5 seconds
+                };
+
+                // Check if candidate wants to be available and has recent heartbeat
+                let death_detection_timeout = time::Duration::milliseconds(death_detection_timeout_millis);
+                if make_me == 1 && heartbeat_time + death_detection_timeout > now {
+                    available.push(*candidate_id);
+                }
+            }
+
+            // Update available list
+            if let Err(e) = self.store.perform_mut(sreq![
+                swrite!(ft_entity_id, sfield![ft_available_list], Some(qlib_rs::Value::EntityList(available.clone())), PushCondition::Changes)
+            ]) {
+                warn!("Failed to update available list: {}", e);
+                continue;
+            }
+
+            // Handle leadership
+            let mut handle_me_as_candidate = false;
+            if let Some(me_as_candidate) = &me_as_candidate {
+                // If we're in the candidate list, we can be leader
+                if candidates.contains(me_as_candidate) {
+                    handle_me_as_candidate = true;
+
+                    if let Err(e) = self.store.perform_mut(sreq![
+                        swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(Some(*me_as_candidate))), PushCondition::Changes)
+                    ]) {
+                        warn!("Failed to set current leader: {}", e);
+                    }
+                }
+            }
+
+            if !handle_me_as_candidate {
+                // Promote an available candidate to leader if needed
+                if current_leader.is_none() {
+                    // No current leader, pick first available
+                    let new_leader = available.first().cloned();
+                    if let Err(e) = self.store.perform_mut(sreq![
+                        swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(new_leader)), PushCondition::Changes)
+                    ]) {
+                        warn!("Failed to set new leader: {}", e);
+                    }
+                } else if let Some(current_leader_id) = current_leader {
+                    if !available.contains(&current_leader_id) {
+                        // Current leader is not available, find next one
+                        let next_leader = if let Some(current_idx) = candidates.iter().position(|c| *c == current_leader_id) {
+                            // Find next available candidate after current leader
+                            let mut next_leader = None;
+                            
+                            // Search after current position
+                            for i in (current_idx + 1)..candidates.len() {
+                                if available.contains(&candidates[i]) {
+                                    next_leader = Some(candidates[i]);
+                                    break;
+                                }
+                            }
+                            
+                            // Wrap around to beginning if needed
+                            if next_leader.is_none() {
+                                for i in 0..=current_idx {
+                                    if available.contains(&candidates[i]) {
+                                        next_leader = Some(candidates[i]);
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            next_leader
+                        } else {
+                            // Current leader not in candidates list, pick first available
+                            available.first().cloned()
+                        };
+
+                        if let Err(e) = self.store.perform_mut(sreq![
+                            swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(next_leader)), PushCondition::Changes)
+                        ]) {
+                            warn!("Failed to update leader: {}", e);
+                        }
+                    }
+                }
+            }
+        }
     }
     
 }
