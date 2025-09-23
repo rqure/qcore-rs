@@ -1073,6 +1073,7 @@ dependencies = [
 name = "qcore-rs"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "base64",
  "bincode",
@@ -1086,6 +1087,7 @@ dependencies = [
  "mio",
  "qlib-rs",
  "rand",
+ "rustc-hash",
  "serde",
  "serde_json",
  "smallvec",

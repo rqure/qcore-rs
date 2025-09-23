@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::time::{Duration};
+use ahash::AHashMap;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::{Requests};
+use qlib_rs::{et, Requests};
+use rustc_hash::FxHashMap;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::thread;
@@ -61,6 +63,13 @@ pub enum CoreCommand {
     SetWalHandle {
         wal_handle: crate::wal::WalHandle,
     },
+    PeerConnected {
+        machine_id: String,
+        stream: MioTcpStream,
+    },
+    GetPeers {
+        respond_to: Sender<AHashMap<String, (Option<Token>, Option<EntityId>)>>,
+    }
 }
 
 /// Handle for communicating with core service
@@ -89,6 +98,16 @@ impl CoreHandle {
     pub fn set_wal_handle(&self, wal_handle: crate::wal::WalHandle) {
         self.sender.send(CoreCommand::SetWalHandle { wal_handle }).unwrap();
     }
+
+    pub fn peer_connected(&self, machine_id: String, stream: MioTcpStream) {
+        self.sender.send(CoreCommand::PeerConnected { machine_id, stream }).unwrap();
+    }
+
+    pub fn get_peers(&self) -> AHashMap<String, (Option<Token>, Option<EntityId>)> {
+        let (resp_sender, resp_receiver) = crossbeam::channel::bounded(1);
+        self.sender.send(CoreCommand::GetPeers { respond_to: resp_sender }).unwrap();
+        resp_receiver.recv().unwrap_or_default()
+    }
 }
 
 /// Client connection information  
@@ -106,11 +125,11 @@ struct Connection {
 
 /// Core service that handles both client and peer connections
 pub struct CoreService {
-    #[allow(dead_code)]
     config: CoreConfig,
     listener: MioTcpListener,
     poll: Poll,
-    connections: HashMap<Token, Connection>,
+    connections: FxHashMap<Token, Connection>,
+    peers: AHashMap<String, (Option<Token>, Option<EntityId>)>,
     next_token: usize,
     
     // Store and related components (replacing StoreService)
@@ -205,7 +224,8 @@ impl CoreService {
             config,
             listener,
             poll,
-            connections: HashMap::new(),
+            connections: FxHashMap::default(),
+            peers: AHashMap::default(),
             next_token: 1,
             store,
             permission_cache: None,
@@ -216,6 +236,11 @@ impl CoreService {
         
         // Attempt to create permission cache
         service.permission_cache = service.create_permission_cache();
+
+        // Create initial peer entries
+        for (machine_id, _address) in &service.config.peers {
+            service.peers.insert(machine_id.clone(), (None, None));
+        }
         
         Ok(service)
     }
@@ -224,6 +249,13 @@ impl CoreService {
     pub fn spawn(config: CoreConfig) -> CoreHandle {
         let (sender, receiver) = crossbeam::channel::unbounded();
         let handle = CoreHandle { sender };
+
+        // Start peer connection thread
+        let peer_handle = handle.clone();
+        let peer_config = config.clone();
+        thread::spawn(move || {
+            Self::peer_connection_thread(peer_handle, peer_config);
+        });
 
         thread::spawn(move || {
             let mut service = match Self::new(config) {
@@ -276,6 +308,57 @@ impl CoreService {
         });
 
         handle
+    }
+    
+    /// Peer connection thread that connects to peers with higher machine IDs
+    fn peer_connection_thread(handle: CoreHandle, config: CoreConfig) {
+        info!("Starting peer connection thread for machine {}", config.machine);
+        
+        loop {
+            // Find peers with higher machine IDs that we should connect to
+            let all_peers = handle.get_peers();
+            let mut target_peers = Vec::new();
+            for (machine_id, (token_opt, _entity_id)) in &all_peers {
+                if machine_id > &config.machine {
+                    if token_opt.is_none() {
+                        if let Some(address) = config.peers.get(machine_id) {
+                            target_peers.push((machine_id.clone(), address.clone()));
+                        } else {
+                            debug!("No address found for peer {}, skipping connection attempt", machine_id);
+                        }
+                    } else {
+                        debug!("Already connected to peer {}, skipping connection attempt", machine_id);
+                    }
+                }
+            }
+
+            info!("Will attempt to connect to {} peers: {:?}", target_peers.len(), target_peers);
+
+            for (machine_id, address) in &target_peers {
+                match std::net::TcpStream::connect(address) {
+                    Ok(std_stream) => {
+                        info!("Successfully connected to peer {} at {}", machine_id, address);
+                        
+                        // Set non-blocking and convert to mio stream
+                        if let Err(e) = std_stream.set_nonblocking(true) {
+                            error!("Failed to set peer connection to non-blocking: {}", e);
+                            continue;
+                        }
+                        
+                        let mio_stream = MioTcpStream::from_std(std_stream);
+                        
+                        // Send the connected peer to the main service
+                        handle.peer_connected(machine_id.clone(), mio_stream)
+                    }
+                    Err(e) => {
+                        debug!("Failed to connect to peer {} at {}: {}", machine_id, address, e);
+                    }
+                }
+            }
+            
+            // Wait before retrying connections
+            thread::sleep(Duration::from_secs(3));
+        }
     }
     
     
@@ -861,6 +944,27 @@ impl CoreService {
                 } else {
                     warn!("Failed to recreate permission cache after snapshot restore");
                 }
+
+                // Clear machine ids in peers to force re-resolution
+                for (_machine_id, (_token_opt, entity_id_opt)) in self.peers.iter_mut() {
+                    *entity_id_opt = None;
+                }
+
+                // Update peer entity ids based on restored data
+                if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
+                    for (machine_id, (_token_opt, entity_id_opt)) in self.peers.iter_mut() {
+                        if let Some(machines) = self.store.find_entities(etype, Some(format!("Name == '{}'", machine_id))).ok() {
+                            if let Some(machine) = machines.first() {
+                                *entity_id_opt = Some(*machine);
+                                debug!("Updated entity ID for peer {}: {:?}", machine_id, machine);
+                            } else {
+                                warn!("No entity found for peer {}", machine_id);
+                            }
+                        } else {
+                            warn!("Failed to query entity for peer {}", machine_id);
+                        }
+                    }
+                }
             }
             CoreCommand::SetSnapshotHandle { snapshot_handle } => {
                 debug!("Setting snapshot handle");
@@ -869,6 +973,44 @@ impl CoreService {
             CoreCommand::SetWalHandle { wal_handle } => {
                 debug!("Setting WAL handle");
                 self.wal_handle = Some(wal_handle);
+            }
+            CoreCommand::PeerConnected { machine_id, mut stream } => {
+                debug!("Adding peer connection for machine {}", machine_id);
+                
+                let token = Token(self.next_token);
+                self.next_token += 1;
+                
+                // Register for read events
+                if let Err(e) = self.poll.registry().register(
+                    &mut stream,
+                    token,
+                    Interest::READABLE
+                ) {
+                    error!("Failed to register peer connection: {}", e);
+                    return;
+                }
+
+                let addr = stream.peer_addr().map(|addr| addr.to_string()).expect("Failed to get peer address");
+
+                let connection = Connection {
+                    stream,
+                    addr_string: addr,
+                    authenticated: true,
+                    client_id: None,
+                    notification_queue: NotificationQueue::new(),
+                    notification_configs: HashSet::new(),
+                    outbound_messages: VecDeque::new(),
+                    message_buffer: MessageBuffer::new()
+                };
+                
+                self.connections.insert(token, connection);
+                info!("Peer {} connected with token {:?}", machine_id, token);
+            }
+            CoreCommand::GetPeers { respond_to } => {
+                let peers = self.peers.clone();
+                if let Err(e) = respond_to.send(peers) {
+                    error!("Failed to send peers response: {}", e);
+                }
             }
         }
     }
