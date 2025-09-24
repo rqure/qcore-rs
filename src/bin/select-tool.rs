@@ -124,7 +124,7 @@ impl DisplayValue {
 
     fn from_value(value: Option<&Value>) -> Self {
         match value {
-            Some(Value::String(s)) => DisplayValue::String(s.clone()),
+            Some(Value::String(s)) => DisplayValue::String(s.as_str().into()),
             Some(Value::Int(i)) => DisplayValue::Integer(*i),
             Some(Value::Float(f)) => DisplayValue::Float(*f),
             Some(Value::Bool(b)) => DisplayValue::Boolean(*b),
@@ -140,7 +140,7 @@ impl DisplayValue {
             },
             Some(Value::Blob(data)) => {
                 // Convert to base64 for display
-                DisplayValue::Blob(general_purpose::STANDARD.encode(data))
+                DisplayValue::Blob(general_purpose::STANDARD.encode(data.as_slice()))
             },
             None => DisplayValue::None,
         }

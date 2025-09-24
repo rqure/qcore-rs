@@ -734,10 +734,10 @@ impl WalReader {
             Some(qlib_rs::Value::EntityReference(Some(entity_id))) => Self::format_entity_id(entity_id),
             Some(qlib_rs::Value::EntityReference(None)) => "null".to_string(),
             Some(qlib_rs::Value::Blob(blob)) => {
-                if blob.len() <= 16 {
-                    format!("blob[{}]", blob.len())
+                if blob.as_slice().len() <= 16 {
+                    format!("blob[{}]", blob.as_slice().len())
                 } else {
-                    format!("blob[{} bytes]", blob.len())
+                    format!("blob[{} bytes]", blob.as_slice().len())
                 }
             },
             Some(qlib_rs::Value::Timestamp(ts)) => {

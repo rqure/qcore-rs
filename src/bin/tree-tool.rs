@@ -203,7 +203,7 @@ fn get_entity_name(store: &mut StoreProxy, entity_id: EntityId) -> Result<String
     
     if let Some(request) = results.first() {
         if let Some(Value::String(name)) = request.value() {
-            return Ok(name.clone());
+            return Ok(name.as_str().into());
         }
     }
     
