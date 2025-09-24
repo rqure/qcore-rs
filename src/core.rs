@@ -344,8 +344,47 @@ impl CoreService {
 
                 // Drain the write queue from the store
                 while let Some(requests) = service.store.write_queue.pop_front() {
+                    // Get our machine entity ID for originator
+                    let our_machine_id = if let Ok(machine_etype) = service.store.get_entity_type(qlib_rs::et::MACHINE) {
+                        service.store.find_entities(machine_etype, Some(&format!("Name == '{}'", service.config.machine)))
+                            .ok()
+                            .and_then(|machines| machines.first().copied())
+                    } else {
+                        None
+                    };
+                    
+                    // Set the originator to our machine entity ID
+                    requests.set_originator(our_machine_id);
+                    
+                    // Send to WAL
                     if let Some(wal_handle) = &service.wal_handle {
                         wal_handle.append_requests(requests.clone());
+                    }
+                    
+                    // Send SyncWrite message to all connected peers
+                    let sync_write_msg = qlib_rs::protocol::ProtocolMessage::Peer(
+                        qlib_rs::protocol::PeerMessage::SyncWrite { 
+                            requests: requests.clone() 
+                        }
+                    );
+                    
+                    // Send to all peer connections
+                    // Collect peer tokens first to avoid borrowing issues
+                    let peer_tokens: Vec<_> = service.peers.values()
+                        .filter_map(|peer_info| peer_info.token)
+                        .collect();
+                    
+                    let mut tokens_to_remove = Vec::new();
+                    for token in peer_tokens {
+                        if let Err(e) = service.send_protocol_message(token, sync_write_msg.clone()) {
+                            warn!("Failed to send SyncWrite to peer: {}", e);
+                            tokens_to_remove.push(token);
+                        }
+                    }
+                    
+                    // Remove failed peer connections
+                    for token in tokens_to_remove {
+                        service.remove_connection(token);
                     }
                 }
             }
@@ -830,6 +869,38 @@ impl CoreService {
         Ok(())
     }
     
+    /// Handle peer sync write message
+    fn handle_peer_sync_write(&mut self, token: Token, requests: Requests) -> Result<()> {
+        // Find the machine ID for this peer connection
+        let peer_machine_id = self.peers.iter()
+            .find(|(_, peer_info)| peer_info.token.map_or(false, |t| t == token))
+            .map(|(machine_id, _)| machine_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+            
+        info!("Received sync write from peer {} with {} requests", peer_machine_id, requests.len());
+        
+        // Apply the requests to our store if they didn't originate from us
+        let our_machine_id = if let Ok(machine_etype) = self.store.get_entity_type(qlib_rs::et::MACHINE) {
+            self.store.find_entities(machine_etype, Some(&format!("Name == '{}'", self.config.machine)))
+                .ok()
+                .and_then(|machines| machines.first().copied())
+        } else {
+            None
+        };
+        
+        if requests.originator() != our_machine_id {
+            if let Err(e) = self.store.perform_mut(requests) {
+                warn!("Failed to apply sync write from peer {}: {}", peer_machine_id, e);
+            } else {
+                debug!("Successfully applied sync write from peer {}", peer_machine_id);
+            }
+        } else {
+            debug!("Ignoring sync write from peer {} as it originated from us", peer_machine_id);
+        }
+        
+        Ok(())
+    }
+    
     /// Handle a decoded protocol message
     fn handle_protocol_message(&mut self, token: Token, message: ProtocolMessage) -> Result<()> {
         match message {
@@ -846,6 +917,9 @@ impl CoreService {
                     }
                     PeerMessage::FullSyncResponse { snapshot } => {
                         self.handle_peer_full_sync_response(token, snapshot)
+                    }
+                    PeerMessage::SyncWrite { requests } => {
+                        self.handle_peer_sync_write(token, requests)
                     }
                 }
             }

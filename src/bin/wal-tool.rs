@@ -580,7 +580,7 @@ impl WalReader {
                     location,
                 }
             },
-            Request::Write { entity_id, field_types: field_type, value, push_condition, adjust_behavior, writer_id, originator, .. } => {
+            Request::Write { entity_id, field_types: field_type, value, push_condition, adjust_behavior, writer_id, .. } => {
                 WalReadWriteEntry {
                     timestamp: timestamp_str,
                     operation: "WRITE".to_string(),
@@ -590,7 +590,7 @@ impl WalReader {
                     push: format!("{:?}", push_condition),
                     adjust: format!("{}", adjust_behavior),
                     writer: writer_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "system".to_string()),
-                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    originator: "system".to_string(),
                     location,
                 }
             },
@@ -608,7 +608,7 @@ impl WalReader {
         };
 
         match request {
-            Request::Create { entity_type, parent_id, name, created_entity_id, timestamp: _, originator } => {
+            Request::Create { entity_type, parent_id, name, created_entity_id, timestamp: _ } => {
                 WalCreateEntry {
                     timestamp: timestamp_str,
                     operation: "CREATE".to_string(),
@@ -616,7 +616,7 @@ impl WalReader {
                     name: name.clone(),
                     parent: parent_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "root".to_string()),
                     created_id: created_entity_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "auto".to_string()),
-                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    originator: "system".to_string(),
                     location,
                 }
             },
@@ -634,12 +634,12 @@ impl WalReader {
         };
 
         match request {
-            Request::Delete { entity_id, timestamp: _, originator } => {
+            Request::Delete { entity_id, timestamp: _ } => {
                 WalDeleteEntry {
                     timestamp: timestamp_str,
                     operation: "DELETE".to_string(),
                     entity: Self::format_entity_id(entity_id),
-                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    originator: "system".to_string(),
                     location,
                 }
             },
@@ -657,21 +657,21 @@ impl WalReader {
         };
 
         match request {
-            Request::SchemaUpdate { schema, timestamp: _, originator } => {
+            Request::SchemaUpdate { schema, timestamp: _ } => {
                 WalSystemEntry {
                     timestamp: timestamp_str,
                     operation: "SCHEMA".to_string(),
                     target: schema.entity_type.clone(),
-                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    originator: "system".to_string(),
                     location,
                 }
             },
-            Request::Snapshot { snapshot_counter, timestamp: _, originator } => {
+            Request::Snapshot { snapshot_counter, timestamp: _ } => {
                 WalSystemEntry {
                     timestamp: timestamp_str,
                     operation: "SNAPSHOT".to_string(),
                     target: format!("#{}", snapshot_counter),
-                    originator: originator.as_ref().map(|s| s.as_str()).unwrap_or("system").to_string(),
+                    originator: "system".to_string(),
                     location,
                 }
             },
