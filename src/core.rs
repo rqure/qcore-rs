@@ -723,12 +723,12 @@ impl CoreService {
             peer_info.start_time = None;
         }
 
-        // Clear connection authentication for all peer connections since entity IDs may have changed
+        // Update peer entity IDs for already connected peers
         for (_machine_id, peer_info) in self.peers.iter_mut() {
             if let Some(token) = peer_info.token {
                 self.connections.get_mut(&token).map(|conn| {
-                    conn.client_id = None;
-                    conn.authenticated = false;
+                    conn.client_id = peer_info.entity_id;
+                    // Peers remain authenticated since they don't need explicit authentication
                 });
             }
         }
@@ -741,29 +741,40 @@ impl CoreService {
     }
 
     /// Handle peer handshake message
-    fn handle_peer_handshake(&mut self, token: Token, peer_start_time: u64) -> Result<()> {
-        // Find the machine ID for this peer connection
-        let peer_machine_id = self.peers.iter()
-            .find(|(_, peer_info)| peer_info.token.map_or(false, |t| t == token))
-            .map(|(machine_id, _)| machine_id.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-            
+    fn handle_peer_handshake(&mut self, token: Token, peer_start_time: u64, is_response: bool, peer_machine_id: String) -> Result<()> {
         info!("Received handshake from peer {} with start time {}", peer_machine_id, peer_start_time);
         
-        // Store this peer's start time
+        // Update peer info with the token if this is a new connection
         if let Some(peer_info) = self.peers.get_mut(&peer_machine_id) {
+            if peer_info.token.is_none() {
+                peer_info.token = Some(token);
+                info!("Associated token {:?} with peer {}", token, peer_machine_id);
+                
+                // Update connection with peer entity ID if available
+                if let Some(connection) = self.connections.get_mut(&token) {
+                    connection.client_id = peer_info.entity_id;
+                }
+            }
             peer_info.start_time = Some(peer_start_time);
+        } else {
+            warn!("Received handshake from unknown peer: {}", peer_machine_id);
         }
         
-        // Send our handshake back with our start time
-        let handshake_response = ProtocolMessage::Peer(PeerMessage::Handshake {
-            start_time: self.start_time,
-        });
-        
-        if let Err(e) = self.send_protocol_message(token, handshake_response) {
-            error!("Failed to send handshake response to peer {}: {}", peer_machine_id, e);
+        // Only send a response if this was a request, not a response
+        if !is_response {
+            let handshake_response = ProtocolMessage::Peer(PeerMessage::Handshake {
+                start_time: self.start_time,
+                is_response: true,
+                machine_id: self.config.machine.clone(),
+            });
+            
+            if let Err(e) = self.send_protocol_message(token, handshake_response) {
+                error!("Failed to send handshake response to peer {}: {}", peer_machine_id, e);
+            } else {
+                info!("Sent handshake response to peer {} with our start time {}", peer_machine_id, self.start_time);
+            }
         } else {
-            info!("Sent handshake response to peer {} with our start time {}", peer_machine_id, self.start_time);
+            debug!("Received handshake response from peer {}, no reply needed", peer_machine_id);
         }
         
         // Check if we should sync based on all known peers
@@ -772,16 +783,21 @@ impl CoreService {
         Ok(())
     }
     
-    /// Evaluate leadership status based on start times
+    /// Evaluate leadership status based on start times, with machine ID as tie-breaker
     fn evaluate_leadership(&mut self) {
-        // Find the peer with the earliest start time (longest running)
+        // Find the peer with the earliest start time, using machine ID as tie-breaker
         let mut oldest_start_time = self.start_time;
+        let mut oldest_machine_id = self.config.machine.clone();
         let mut has_older_peer = false;
         
-        for (_machine_id, peer_info) in &self.peers {
+        for (machine_id, peer_info) in &self.peers {
             if let Some(start_time) = peer_info.start_time {
-                if start_time < oldest_start_time {
+                let is_older = start_time < oldest_start_time || 
+                               (start_time == oldest_start_time && machine_id < &oldest_machine_id);
+                               
+                if is_older {
                     oldest_start_time = start_time;
+                    oldest_machine_id = machine_id.clone();
                     has_older_peer = true;
                 }
             }
@@ -792,23 +808,28 @@ impl CoreService {
         
         if was_leader != self.is_leader {
             if self.is_leader {
-                info!("This service is now the leader (started at {})", self.start_time);
+                info!("This service is now the leader (started at {}, machine: {})", self.start_time, self.config.machine);
             } else {
-                info!("This service is no longer the leader (older peer found with start time {})", oldest_start_time);
+                info!("This service is no longer the leader (older peer found: start_time={}, machine={})", oldest_start_time, oldest_machine_id);
             }
         }
     }
     
     /// Evaluate if we need to sync and from which peer
     fn evaluate_sync_needs(&mut self) {
-        // Find the peer with the earliest start time (longest running)
+        // Find the peer with the earliest start time, using machine ID as tie-breaker
         let mut oldest_peer: Option<(String, u64)> = None;
         let mut oldest_start_time = self.start_time;
+        let mut oldest_machine_id = self.config.machine.clone();
         
         for (machine_id, peer_info) in &self.peers {
             if let Some(start_time) = peer_info.start_time {
-                if start_time < oldest_start_time {
+                let is_older = start_time < oldest_start_time ||
+                               (start_time == oldest_start_time && machine_id < &oldest_machine_id);
+                               
+                if is_older {
                     oldest_start_time = start_time;
+                    oldest_machine_id = machine_id.clone();
                     oldest_peer = Some((machine_id.clone(), start_time));
                 }
             }
@@ -836,7 +857,7 @@ impl CoreService {
             }
         } else {
             // We are the oldest peer, no need to sync
-            debug!("We are the oldest peer (started at {}), no sync needed", self.start_time);
+            debug!("We are the oldest peer (started at {}, machine: {}), no sync needed", self.start_time, self.config.machine);
         }
         
         // Always evaluate leadership after checking sync needs
@@ -913,8 +934,8 @@ impl CoreService {
             }
             ProtocolMessage::Peer(peer_message) => {
                 match peer_message {
-                    PeerMessage::Handshake { start_time } => {
-                        self.handle_peer_handshake(token, start_time)
+                    PeerMessage::Handshake { start_time, is_response, machine_id } => {
+                        self.handle_peer_handshake(token, start_time, is_response, machine_id)
                     }
                     PeerMessage::FullSyncRequest => {
                         self.handle_peer_full_sync_request(token)
@@ -975,29 +996,14 @@ impl CoreService {
                 }
                 
                 // Check if this authenticated client is a peer and update the peers map
-                let mut peer_handshake_info: Option<(Token, String)> = None;
                 for (machine_id, peer_info) in self.peers.iter_mut() {
                     if let Some(peer_entity_id) = peer_info.entity_id {
                         if peer_entity_id == subject_id {
                             info!("Authenticated client is known peer {}, updating token", machine_id);
                             peer_info.token = Some(token);
                             debug!("Updated peer {} with token {:?}", machine_id, token);
-                            peer_handshake_info = Some((token, machine_id.clone()));
                             break;
                         }
-                    }
-                }
-                
-                // Send handshake message if this was a peer
-                if let Some((peer_token, peer_machine_id)) = peer_handshake_info {
-                    let handshake_message = ProtocolMessage::Peer(PeerMessage::Handshake {
-                        start_time: self.start_time,
-                    });
-                    
-                    if let Err(e) = self.send_protocol_message(peer_token, handshake_message) {
-                        error!("Failed to send handshake to peer {}: {}", peer_machine_id, e);
-                    } else {
-                        info!("Sent handshake to peer {} with start time {}", peer_machine_id, self.start_time);
                     }
                 }
                 
@@ -1233,7 +1239,7 @@ impl CoreService {
                 let connection = Connection {
                     stream,
                     addr_string: addr,
-                    authenticated: false, // Start as unauthenticated
+                    authenticated: true, // Peers are automatically authenticated
                     client_id,
                     notification_queue: NotificationQueue::new(),
                     notification_configs: HashSet::new(),
@@ -1244,15 +1250,15 @@ impl CoreService {
                 self.connections.insert(token, connection);
                 info!("Peer {} connected with token {:?}", machine_id, token);
                 
-                // Send authentication message to the peer
-                let auth_message = StoreMessage::Authenticate {
-                    id: 1, // Simple ID for peer authentication
-                    subject_name: self.config.machine.clone(),
-                    credential: "peer".to_string(), // Simple peer credential
-                };
+                // Send handshake message directly to the peer
+                let handshake_message = ProtocolMessage::Peer(PeerMessage::Handshake {
+                    start_time: self.start_time,
+                    is_response: false,
+                    machine_id: self.config.machine.clone(),
+                });
                 
-                if let Err(e) = self.send_response(token, auth_message) {
-                    error!("Failed to send authentication to peer {}: {}", machine_id, e);
+                if let Err(e) = self.send_protocol_message(token, handshake_message) {
+                    error!("Failed to send handshake to peer {}: {}", machine_id, e);
                     self.remove_connection(token);
                 }
             }
