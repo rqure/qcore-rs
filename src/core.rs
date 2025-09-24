@@ -16,7 +16,7 @@ use qlib_rs::{
     Request, Snapshot, AuthConfig, StoreTrait,
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
-use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer};
+use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer, PeerMessage};
 
 use crate::snapshot::SnapshotHandle;
 use crate::wal::WalHandle;
@@ -705,9 +705,9 @@ impl CoreService {
         }
         
         // Send our handshake back with our start time
-        let handshake_response = ProtocolMessage::PeerHandshake {
+        let handshake_response = ProtocolMessage::Peer(PeerMessage::Handshake {
             start_time: self.start_time,
-        };
+        });
         
         if let Err(e) = self.send_protocol_message(token, handshake_response) {
             error!("Failed to send handshake response to peer {}: {}", peer_machine_id, e);
@@ -770,7 +770,7 @@ impl CoreService {
             // Find the token for this peer
             if let Some(peer_info) = self.peers.get(&oldest_machine_id) {
                 if let Some(peer_token) = peer_info.token {
-                    let sync_request = ProtocolMessage::PeerFullSyncRequest;
+                    let sync_request = ProtocolMessage::Peer(PeerMessage::FullSyncRequest);
                     
                     if let Err(e) = self.send_protocol_message(peer_token, sync_request) {
                         error!("Failed to send full sync request to older peer {}: {}", oldest_machine_id, e);
@@ -805,9 +805,9 @@ impl CoreService {
         // Take a snapshot of our current store
         let snapshot = self.store.take_snapshot();
         
-        let sync_response = ProtocolMessage::PeerFullSyncResponse {
+        let sync_response = ProtocolMessage::Peer(PeerMessage::FullSyncResponse {
             snapshot,
-        };
+        });
         
         if let Err(e) = self.send_protocol_message(token, sync_response) {
             error!("Failed to send full sync response to peer {}: {}", requesting_machine_id, e);
@@ -836,14 +836,18 @@ impl CoreService {
             ProtocolMessage::Store(store_message) => {
                 self.handle_store_message(token, store_message)
             }
-            ProtocolMessage::PeerHandshake { start_time } => {
-                self.handle_peer_handshake(token, start_time)
-            }
-            ProtocolMessage::PeerFullSyncRequest => {
-                self.handle_peer_full_sync_request(token)
-            }
-            ProtocolMessage::PeerFullSyncResponse { snapshot } => {
-                self.handle_peer_full_sync_response(token, snapshot)
+            ProtocolMessage::Peer(peer_message) => {
+                match peer_message {
+                    PeerMessage::Handshake { start_time } => {
+                        self.handle_peer_handshake(token, start_time)
+                    }
+                    PeerMessage::FullSyncRequest => {
+                        self.handle_peer_full_sync_request(token)
+                    }
+                    PeerMessage::FullSyncResponse { snapshot } => {
+                        self.handle_peer_full_sync_response(token, snapshot)
+                    }
+                }
             }
             _ => {
                 warn!("Received unsupported protocol message from client");
@@ -908,9 +912,9 @@ impl CoreService {
                 
                 // Send handshake message if this was a peer
                 if let Some((peer_token, peer_machine_id)) = peer_handshake_info {
-                    let handshake_message = ProtocolMessage::PeerHandshake {
+                    let handshake_message = ProtocolMessage::Peer(PeerMessage::Handshake {
                         start_time: self.start_time,
-                    };
+                    });
                     
                     if let Err(e) = self.send_protocol_message(peer_token, handshake_message) {
                         error!("Failed to send handshake to peer {}: {}", peer_machine_id, e);
