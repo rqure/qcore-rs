@@ -1516,18 +1516,13 @@ impl CoreService {
                 }
             };
 
-            let candidates = if let Some(Request::Read { value: Some(qlib_rs::Value::EntityList(candidates)), .. }) = ft_results.read().get(0) {
-                candidates.clone()
-            } else {
+            let candidates = ft_results.extract_entity_list(0).unwrap_or_default();
+            if candidates.is_empty() {
                 warn!("Failed to get candidate list");
                 continue;
-            };
+            }
 
-            let current_leader = if let Some(Request::Read { value: Some(qlib_rs::Value::EntityReference(leader)), .. }) = ft_results.read().get(2) {
-                leader.clone()
-            } else {
-                None
-            };
+            let current_leader = ft_results.extract_entity_reference(2);
 
             // Check availability of each candidate
             let mut available = Vec::new();
@@ -1546,23 +1541,12 @@ impl CoreService {
                     }
                 };
 
-                let make_me = if let Some(Request::Read { value: Some(qlib_rs::Value::Choice(choice)), .. }) = candidate_results.read().get(0) {
-                    *choice
-                } else {
-                    0 // Default to unavailable
-                };
+                let make_me = candidate_results.extract_choice(0).unwrap_or(0);
 
-                let heartbeat_time = if let Some(Request::Read { write_time: Some(time), .. }) = candidate_results.read().get(1) {
-                    *time
-                } else {
-                    qlib_rs::data::epoch() // Default to epoch to make it invalid
-                };
+                let heartbeat_time = candidate_results.extract_write_time(1)
+                    .unwrap_or_else(qlib_rs::data::epoch);
 
-                let death_detection_timeout_millis = if let Some(Request::Read { value: Some(qlib_rs::Value::Int(timeout)), .. }) = candidate_results.read().get(2) {
-                    *timeout
-                } else {
-                    5000 // Default 5 seconds
-                };
+                let death_detection_timeout_millis = candidate_results.extract_int(2).unwrap_or(5000);
 
                 // Check if candidate wants to be available and has recent heartbeat
                 let death_detection_timeout = time::Duration::milliseconds(death_detection_timeout_millis);
