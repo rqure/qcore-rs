@@ -5,7 +5,7 @@ use ahash::AHashMap;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::{et, schoice, sfield, sreq, sread, swrite, Requests, PushCondition};
+use qlib_rs::{schoice, sfield, sreq, sread, swrite, Requests, PushCondition};
 use rustc_hash::FxHashMap;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
@@ -13,7 +13,7 @@ use std::thread;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
     AuthenticationResult, Store, Cache, CelExecutor,
-    Request, Snapshot, AuthConfig, StoreTrait,
+    Request, Snapshot, AuthConfig,
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
 use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer, PeerMessage};
@@ -156,6 +156,9 @@ pub struct CoreService {
     
     // Store and related components (replacing StoreService)
     store: Store,
+    
+    // Cached candidate entity ID for this machine
+    candidate_entity_id: Option<EntityId>,
     permission_cache: Option<Cache>,
     cel_executor: CelExecutor,
     
@@ -169,46 +172,16 @@ const LISTENER_TOKEN: Token = Token(0);
 impl CoreService {
     /// Attempt to create a permission cache with the current store state
     fn create_permission_cache(&mut self) -> Option<Cache> {
-        // Get values needed for cache creation
-        let permission_entity_type = match self.store.get_entity_type(qlib_rs::et::PERMISSION) {
-            Ok(et) => et,
-            Err(e) => {
-                debug!("Failed to get permission entity type: {}", e);
-                return None;
-            }
-        };
+        // Get values needed for cache creation from store.et and store.ft
+        // These are only available after a snapshot has been restored
+        let et = self.store.et.as_ref()?;
+        let ft = self.store.ft.as_ref()?;
         
-        let resource_type_field = match self.store.get_field_type(qlib_rs::ft::RESOURCE_TYPE) {
-            Ok(ft) => ft,
-            Err(e) => {
-                debug!("Failed to get resource type field: {}", e);
-                return None;
-            }
-        };
-        
-        let resource_field_field = match self.store.get_field_type(qlib_rs::ft::RESOURCE_FIELD) {
-            Ok(ft) => ft,
-            Err(e) => {
-                debug!("Failed to get resource field field: {}", e);
-                return None;
-            }
-        };
-        
-        let scope_field = match self.store.get_field_type(qlib_rs::ft::SCOPE) {
-            Ok(ft) => ft,
-            Err(e) => {
-                debug!("Failed to get scope field: {}", e);
-                return None;
-            }
-        };
-        
-        let condition_field = match self.store.get_field_type(qlib_rs::ft::CONDITION) {
-            Ok(ft) => ft,
-            Err(e) => {
-                debug!("Failed to get condition field: {}", e);
-                return None;
-            }
-        };
+        let permission_entity_type = et.permission?;
+        let resource_type_field = ft.resource_type?;
+        let resource_field_field = ft.resource_field?;
+        let scope_field = ft.scope?;
+        let condition_field = ft.condition?;
         
         match Cache::new(
             &mut self.store,
@@ -260,6 +233,7 @@ impl CoreService {
             last_fault_tolerance_tick: Instant::now(),
             is_leader: true, // Start as leader until we learn about older peers
             store,
+            candidate_entity_id: None,
             permission_cache: None,
             cel_executor,
             snapshot_handle: None,
@@ -269,7 +243,7 @@ impl CoreService {
         // Attempt to create permission cache
         service.permission_cache = service.create_permission_cache();
 
-        // Create initial peer entries
+        // Create initial peer entries without entity IDs (will be resolved after snapshot restore)
         for (machine_id, _address) in &service.config.peers {
             service.peers.insert(machine_id.clone(), PeerInfo::new());
         }
@@ -344,17 +318,8 @@ impl CoreService {
 
                 // Drain the write queue from the store
                 while let Some(requests) = service.store.write_queue.pop_front() {
-                    // Get our machine entity ID for originator
-                    let our_machine_id = if let Ok(machine_etype) = service.store.get_entity_type(qlib_rs::et::MACHINE) {
-                        service.store.find_entities(machine_etype, Some(&format!("Name == '{}'", service.config.machine)))
-                            .ok()
-                            .and_then(|machines| machines.first().copied())
-                    } else {
-                        None
-                    };
-                    
-                    // Set the originator to our machine entity ID
-                    requests.set_originator(our_machine_id);
+                    // Set the originator to our candidate entity ID
+                    requests.set_originator(service.candidate_entity_id);
                     
                     // Send to WAL
                     if let Some(wal_handle) = &service.wal_handle {
@@ -672,6 +637,63 @@ impl CoreService {
         Ok(())
     }
     
+    /// Resolve candidate entity IDs for ourselves and all peers
+    /// This should be called whenever store.et becomes available (e.g., after snapshot restoration)
+    fn resolve_candidate_entity_ids(&mut self) {
+        // Clear existing candidate entity IDs since they may have changed
+        self.candidate_entity_id = None;
+        for (_, peer_info) in self.peers.iter_mut() {
+            peer_info.entity_id = None;
+        }
+
+        if let Some(et) = self.store.et.as_ref() {
+            if let Some(candidate_etype) = et.candidate {
+                // Resolve our own candidate entity ID
+                if let Ok(candidates) = self.store.find_entities(
+                    candidate_etype, 
+                    Some(&format!("Name == 'qcore' && Parent->Name == '{}'", self.config.machine))
+                ) {
+                    if let Some(candidate_id) = candidates.first() {
+                        self.candidate_entity_id = Some(*candidate_id);
+                        debug!("Resolved our candidate entity ID: {:?}", candidate_id);
+                    } else {
+                        warn!("No candidate entity found for our machine {}", self.config.machine);
+                    }
+                } else {
+                    warn!("Failed to query candidate entity for our machine {}", self.config.machine);
+                }
+
+                // Resolve peer candidate entity IDs
+                for (machine_id, peer_info) in self.peers.iter_mut() {
+                    if let Ok(peer_candidates) = self.store.find_entities(
+                        candidate_etype, 
+                        Some(&format!("Name == 'qcore' && Parent->Name == '{}'", machine_id))
+                    ) {
+                        if let Some(candidate) = peer_candidates.first() {
+                            peer_info.entity_id = Some(*candidate);
+                            // Update connected peer connections
+                            if let Some(token) = peer_info.token {
+                                if let Some(connection) = self.connections.get_mut(&token) {
+                                    connection.client_id = Some(*candidate);
+                                    connection.authenticated = true;
+                                }
+                            }
+                            debug!("Resolved candidate entity ID for peer {}: {:?}", machine_id, candidate);
+                        } else {
+                            warn!("No candidate entity found for peer {}", machine_id);
+                        }
+                    } else {
+                        warn!("Failed to query candidate entity for peer {}", machine_id);
+                    }
+                }
+            } else {
+                warn!("Candidate entity type not found in store schema");
+            }
+        } else {
+            debug!("Store schema (et) not yet available, candidate entity IDs will be resolved later");
+        }
+    }
+
     /// Handle complete snapshot restoration including store, cache, and peer reinitialization
     fn handle_snapshot_restoration(&mut self, snapshot: Snapshot) {
         // Restore the snapshot to our store
@@ -691,9 +713,8 @@ impl CoreService {
             peer_info.start_time = None;
         }
 
-        // Clear machine ids in peers to force re-resolution
+        // Clear connection authentication for all peer connections since entity IDs may have changed
         for (_machine_id, peer_info) in self.peers.iter_mut() {
-            peer_info.entity_id = None;
             if let Some(token) = peer_info.token {
                 self.connections.get_mut(&token).map(|conn| {
                     conn.client_id = None;
@@ -702,27 +723,8 @@ impl CoreService {
             }
         }
 
-        // Update peer entity ids based on restored data
-        if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
-            for (machine_id, peer_info) in self.peers.iter_mut() {
-                if let Some(machines) = self.store.find_entities(etype, Some(&format!("Name == '{}'", machine_id))).ok() {
-                    if let Some(machine) = machines.first() {
-                        peer_info.entity_id = Some(*machine);
-                        if let Some(token) = peer_info.token {
-                            if let Some(connection) = self.connections.get_mut(&token) {
-                                connection.client_id = Some(*machine);
-                                connection.authenticated = true;
-                            }
-                        }
-                        debug!("Updated entity ID for peer {} after restore: {:?}", machine_id, machine);
-                    } else {
-                        warn!("No entity found for peer {} after restore", machine_id);
-                    }
-                } else {
-                    warn!("Failed to query entity for peer {} after restore", machine_id);
-                }
-            }
-        }
+        // Resolve all candidate entity IDs (ours and peers) now that schema is available
+        self.resolve_candidate_entity_ids();
 
         // Re-evaluate leadership after restoration
         self.evaluate_leadership();
@@ -880,15 +882,7 @@ impl CoreService {
         info!("Received sync write from peer {} with {} requests", peer_machine_id, requests.len());
         
         // Apply the requests to our store if they didn't originate from us
-        let our_machine_id = if let Ok(machine_etype) = self.store.get_entity_type(qlib_rs::et::MACHINE) {
-            self.store.find_entities(machine_etype, Some(&format!("Name == '{}'", self.config.machine)))
-                .ok()
-                .and_then(|machines| machines.first().copied())
-        } else {
-            None
-        };
-        
-        if requests.originator() != our_machine_id {
+        if requests.originator() != self.candidate_entity_id {
             if let Err(e) = self.store.perform_mut(requests) {
                 warn!("Failed to apply sync write from peer {}: {}", peer_machine_id, e);
             } else {
