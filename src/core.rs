@@ -318,38 +318,48 @@ impl CoreService {
 
                 // Drain the write queue from the store
                 while let Some(requests) = service.store.write_queue.pop_front() {
-                    // Set the originator to our candidate entity ID
-                    requests.set_originator(service.candidate_entity_id);
+                    // Set the originator to our candidate entity ID only if it wasn't already set
+                    let we_are_originator = if requests.originator().is_none() {
+                        requests.set_originator(service.candidate_entity_id);
+                        true
+                    } else {
+                        // Check if we are the originator
+                        requests.originator() == service.candidate_entity_id
+                    };
                     
                     // Send to WAL
                     if let Some(wal_handle) = &service.wal_handle {
                         wal_handle.append_requests(requests.clone());
                     }
                     
-                    // Send SyncWrite message to all connected peers
-                    let sync_write_msg = qlib_rs::protocol::ProtocolMessage::Peer(
-                        qlib_rs::protocol::PeerMessage::SyncWrite { 
-                            requests: requests.clone() 
+                    // Only send SyncWrite message to peers if we are the originator
+                    if we_are_originator {
+                        let sync_write_msg = qlib_rs::protocol::ProtocolMessage::Peer(
+                            qlib_rs::protocol::PeerMessage::SyncWrite { 
+                                requests: requests.clone() 
+                            }
+                        );
+                        
+                        // Send to all peer connections
+                        // Collect peer tokens first to avoid borrowing issues
+                        let peer_tokens: Vec<_> = service.peers.values()
+                            .filter_map(|peer_info| peer_info.token)
+                            .collect();
+                        
+                        let mut tokens_to_remove = Vec::new();
+                        for token in peer_tokens {
+                            if let Err(e) = service.send_protocol_message(token, sync_write_msg.clone()) {
+                                warn!("Failed to send SyncWrite to peer: {}", e);
+                                tokens_to_remove.push(token);
+                            }
                         }
-                    );
-                    
-                    // Send to all peer connections
-                    // Collect peer tokens first to avoid borrowing issues
-                    let peer_tokens: Vec<_> = service.peers.values()
-                        .filter_map(|peer_info| peer_info.token)
-                        .collect();
-                    
-                    let mut tokens_to_remove = Vec::new();
-                    for token in peer_tokens {
-                        if let Err(e) = service.send_protocol_message(token, sync_write_msg.clone()) {
-                            warn!("Failed to send SyncWrite to peer: {}", e);
-                            tokens_to_remove.push(token);
+                        
+                        // Remove failed peer connections
+                        for token in tokens_to_remove {
+                            service.remove_connection(token);
                         }
-                    }
-                    
-                    // Remove failed peer connections
-                    for token in tokens_to_remove {
-                        service.remove_connection(token);
+                    } else {
+                        debug!("Not sending SyncWrite to peers as we are not the originator");
                     }
                 }
             }
