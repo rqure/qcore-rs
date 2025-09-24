@@ -947,61 +947,6 @@ impl CoreService {
             .ok_or_else(|| anyhow::anyhow!("Client ID not found"))?;
         
         match message {
-            StoreMessage::GetEntitySchema { id, entity_type } => {
-                match self.store.get_entity_schema(entity_type) {
-                    Ok(schema) => Ok(StoreMessage::GetEntitySchemaResponse {
-                        id,
-                        response: Ok(Some(schema)),
-                    }),
-                    Err(e) => Ok(StoreMessage::GetEntitySchemaResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::GetCompleteEntitySchema { id, entity_type } => {
-                match self.store.get_complete_entity_schema(entity_type) {
-                    Ok(schema) => Ok(StoreMessage::GetCompleteEntitySchemaResponse {
-                        id,
-                        response: Ok(schema.clone()),
-                    }),
-                    Err(e) => Ok(StoreMessage::GetCompleteEntitySchemaResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::GetFieldSchema { id, entity_type, field_type } => {
-                match self.store.get_field_schema(entity_type, field_type) {
-                    Ok(schema) => Ok(StoreMessage::GetFieldSchemaResponse {
-                        id,
-                        response: Ok(Some(schema)),
-                    }),
-                    Err(e) => Ok(StoreMessage::GetFieldSchemaResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::EntityExists { id, entity_id } => {
-                let exists = self.store.entity_exists(entity_id);
-                Ok(StoreMessage::EntityExistsResponse {
-                    id,
-                    response: exists,
-                })
-            }
-            
-            StoreMessage::FieldExists { id, entity_type, field_type } => {
-                let exists = self.store.field_exists(entity_type, field_type);
-                Ok(StoreMessage::FieldExistsResponse {
-                    id,
-                    response: exists,
-                })
-            }
-            
             StoreMessage::Perform { id, requests } => {
                 match self.check_requests_authorization(client_id, requests) {
                     Ok(authorized_requests) => {
@@ -1019,45 +964,6 @@ impl CoreService {
                     Err(e) => Ok(StoreMessage::PerformResponse {
                         id,
                         response: Err(format!("Authorization failed: {}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::FindEntities { id, entity_type, page_opts, filter } => {
-                match self.store.find_entities_paginated(entity_type, page_opts, filter) {
-                    Ok(result) => Ok(StoreMessage::FindEntitiesResponse {
-                        id,
-                        response: Ok(result),
-                    }),
-                    Err(e) => Ok(StoreMessage::FindEntitiesResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::FindEntitiesExact { id, entity_type, page_opts, filter } => {
-                match self.store.find_entities_exact(entity_type, page_opts, filter) {
-                    Ok(result) => Ok(StoreMessage::FindEntitiesExactResponse {
-                        id,
-                        response: Ok(result),
-                    }),
-                    Err(e) => Ok(StoreMessage::FindEntitiesExactResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::GetEntityTypes { id, page_opts } => {
-                match self.store.get_entity_types_paginated(page_opts) {
-                    Ok(result) => Ok(StoreMessage::GetEntityTypesResponse {
-                        id,
-                        response: Ok(result),
-                    }),
-                    Err(e) => Ok(StoreMessage::GetEntityTypesResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
                     }),
                 }
             }
@@ -1098,58 +1004,6 @@ impl CoreService {
                         id,
                         response: false,
                     })
-                }
-            }
-            
-            StoreMessage::GetEntityType { id, name } => {
-                match self.store.get_entity_type(&name) {
-                    Ok(entity_type) => Ok(StoreMessage::GetEntityTypeResponse {
-                        id,
-                        response: Ok(entity_type),
-                    }),
-                    Err(e) => Ok(StoreMessage::GetEntityTypeResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::ResolveEntityType { id, entity_type } => {
-                match self.store.resolve_entity_type(entity_type) {
-                    Ok(name) => Ok(StoreMessage::ResolveEntityTypeResponse {
-                        id,
-                        response: Ok(name),
-                    }),
-                    Err(e) => Ok(StoreMessage::ResolveEntityTypeResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::GetFieldType { id, name } => {
-                match self.store.get_field_type(&name) {
-                    Ok(field_type) => Ok(StoreMessage::GetFieldTypeResponse {
-                        id,
-                        response: Ok(field_type),
-                    }),
-                    Err(e) => Ok(StoreMessage::GetFieldTypeResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::ResolveFieldType { id, field_type } => {
-                match self.store.resolve_field_type(field_type) {
-                    Ok(name) => Ok(StoreMessage::ResolveFieldTypeResponse {
-                        id,
-                        response: Ok(name),
-                    }),
-                    Err(e) => Ok(StoreMessage::ResolveFieldTypeResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
                 }
             }
             
