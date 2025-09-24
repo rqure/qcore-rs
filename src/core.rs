@@ -1508,7 +1508,7 @@ impl CoreService {
                 sread!(ft_entity_id, sfield![ft_current_leader])
             ];
 
-            let ft_results = match self.store.perform_mut(ft_read_requests) {
+            let ft_results = match self.store.perform(ft_read_requests) {
                 Ok(results) => results,
                 Err(e) => {
                     warn!("Failed to read fault tolerance fields: {}", e);
@@ -1533,7 +1533,7 @@ impl CoreService {
                     sread!(*candidate_id, sfield![ft_death_detection_timeout])
                 ];
 
-                let candidate_results = match self.store.perform_mut(candidate_read_requests) {
+                let candidate_results = match self.store.perform(candidate_read_requests) {
                     Ok(results) => results,
                     Err(e) => {
                         warn!("Failed to read candidate fields for {:?}: {}", candidate_id, e);
@@ -1555,12 +1555,15 @@ impl CoreService {
                 }
             }
 
-            // Update available list
-            if let Err(e) = self.store.perform_mut(sreq![
-                swrite!(ft_entity_id, sfield![ft_available_list], Some(qlib_rs::Value::EntityList(available.clone())), PushCondition::Changes)
-            ]) {
-                warn!("Failed to update available list: {}", e);
-                continue;
+            // Update available list only if it has changed
+            let current_available = ft_results.extract_entity_list(1).unwrap_or_default();
+            if current_available != available {
+                if let Err(e) = self.store.perform_mut(sreq![
+                    swrite!(ft_entity_id, sfield![ft_available_list], Some(qlib_rs::Value::EntityList(available.clone())))
+                ]) {
+                    warn!("Failed to update available list: {}", e);
+                    continue;
+                }
             }
 
             // Handle leadership
@@ -1570,10 +1573,13 @@ impl CoreService {
                 if candidates.contains(me_as_candidate) {
                     handle_me_as_candidate = true;
 
-                    if let Err(e) = self.store.perform_mut(sreq![
-                        swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(Some(*me_as_candidate))), PushCondition::Changes)
-                    ]) {
-                        warn!("Failed to set current leader: {}", e);
+                    // Only write if the current leader is different
+                    if current_leader != Some(*me_as_candidate) {
+                        if let Err(e) = self.store.perform_mut(sreq![
+                            swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(Some(*me_as_candidate))))
+                        ]) {
+                            warn!("Failed to set current leader: {}", e);
+                        }
                     }
                 }
             }
@@ -1583,10 +1589,12 @@ impl CoreService {
                 if current_leader.is_none() {
                     // No current leader, pick first available
                     let new_leader = available.first().cloned();
-                    if let Err(e) = self.store.perform_mut(sreq![
-                        swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(new_leader)), PushCondition::Changes)
-                    ]) {
-                        warn!("Failed to set new leader: {}", e);
+                    if new_leader.is_some() {
+                        if let Err(e) = self.store.perform_mut(sreq![
+                            swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(new_leader)))
+                        ]) {
+                            warn!("Failed to set new leader: {}", e);
+                        }
                     }
                 } else if let Some(current_leader_id) = current_leader {
                     if !available.contains(&current_leader_id) {
@@ -1619,10 +1627,13 @@ impl CoreService {
                             available.first().cloned()
                         };
 
-                        if let Err(e) = self.store.perform_mut(sreq![
-                            swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(next_leader)), PushCondition::Changes)
-                        ]) {
-                            warn!("Failed to update leader: {}", e);
+                        // Only write if the leader actually changes
+                        if current_leader != next_leader {
+                            if let Err(e) = self.store.perform_mut(sreq![
+                                swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(next_leader)))
+                            ]) {
+                                warn!("Failed to update leader: {}", e);
+                            }
                         }
                     }
                 }
