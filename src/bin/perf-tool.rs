@@ -163,7 +163,7 @@ fn find_test_entity(config: &Config) -> Result<EntityId> {
         .context("Failed to get PerfTestEntity type")?;
     
     // Find the TestEntity by searching for entities with Name = "TestEntity"
-    let entities = store.find_entities(perf_test_entity_type, Some("Name == 'TestEntity'".to_string()))
+    let entities = store.find_entities(perf_test_entity_type, Some("Name == 'TestEntity'"))
         .context("Failed to find test entity")?;
     
     if entities.is_empty() {
@@ -288,7 +288,7 @@ fn perform_test_operation(
             } else {
                 // Search operation
                 let entity_type = store.get_entity_type(&config.entity_type).context("Failed to get entity type")?;
-                let _result = store.find_entities_paginated(entity_type, Some(PageOpts::new(20, None)), Some(format!("Name != 'NonExistent_{}'", client_id)))?;
+                let _result = store.find_entities_paginated(entity_type, Some(&PageOpts::new(20, None)), Some(&format!("Name != 'NonExistent_{}'", client_id)))?;
             }
         }
         TestType::Create => {
@@ -308,8 +308,8 @@ fn perform_test_operation(
             let entity_type = store.get_entity_type(&config.entity_type).context("Failed to get entity type")?;
             let _result = store.find_entities_paginated(
                 entity_type,
-                Some(PageOpts::new(20, None)),
-                Some(format!("Name != 'NonExistent_{}'", client_id))
+                Some(&PageOpts::new(20, None)),
+                Some(&format!("Name != 'NonExistent_{}'", client_id))
             )?;
         }
         TestType::Bulk => {

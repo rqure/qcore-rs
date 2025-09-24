@@ -216,7 +216,7 @@ struct WalReader {
     config: Config,
     wal_dir: PathBuf,
     request_type_filter: Option<Vec<String>>,
-    read_write_entries: Vec<WalReadWriteEntry>,
+    write_entries: Vec<WalReadWriteEntry>,
     create_entries: Vec<WalCreateEntry>,
     delete_entries: Vec<WalDeleteEntry>,
     system_entries: Vec<WalSystemEntry>,
@@ -238,7 +238,7 @@ impl WalReader {
             config,
             wal_dir,
             request_type_filter,
-            read_write_entries: Vec::new(),
+            write_entries: Vec::new(),
             create_entries: Vec::new(),
             delete_entries: Vec::new(),
             system_entries: Vec::new(),
@@ -367,16 +367,12 @@ impl WalReader {
         // Check request type filter
         if let Some(ref types) = self.request_type_filter {
             let request_type = match request {
-                Request::Read { .. } => "Read",
                 Request::Write { .. } => "Write", 
                 Request::Create { .. } => "Create",
                 Request::Delete { .. } => "Delete",
                 Request::SchemaUpdate { .. } => "SchemaUpdate",
                 Request::Snapshot { .. } => "Snapshot",
-                Request::GetEntityType { .. } => "GetEntityType",
-                Request::ResolveEntityType { .. } => "ResolveEntityType",
-                Request::GetFieldType { .. } => "GetFieldType",
-                Request::ResolveFieldType { .. } => "ResolveFieldType",
+                _ => "Read"
             };
             
             if !types.contains(&request_type.to_string()) {
@@ -429,7 +425,7 @@ impl WalReader {
         // Check entity type filter
         if let Some(ref filter_entity_type) = self.config.entity_type {
             match request {
-                Request::Read { entity_id, .. } | Request::Write { entity_id, .. } | Request::Delete { entity_id, .. } => {
+                Request::Write { entity_id, .. } | Request::Delete { entity_id, .. } => {
                     // For now, we need a way to convert EntityType to string for comparison
                     // This is a limitation since we don't have a store reference here
                     // We'll use the raw type ID for comparison
@@ -447,12 +443,7 @@ impl WalReader {
                         return false;
                     }
                 },
-                Request::Snapshot { .. } => {
-                    // Snapshots don't have entity types, so they don't match entity type filters
-                    return false;
-                },
-                Request::GetEntityType { .. } | Request::ResolveEntityType { .. } | 
-                Request::GetFieldType { .. } | Request::ResolveFieldType { .. } => {
+                _ => {
                     // These request types don't have entity types to filter on
                     return false;
                 }
@@ -487,7 +478,7 @@ impl WalReader {
 
         // For follow mode, create temporary entries and print them immediately
         match request {
-            Request::Read { .. } | Request::Write { .. } => {
+            Request::Write { .. } => {
                 let entry = self.create_read_write_entry(request, wal_path, entry_index);
                 let table = Table::new(&[entry]);
                 println!("{}", table);
@@ -507,22 +498,18 @@ impl WalReader {
                 let table = Table::new(&[entry]);
                 println!("{}", table);
             },
-            Request::GetEntityType { .. } | Request::ResolveEntityType { .. } | 
-            Request::GetFieldType { .. } | Request::ResolveFieldType { .. } => {
-                // These are internal requests, unlikely to appear in WAL files
-                let entry = self.create_system_entry(request, wal_path, entry_index);
-                let table = Table::new(&[entry]);
-                println!("{}", table);
-            },
+            _ => {
+                // Other request types are unlikely in WAL files
+            }
         }
     }
 
     /// Create and store entries in appropriate collections
     fn create_and_store_entry(&mut self, request: &Request, wal_path: &PathBuf, entry_index: usize) {
         match request {
-            Request::Read { .. } | Request::Write { .. } => {
+            Request::Write { .. } => {
                 let entry = self.create_read_write_entry(request, wal_path, entry_index);
-                self.read_write_entries.push(entry);
+                self.write_entries.push(entry);
             },
             Request::Create { .. } => {
                 let entry = self.create_create_entry(request, wal_path, entry_index);
@@ -536,20 +523,17 @@ impl WalReader {
                 let entry = self.create_system_entry(request, wal_path, entry_index);
                 self.system_entries.push(entry);
             },
-            Request::GetEntityType { .. } | Request::ResolveEntityType { .. } | 
-            Request::GetFieldType { .. } | Request::ResolveFieldType { .. } => {
-                // These are internal requests, unlikely to appear in WAL files
-                let entry = self.create_system_entry(request, wal_path, entry_index);
-                self.system_entries.push(entry);
+            _ => {
+                // Other request types are unlikely in WAL files
             },
         }
     }
 
     /// Print all collected tables
     fn print_all_tables(&self) {
-        if !self.read_write_entries.is_empty() {
-            println!("\n=== READ/WRITE Operations ===");
-            let table = Table::new(&self.read_write_entries);
+        if !self.write_entries.is_empty() {
+            println!("\n=== WRITE Operations ===");
+            let table = Table::new(&self.write_entries);
             println!("{}", table);
         }
 

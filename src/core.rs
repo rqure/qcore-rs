@@ -666,7 +666,7 @@ impl CoreService {
         // Update peer entity ids based on restored data
         if let Ok(etype) = self.store.get_entity_type(et::MACHINE) {
             for (machine_id, peer_info) in self.peers.iter_mut() {
-                if let Some(machines) = self.store.find_entities(etype, Some(format!("Name == '{}'", machine_id))).ok() {
+                if let Some(machines) = self.store.find_entities(etype, Some(&format!("Name == '{}'", machine_id))).ok() {
                     if let Some(machine) = machines.first() {
                         peer_info.entity_id = Some(*machine);
                         if let Some(token) = peer_info.token {
@@ -1417,7 +1417,7 @@ impl CoreService {
         let candidates = {
             let result = self.store.find_entities(
             et_candidate, 
-            Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine)));
+            Some(&format!("Name == 'qcore' && Parent->Name == '{}'", machine)));
 
             match result {
                 Ok(ents) => ents,
@@ -1535,7 +1535,7 @@ impl CoreService {
             let machine = &self.config.machine;
             let candidates_result = self.store.find_entities(
                 et_candidate, 
-                Some(format!("Name == 'qcore' && Parent->Name == '{}'", machine))
+                Some(&format!("Name == 'qcore' && Parent->Name == '{}'", machine))
             );
 
             match candidates_result {

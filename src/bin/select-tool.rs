@@ -389,9 +389,9 @@ fn execute_query(
 
     loop {
         let page_result: PageResult<EntityId> = if exact {
-            store.find_entities_exact(entity_type, page_opts.clone(), filter.map(|s| s.to_string()))?
+            store.find_entities_exact(entity_type, page_opts.as_ref(), filter.as_deref())?
         } else {
-            store.find_entities_paginated(entity_type, page_opts.clone(), filter.map(|s| s.to_string()))?
+            store.find_entities_paginated(entity_type, page_opts.as_ref(), filter.as_deref())?
         };
 
         pages_fetched += 1;
