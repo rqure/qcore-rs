@@ -83,8 +83,6 @@ struct WalReadWriteEntry {
     adjust: String,
     #[tabled(rename = "Writer")]
     writer: String,
-    #[tabled(rename = "Orig")]
-    originator: String,
     #[tabled(rename = "File:Row")]
     location: String,
 }
@@ -104,8 +102,6 @@ struct WalCreateEntry {
     parent: String,
     #[tabled(rename = "CreatedID")]
     created_id: String,
-    #[tabled(rename = "Orig")]
-    originator: String,
     #[tabled(rename = "File:Row")]
     location: String,
 }
@@ -119,8 +115,6 @@ struct WalDeleteEntry {
     operation: String,
     #[tabled(rename = "Entity")]
     entity: String,
-    #[tabled(rename = "Orig")]
-    originator: String,
     #[tabled(rename = "File:Row")]
     location: String,
 }
@@ -134,8 +128,6 @@ struct WalSystemEntry {
     operation: String,
     #[tabled(rename = "Target")]
     target: String,
-    #[tabled(rename = "Orig")]
-    originator: String,
     #[tabled(rename = "File:Row")]
     location: String,
 }
@@ -576,7 +568,6 @@ impl WalReader {
                     push: "-".to_string(),
                     adjust: "-".to_string(),
                     writer: writer_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "system".to_string()),
-                    originator: "-".to_string(),
                     location,
                 }
             },
@@ -590,7 +581,6 @@ impl WalReader {
                     push: format!("{:?}", push_condition),
                     adjust: format!("{}", adjust_behavior),
                     writer: writer_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "system".to_string()),
-                    originator: "system".to_string(),
                     location,
                 }
             },
@@ -616,7 +606,6 @@ impl WalReader {
                     name: name.clone(),
                     parent: parent_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "root".to_string()),
                     created_id: created_entity_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "auto".to_string()),
-                    originator: "system".to_string(),
                     location,
                 }
             },
@@ -639,7 +628,6 @@ impl WalReader {
                     timestamp: timestamp_str,
                     operation: "DELETE".to_string(),
                     entity: Self::format_entity_id(entity_id),
-                    originator: "system".to_string(),
                     location,
                 }
             },
@@ -662,7 +650,6 @@ impl WalReader {
                     timestamp: timestamp_str,
                     operation: "SCHEMA".to_string(),
                     target: schema.entity_type.clone(),
-                    originator: "system".to_string(),
                     location,
                 }
             },
@@ -671,7 +658,6 @@ impl WalReader {
                     timestamp: timestamp_str,
                     operation: "SNAPSHOT".to_string(),
                     target: format!("#{}", snapshot_counter),
-                    originator: "system".to_string(),
                     location,
                 }
             },
