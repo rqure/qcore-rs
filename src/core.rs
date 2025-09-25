@@ -396,7 +396,7 @@ impl CoreService {
             for (machine_id, address) in &target_peers {
                 match std::net::TcpStream::connect(address) {
                     Ok(std_stream) => {
-                        info!("Successfully connected to peer {} at {}", machine_id, address);
+                        debug!("Successfully connected to peer {} at {}", machine_id, address);
                         
                         // Set non-blocking and convert to mio stream
                         if let Err(e) = std_stream.set_nonblocking(true) {
@@ -481,7 +481,7 @@ impl CoreService {
         loop {
             match self.listener.accept() {
                 Ok((mut stream, addr)) => {
-                    info!("Accepted new connection from {}", addr);
+                    debug!("Accepted new connection from {}", addr);
                     
                     let token = Token(self.next_token);
                     self.next_token += 1;
@@ -757,13 +757,13 @@ impl CoreService {
 
     /// Handle peer handshake message
     fn handle_peer_handshake(&mut self, token: Token, peer_start_time: u64, is_response: bool, peer_machine_id: String) -> Result<()> {
-        info!("Received handshake from peer {} with start time {}", peer_machine_id, peer_start_time);
+        debug!("Received handshake from peer {} with start time {}", peer_machine_id, peer_start_time);
         
         // Update peer info with the token if this is a new connection
         if let Some(peer_info) = self.peers.get_mut(&peer_machine_id) {
             if peer_info.token.is_none() {
                 peer_info.token = Some(token);
-                info!("Associated token {:?} with peer {}", token, peer_machine_id);
+                debug!("Associated token {:?} with peer {}", token, peer_machine_id);
                 
                 // Update connection with peer entity ID if available
                 if let Some(connection) = self.connections.get_mut(&token) {
@@ -786,7 +786,7 @@ impl CoreService {
             if let Err(e) = self.send_protocol_message(token, handshake_response) {
                 error!("Failed to send handshake response to peer {}: {}", peer_machine_id, e);
             } else {
-                info!("Sent handshake response to peer {} with our start time {}", peer_machine_id, self.start_time);
+                debug!("Sent handshake response to peer {} with our start time {}", peer_machine_id, self.start_time);
             }
         } else {
             debug!("Received handshake response from peer {}, no reply needed", peer_machine_id);
@@ -860,7 +860,7 @@ impl CoreService {
         
         // If we found an older peer, sync from them
         if let Some((oldest_machine_id, oldest_time)) = oldest_peer {
-            info!("Found older peer {} (started at {}), requesting full sync", oldest_machine_id, oldest_time);
+            debug!("Found older peer {} (started at {}), requesting full sync", oldest_machine_id, oldest_time);
             
             // Find the token for this peer
             if let Some(peer_info) = self.peers.get(&oldest_machine_id) {
@@ -895,7 +895,7 @@ impl CoreService {
             .map(|(machine_id, _)| machine_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
             
-        info!("Received full sync request from peer {}", requesting_machine_id);
+        debug!("Received full sync request from peer {}", requesting_machine_id);
         
         // Take a snapshot of our current store
         let snapshot = self.store.take_snapshot();
@@ -915,7 +915,7 @@ impl CoreService {
     
     /// Handle peer full sync response
     fn handle_peer_full_sync_response(&mut self, _token: Token, snapshot: Snapshot) -> Result<()> {
-        info!("Received full sync response, restoring snapshot");
+        debug!("Received full sync response, restoring snapshot");
         
         // Handle complete snapshot restoration
         self.handle_snapshot_restoration(snapshot);
@@ -933,7 +933,7 @@ impl CoreService {
             .map(|(machine_id, _)| machine_id.clone())
             .unwrap_or_else(|| "unknown".to_string());
             
-        info!("Received sync write from peer {} with {} requests", peer_machine_id, requests.len());
+        debug!("Received sync write from peer {} with {} requests", peer_machine_id, requests.len());
         
         // Apply the requests to our store if they didn't originate from us
         if requests.originator() != self.candidate_entity_id {

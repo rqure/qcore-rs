@@ -24,8 +24,8 @@ name = "select-tool"
 path = "src/bin/select-tool.rs"
 
 [[bin]]
-name = "perf-tool"
-path = "src/bin/perf-tool.rs"
+name = "benchmark-tool"
+path = "src/bin/benchmark-tool.rs"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
