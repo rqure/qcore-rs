@@ -719,11 +719,6 @@ impl CoreService {
             warn!("Failed to recreate permission cache after restore");
         }
 
-        // Clear peer start times since we have new data
-        for (_machine_id, peer_info) in self.peers.iter_mut() {
-            peer_info.start_time = None;
-        }
-
         // Update peer entity IDs for already connected peers
         for (_machine_id, peer_info) in self.peers.iter_mut() {
             if let Some(token) = peer_info.token {
@@ -791,21 +786,29 @@ impl CoreService {
         let mut oldest_machine_id = self.config.machine.clone();
         let mut has_older_peer = false;
         
+        debug!("Evaluating leadership: our start_time={}, machine={}", self.start_time, self.config.machine);
+        
         for (machine_id, peer_info) in &self.peers {
             if let Some(start_time) = peer_info.start_time {
+                debug!("Peer {} has start_time={}", machine_id, start_time);
                 let is_older = start_time < oldest_start_time || 
                                (start_time == oldest_start_time && machine_id < &oldest_machine_id);
                                
                 if is_older {
+                    debug!("Peer {} is older than current oldest", machine_id);
                     oldest_start_time = start_time;
                     oldest_machine_id = machine_id.clone();
                     has_older_peer = true;
                 }
+            } else {
+                debug!("Peer {} has no start_time yet", machine_id);
             }
         }
         
         let was_leader = self.is_leader;
         self.is_leader = !has_older_peer;
+        
+        debug!("Leadership evaluation result: has_older_peer={}, is_leader={}", has_older_peer, self.is_leader);
         
         if was_leader != self.is_leader {
             if self.is_leader {
