@@ -60,7 +60,7 @@ struct Config {
     r#loop: bool,
 
     /// Number of decimal places to display in latency output (default 0)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 3)]
     precision: usize,
 
     /// Entity type to use for search/read operations
