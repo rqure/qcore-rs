@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{sfield, sstr, swrite, sread, EntityId, PageOpts, Requests, StoreProxy};
+use qlib_rs::{sfield, sstr, swrite, sread, EntityId, PageOpts, Requests, AsyncStoreProxy};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::thread;
+use tokio::task;
 use tracing::{error, info, warn};
 use tracing_subscriber;
 
@@ -164,36 +164,36 @@ struct BenchmarkContext {
 }
 
 impl BenchmarkContext {
-    fn new(config: Arc<Config>) -> Result<Self> {
+    async fn new(config: Arc<Config>) -> Result<Self> {
         let mut context = Self {
             config,
             test_entities: Vec::new(),
             test_entity_id: None,
         };
-        context.initialize()?;
+        context.initialize().await?;
         Ok(context)
     }
 
-    fn initialize(&mut self) -> Result<()> {
+    async fn initialize(&mut self) -> Result<()> {
         // Connect to load test data
         let url = format!("{}:{}", self.config.host, self.config.port);
-        let store = StoreProxy::connect_and_authenticate(
+        let store = AsyncStoreProxy::connect_and_authenticate(
             &url,
             &self.config.username,
             &self.config.password,
-        ).context("Failed to connect for initialization")?;
+        ).await.context("Failed to connect for initialization")?;
 
         // Load existing entities for read operations
-        if let Ok(entity_type) = store.get_entity_type(&self.config.entity_type) {
-            if let Ok(entities) = store.find_entities(entity_type, None) {
+        if let Ok(entity_type) = store.get_entity_type(&self.config.entity_type).await {
+            if let Ok(entities) = store.find_entities(entity_type, None).await {
                 self.test_entities = entities;
                 info!("Found {} existing {} entities", self.test_entities.len(), self.config.entity_type);
             }
         }
 
         // Find or create test entity for write operations
-        if let Ok(perf_test_et) = store.get_entity_type("PerfTestEntity") {
-            let entities = store.find_entities(perf_test_et, Some("Name == 'TestEntity'"))
+        if let Ok(perf_test_et) = store.get_entity_type("PerfTestEntity").await {
+            let entities = store.find_entities(perf_test_et, Some("Name == 'TestEntity'")).await
                 .unwrap_or_default();
             
             if !entities.is_empty() {
@@ -204,11 +204,13 @@ impl BenchmarkContext {
             }
         }
 
+        // Shutdown the connection used for initialization
+        store.shutdown().await;
         Ok(())
     }
 }
 
-fn run_benchmark_test(
+async fn run_benchmark_test(
     config: Arc<Config>,
     context: Arc<BenchmarkContext>,
     test: BenchmarkTest,
@@ -222,8 +224,8 @@ fn run_benchmark_test(
         let context_clone = context.clone();
         let test_clone = test.clone();
         
-        let handle = thread::spawn(move || {
-            run_client_benchmark(config_clone, context_clone, test_clone, client_id, requests_per_client)
+        let handle = task::spawn(async move {
+            run_client_benchmark(config_clone, context_clone, test_clone, client_id, requests_per_client).await
         });
         handles.push(handle);
     }
@@ -231,7 +233,7 @@ fn run_benchmark_test(
     let mut total_result = TestResult::new(test.name().to_string());
     
     for handle in handles {
-        match handle.join() {
+        match handle.await {
             Ok(Ok(client_result)) => {
                 total_result.total_requests += client_result.total_requests;
                 total_result.successful_requests += client_result.successful_requests;
@@ -241,8 +243,8 @@ fn run_benchmark_test(
             Ok(Err(e)) => {
                 error!("Client failed: {}", e);
             }
-            Err(_) => {
-                error!("Client thread panicked");
+            Err(e) => {
+                error!("Client task panicked: {}", e);
             }
         }
     }
@@ -253,7 +255,7 @@ fn run_benchmark_test(
     Ok(total_result)
 }
 
-fn run_client_benchmark(
+async fn run_client_benchmark(
     config: Arc<Config>,
     context: Arc<BenchmarkContext>,
     test: BenchmarkTest,
@@ -261,11 +263,11 @@ fn run_client_benchmark(
     requests_count: u64,
 ) -> Result<TestResult> {
     let url = format!("{}:{}", config.host, config.port);
-    let mut store = StoreProxy::connect_and_authenticate(
+    let store = AsyncStoreProxy::connect_and_authenticate(
         &url,
         &config.username,
         &config.password,
-    ).with_context(|| format!("Client {} failed to connect", client_id))?;
+    ).await.with_context(|| format!("Client {} failed to connect", client_id))?;
 
     let mut result = TestResult::new(test.name().to_string());
     let mut requests_processed = 0u64;
@@ -279,7 +281,7 @@ fn run_client_benchmark(
         
         // Prepare multiple requests for pipelining
         for i in 0..pipeline_size {
-            if let Some(request) = prepare_request(&mut store, &context, &test, client_id, requests_processed + i as u64)? {
+            if let Some(request) = prepare_request(&store, &context, &test, client_id, requests_processed + i as u64).await? {
                 pipeline_requests.push(request);
             }
         }
@@ -290,10 +292,10 @@ fn run_client_benchmark(
         // Execute the pipeline - send all requests in a single Requests object over the wire
         let pipeline_success = if !pipeline_requests.is_empty() {
             let pipelined_requests = Requests::new(pipeline_requests);
-            store.perform(pipelined_requests).is_ok()
+            store.perform(pipelined_requests).await.is_ok()
         } else {
             // For tests that don't generate requests (like EntityExists), execute directly
-            execute_non_request_operations(&mut store, &context, &test, client_id, pipeline_size).is_ok()
+            execute_non_request_operations(&store, &context, &test, client_id, pipeline_size).await.is_ok()
         };
         
         let pipeline_latency = pipeline_start.elapsed();
@@ -319,11 +321,13 @@ fn run_client_benchmark(
         }
     }
 
+    // Clean shutdown of the async connection
+    store.shutdown().await;
     Ok(result)
 }
 
-fn prepare_request(
-    store: &mut StoreProxy,
+async fn prepare_request(
+    store: &AsyncStoreProxy,
     context: &BenchmarkContext,
     test: &BenchmarkTest,
     client_id: usize,
@@ -332,7 +336,7 @@ fn prepare_request(
     match test {
         BenchmarkTest::WriteEntity => {
             if let Some(test_entity_id) = context.test_entity_id {
-                let test_string_ft = store.get_field_type("TestString")?;
+                let test_string_ft = store.get_field_type("TestString").await?;
                 // Generate string data of specified size
                 let data = generate_test_data(context.config.data_size, client_id, request_num);
                 Ok(Some(swrite!(test_entity_id, sfield![test_string_ft], sstr!(data))))
@@ -342,7 +346,7 @@ fn prepare_request(
         }
         BenchmarkTest::BulkWrite => {
             if let Some(test_entity_id) = context.test_entity_id {
-                let test_string_ft = store.get_field_type("TestString")?;
+                let test_string_ft = store.get_field_type("TestString").await?;
                 // Generate string data of specified size for bulk operations
                 let data = generate_test_data(context.config.data_size, client_id, request_num);
                 Ok(Some(swrite!(test_entity_id, sfield![test_string_ft], sstr!(data))))
@@ -353,7 +357,7 @@ fn prepare_request(
         BenchmarkTest::ReadField => {
             if !context.test_entities.is_empty() {
                 let entity_id = &context.test_entities[client_id % context.test_entities.len()];
-                if let Ok(name_ft) = store.get_field_type("Name") {
+                if let Ok(name_ft) = store.get_field_type("Name").await {
                     Ok(Some(sread!(*entity_id, sfield![name_ft])))
                 } else {
                     Ok(None)
@@ -369,8 +373,8 @@ fn prepare_request(
     }
 }
 
-fn execute_non_request_operations(
-    store: &mut StoreProxy,
+async fn execute_non_request_operations(
+    store: &AsyncStoreProxy,
     context: &BenchmarkContext,
     test: &BenchmarkTest,
     client_id: usize,
@@ -383,17 +387,17 @@ fn execute_non_request_operations(
             BenchmarkTest::EntityExists => {
                 if !context.test_entities.is_empty() {
                     let entity_id = &context.test_entities[(client_id + i) % context.test_entities.len()];
-                    let _ = store.entity_exists(*entity_id);
+                    let _ = store.entity_exists(*entity_id).await;
                 }
             }
             BenchmarkTest::FindEntities => {
-                let entity_type = store.get_entity_type(&context.config.entity_type)?;
-                let _ = store.find_entities(entity_type, None)?;
+                let entity_type = store.get_entity_type(&context.config.entity_type).await?;
+                let _ = store.find_entities(entity_type, None).await?;
             }
             BenchmarkTest::SearchEntities => {
-                let entity_type = store.get_entity_type(&context.config.entity_type)?;
+                let entity_type = store.get_entity_type(&context.config.entity_type).await?;
                 let query = format!("Name != 'NonExistent_{}'", client_id + i);
-                let _ = store.find_entities_paginated(entity_type, Some(&PageOpts::new(20, None)), Some(&query))?;
+                let _ = store.find_entities_paginated(entity_type, Some(&PageOpts::new(20, None)), Some(&query)).await?;
             }
             // Request-based operations should not reach here
             BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField => {
@@ -520,7 +524,8 @@ fn get_tests_to_run(config: &Config) -> Vec<BenchmarkTest> {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let config = Arc::new(Config::parse());
 
     // Initialize tracing
@@ -536,7 +541,7 @@ fn main() -> Result<()> {
         .init();
 
     if !config.quiet && !config.csv {
-        info!("QCore benchmark tool starting");
+        info!("QCore async benchmark tool starting");
         info!("Target: {}:{}", config.host, config.port);
         info!("Clients: {}, Requests: {}, Data size: {} bytes", config.clients, config.requests, config.data_size);
         if config.pipeline > 1 {
@@ -545,7 +550,7 @@ fn main() -> Result<()> {
     }
 
     // Initialize benchmark context
-    let context = Arc::new(BenchmarkContext::new(config.clone())?);
+    let context = Arc::new(BenchmarkContext::new(config.clone()).await?);
     let tests_to_run = get_tests_to_run(&config);
     let requests_per_client = config.requests / config.clients as u64;
 
@@ -557,7 +562,7 @@ fn main() -> Result<()> {
                 info!("Running {} benchmark...", test.name());
             }
             
-            match run_benchmark_test(config.clone(), context.clone(), test.clone(), requests_per_client) {
+            match run_benchmark_test(config.clone(), context.clone(), test.clone(), requests_per_client).await {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     error!("Failed to run {} benchmark: {}", test.name(), e);
