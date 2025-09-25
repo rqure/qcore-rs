@@ -193,14 +193,14 @@ impl BenchmarkContext {
 
         // Find or create test entity for write operations
         if let Ok(perf_test_et) = store.get_entity_type("PerfTestEntity") {
-            let entities = store.find_entities(perf_test_et, Some("Name == 'BenchmarkTestEntity'"))
+            let entities = store.find_entities(perf_test_et, Some("Name == 'TestEntity'"))
                 .unwrap_or_default();
             
             if !entities.is_empty() {
                 self.test_entity_id = Some(entities[0]);
                 info!("Found benchmark test entity");
             } else {
-                warn!("BenchmarkTestEntity not found. Write operations will be limited.");
+                warn!("TestEntity not found. Write operations will be limited.");
             }
         }
 
