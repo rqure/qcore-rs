@@ -234,9 +234,14 @@ impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
                 continue;
             } else if let qlib_rs::Request::ResolveFieldType { .. } = request {
                 continue;
+            } else if let qlib_rs::Request::Write { write_processed, .. } = request {
+                // Only append Write requests that were actually processed and changed the store
+                if !write_processed {
+                    continue;
+                }
             }
 
-            // Skip read requests
+            // Skip read requests and unprocessed write requests
             let serialized = bincode::serialize(request)?;
 
             // Check if we need to rotate the file
