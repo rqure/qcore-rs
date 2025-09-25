@@ -304,8 +304,20 @@ fn run_client_benchmark(
             } else {
                 result.failed_requests += 1;
             }
-            // Divide batch latency across all requests in the batch
-            result.latencies.push(batch_latency / batch_size as u32);
+            
+            // Latency calculation:
+            // - For non-pipelined requests (pipeline=1): use full batch latency (which is single request latency)
+            // - For pipelined requests: use average latency per request in the batch
+            //   This represents the server-side processing time per request
+            let request_latency = if config.pipeline == 1 {
+                // Non-pipelined: batch_latency represents single request latency
+                batch_latency
+            } else {
+                // Pipelined: divide batch latency by number of requests processed concurrently
+                batch_latency / batch_size as u32
+            };
+            
+            result.latencies.push(request_latency);
         }
     }
 
