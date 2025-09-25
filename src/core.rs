@@ -391,7 +391,7 @@ impl CoreService {
                 }
             }
 
-            info!("Will attempt to connect to {} peers: {:?}", target_peers.len(), target_peers);
+            debug!("Will attempt to connect to {} peers: {:?}", target_peers.len(), target_peers);
 
             for (machine_id, address) in &target_peers {
                 match std::net::TcpStream::connect(address) {
@@ -717,6 +717,24 @@ impl CoreService {
             debug!("Permission cache recreated after restore");
         } else {
             warn!("Failed to recreate permission cache after restore");
+        }
+
+        // Disconnect all non-peer clients since snapshot restoration invalidates their state
+        let mut non_peer_tokens = Vec::new();
+        let peer_tokens: HashSet<Token> = self.peers.values()
+            .filter_map(|peer_info| peer_info.token)
+            .collect();
+        
+        for (&token, connection) in &self.connections {
+            if !peer_tokens.contains(&token) {
+                non_peer_tokens.push(token);
+                info!("Disconnecting non-peer client {} due to snapshot restoration", connection.addr_string);
+            }
+        }
+        
+        // Remove non-peer connections
+        for token in non_peer_tokens {
+            self.remove_connection(token);
         }
 
         // Update peer entity IDs for already connected peers
