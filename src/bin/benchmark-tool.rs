@@ -268,53 +268,53 @@ fn run_client_benchmark(
     ).with_context(|| format!("Client {} failed to connect", client_id))?;
 
     let mut result = TestResult::new(test.name().to_string());
-    let mut current_batch = Vec::new();
     let mut requests_processed = 0u64;
     
     while requests_processed < requests_count {
-        let batch_start = std::time::Instant::now();
+        let pipeline_start = std::time::Instant::now();
         
-        // Build a batch of requests for pipelining
-        current_batch.clear();
-        let batch_size = std::cmp::min(config.pipeline, (requests_count - requests_processed) as usize);
+        // Build a pipeline of requests - multiple requests in a single Requests object
+        let pipeline_size = std::cmp::min(config.pipeline, (requests_count - requests_processed) as usize);
+        let mut pipeline_requests = Vec::new();
         
-        for _ in 0..batch_size {
+        // Prepare multiple requests for pipelining
+        for _ in 0..pipeline_size {
             if let Some(request) = prepare_request(&mut store, &context, &test, client_id, requests_processed)? {
-                current_batch.push(request);
+                pipeline_requests.push(request);
             }
             requests_processed += 1;
         }
         
-        // Execute the batch
-        let batch_success = if !current_batch.is_empty() {
-            let batch_requests = Requests::new(current_batch.clone());
-            store.perform(batch_requests).is_ok()
+        // Execute the pipeline - send all requests in a single Requests object over the wire
+        let pipeline_success = if !pipeline_requests.is_empty() {
+            let pipelined_requests = Requests::new(pipeline_requests);
+            store.perform(pipelined_requests).is_ok()
         } else {
             // For tests that don't generate requests (like EntityExists), execute directly
-            execute_non_request_operations(&mut store, &context, &test, client_id, batch_size).is_ok()
+            execute_non_request_operations(&mut store, &context, &test, client_id, pipeline_size).is_ok()
         };
         
-        let batch_latency = batch_start.elapsed();
+        let pipeline_latency = pipeline_start.elapsed();
         
-        // Record results for each request in the batch
-        for _ in 0..batch_size {
+        // Record results for each request in the pipeline
+        for _ in 0..pipeline_size {
             result.total_requests += 1;
-            if batch_success {
+            if pipeline_success {
                 result.successful_requests += 1;
             } else {
                 result.failed_requests += 1;
             }
             
             // Latency calculation:
-            // - For non-pipelined requests (pipeline=1): use full batch latency (which is single request latency)
-            // - For pipelined requests: use average latency per request in the batch
-            //   This represents the server-side processing time per request
+            // - For non-pipelined requests (pipeline=1): use full pipeline latency (which is single request latency)
+            // - For pipelined requests: divide pipeline latency by number of requests in the pipeline
+            //   This represents the average server-side processing time per request in the pipeline
             let request_latency = if config.pipeline == 1 {
-                // Non-pipelined: batch_latency represents single request latency
-                batch_latency
+                // Non-pipelined: pipeline_latency represents single request latency
+                pipeline_latency
             } else {
-                // Pipelined: divide batch latency by number of requests processed concurrently
-                batch_latency / batch_size as u32
+                // Pipelined: divide pipeline latency by number of requests processed in the pipeline
+                pipeline_latency / pipeline_size as u32
             };
             
             result.latencies.push(request_latency);
@@ -376,10 +376,11 @@ fn execute_non_request_operations(
     context: &BenchmarkContext,
     test: &BenchmarkTest,
     client_id: usize,
-    batch_size: usize,
+    pipeline_size: usize,
 ) -> Result<()> {
-    // Execute multiple operations for bulk testing
-    for i in 0..batch_size {
+    // For non-request operations, we cannot truly pipeline them since they use direct method calls
+    // However, we can still execute multiple operations in sequence to simulate pipeline behavior
+    for i in 0..pipeline_size {
         match test {
             BenchmarkTest::EntityExists => {
                 if !context.test_entities.is_empty() {
@@ -489,7 +490,7 @@ fn print_detailed_results(config: &Config, results: &[TestResult]) {
         println!("  {} bytes payload", config.data_size);
         
         if config.pipeline > 1 {
-            println!("  {} requests pipelined", config.pipeline);
+            println!("  {} requests per pipeline (sent together in single Requests object)", config.pipeline);
         }
         
         println!("  keep alive: 1");
