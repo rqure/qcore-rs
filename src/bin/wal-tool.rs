@@ -766,9 +766,18 @@ impl WalReader {
             if self.config.relative_time {
                 format_relative_time(write_time)
             } else {
-                // Show full timestamp
-                write_time.format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "Invalid timestamp".to_string())
+                // Show timestamp rounded to 3 decimal places (milliseconds)
+                match time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z") {
+                    Ok(format) => {
+                        write_time.format(&format)
+                            .unwrap_or_else(|_| "Invalid timestamp".to_string())
+                    },
+                    Err(_) => {
+                        // Fallback to RFC3339 if custom format fails
+                        write_time.format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_else(|_| "Invalid timestamp".to_string())
+                    }
+                }
             }
         } else {
             "No timestamp".to_string()
@@ -851,8 +860,17 @@ impl WalReader {
                 }
             },
             Some(qlib_rs::Value::Timestamp(ts)) => {
-                ts.format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "invalid_timestamp".to_string())
+                match time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z") {
+                    Ok(format) => {
+                        ts.format(&format)
+                            .unwrap_or_else(|_| "invalid_timestamp".to_string())
+                    },
+                    Err(_) => {
+                        // Fallback to RFC3339 if custom format fails
+                        ts.format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_else(|_| "invalid_timestamp".to_string())
+                    }
+                }
             },
             None => "null".to_string(),
         }
