@@ -211,6 +211,7 @@ struct WalReader {
     create_entries: Vec<WalCreateEntry>,
     delete_entries: Vec<WalDeleteEntry>,
     system_entries: Vec<WalSystemEntry>,
+    snapshot: Option<qlib_rs::Snapshot>,
 }
 
 impl WalReader {
@@ -219,13 +220,17 @@ impl WalReader {
             .join(&config.machine)
             .join("wal");
 
+        let snapshots_dir = PathBuf::from(&config.data_dir)
+            .join(&config.machine)
+            .join("snapshots");
+
         let request_type_filter = if config.request_types.is_empty() {
             None
         } else {
             Some(config.request_types.clone())
         };
 
-        Ok(Self {
+        let mut reader = Self {
             config,
             wal_dir,
             request_type_filter,
@@ -233,7 +238,98 @@ impl WalReader {
             create_entries: Vec::new(),
             delete_entries: Vec::new(),
             system_entries: Vec::new(),
-        })
+            snapshot: None,
+        };
+
+        // Try to load the latest snapshot from the expected location
+        reader.load_snapshot(&snapshots_dir)?;
+
+        Ok(reader)
+    }
+
+    /// Load the latest snapshot from the snapshots directory
+    fn load_snapshot(&mut self, snapshots_dir: &PathBuf) -> Result<()> {
+        if !snapshots_dir.exists() {
+            info!("Snapshots directory does not exist: {}, entity/field types will be shown as IDs", snapshots_dir.display());
+            return Ok(());
+        }
+
+        info!("Looking for snapshots in: {}", snapshots_dir.display());
+
+        match self.find_latest_snapshot(snapshots_dir)? {
+            Some((snapshot_path, counter)) => {
+                info!("Loading snapshot #{} from {}", counter, snapshot_path.display());
+                
+                let mut file = File::open(&snapshot_path)?;
+                let mut buffer = Vec::new();
+                file.read_to_end(&mut buffer)?;
+                
+                if buffer.is_empty() {
+                    warn!("Snapshot file is empty: {}", snapshot_path.display());
+                    return Ok(());
+                }
+                
+                match bincode::deserialize::<qlib_rs::Snapshot>(&buffer) {
+                    Ok(snapshot) => {
+                        info!("Loaded snapshot #{} for entity/field type resolution", counter);
+                        info!("Snapshot contains {} entity types and {} field types", 
+                            snapshot.entity_type_interner.ids().count(), 
+                            snapshot.field_type_interner.ids().count());
+                        
+                        // Debug: print some entity and field types
+                        for id in snapshot.entity_type_interner.ids().take(5) {
+                            if let Some(name) = snapshot.entity_type_interner.resolve(id) {
+                                info!("Entity type {}: {}", id, name);
+                            }
+                        }
+                        for id in snapshot.field_type_interner.ids().take(5) {
+                            if let Some(name) = snapshot.field_type_interner.resolve(id) {
+                                info!("Field type {}: {}", id, name);
+                            }
+                        }
+                        
+                        self.snapshot = Some(snapshot);
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize snapshot from {}: {}", snapshot_path.display(), e);
+                    }
+                }
+            }
+            None => {
+                info!("No snapshots found in {}, entity/field types will be shown as IDs", snapshots_dir.display());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find the latest snapshot file in the directory
+    fn find_latest_snapshot(&self, snapshots_dir: &PathBuf) -> Result<Option<(PathBuf, u64)>> {
+        let entries = read_dir(snapshots_dir)?;
+        let mut snapshot_files = Vec::new();
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                if filename.starts_with("snapshot_") && filename.ends_with(".bin") {
+                    // Extract counter from filename (snapshot_NNNNNNNNNN.bin)
+                    if let Some(counter_str) = filename.strip_prefix("snapshot_").and_then(|s| s.strip_suffix(".bin")) {
+                        if let Ok(counter) = counter_str.parse::<u64>() {
+                            snapshot_files.push((path, counter));
+                        }
+                    }
+                }
+            }
+        }
+
+        if snapshot_files.is_empty() {
+            return Ok(None);
+        }
+
+        // Sort files by counter and return the latest
+        snapshot_files.sort_by_key(|(_, counter)| *counter);
+        snapshot_files.last().cloned().map(Some).ok_or_else(|| anyhow::anyhow!("No valid snapshot files found"))
     }
 
     fn read_wal_files(&mut self, start_time: Option<OffsetDateTime>, end_time: Option<OffsetDateTime>) -> Result<()> {
@@ -561,12 +657,12 @@ impl WalReader {
                 WalReadWriteEntry {
                     timestamp: timestamp_str,
                     operation: "READ".to_string(),
-                    entity: Self::format_entity_id(entity_id),
-                    field: Self::format_field_types(field_type),
-                    value: Self::format_value_clean(value),
+                    entity: self.format_entity_id(entity_id),
+                    field: self.format_field_types(field_type),
+                    value: self.format_value_clean(value),
                     push: "-".to_string(),
                     adjust: "-".to_string(),
-                    writer: writer_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "system".to_string()),
+                    writer: writer_id.as_ref().map(|id| self.format_entity_id(id)).unwrap_or_else(|| "system".to_string()),
                     location,
                 }
             },
@@ -574,12 +670,12 @@ impl WalReader {
                 WalReadWriteEntry {
                     timestamp: timestamp_str,
                     operation: "WRITE".to_string(),
-                    entity: Self::format_entity_id(entity_id),
-                    field: Self::format_field_types(field_type),
-                    value: Self::format_value_clean(value),
+                    entity: self.format_entity_id(entity_id),
+                    field: self.format_field_types(field_type),
+                    value: self.format_value_clean(value),
                     push: format!("{:?}", push_condition),
                     adjust: format!("{}", adjust_behavior),
-                    writer: writer_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "system".to_string()),
+                    writer: writer_id.as_ref().map(|id| self.format_entity_id(id)).unwrap_or_else(|| "system".to_string()),
                     location,
                 }
             },
@@ -603,8 +699,8 @@ impl WalReader {
                     operation: "CREATE".to_string(),
                     entity_type: format!("{}", entity_type.0),
                     name: name.clone(),
-                    parent: parent_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "root".to_string()),
-                    created_id: created_entity_id.as_ref().map(Self::format_entity_id).unwrap_or_else(|| "auto".to_string()),
+                    parent: parent_id.as_ref().map(|id| self.format_entity_id(id)).unwrap_or_else(|| "root".to_string()),
+                    created_id: created_entity_id.as_ref().map(|id| self.format_entity_id(id)).unwrap_or_else(|| "auto".to_string()),
                     location,
                 }
             },
@@ -626,7 +722,7 @@ impl WalReader {
                 WalDeleteEntry {
                     timestamp: timestamp_str,
                     operation: "DELETE".to_string(),
-                    entity: Self::format_entity_id(entity_id),
+                    entity: self.format_entity_id(entity_id),
                     location,
                 }
             },
@@ -680,25 +776,54 @@ impl WalReader {
     }
 
     /// Format entity ID in a clean, readable way
-    fn format_entity_id(entity_id: &qlib_rs::EntityId) -> String {
-        format!("{}:{}", entity_id.extract_type().0, entity_id.extract_id())
+    fn format_entity_id(&self, entity_id: &qlib_rs::EntityId) -> String {
+        let entity_type = entity_id.extract_type();
+        let id = entity_id.extract_id();
+        
+        if let Some(ref snapshot) = self.snapshot {
+            if let Some(type_name) = snapshot.entity_type_interner.resolve(entity_type.0 as u64) {
+                info!("Resolved entity type {} -> {}", entity_type.0, type_name);
+                return format!("{}:{}", type_name, entity_id.0);
+            } else {
+                warn!("Could not resolve entity type {} in snapshot", entity_type.0);
+            }
+        } else {
+            warn!("No snapshot available for entity type resolution");
+        }
+        
+        // Fallback to ID if no snapshot or type not found
+        format!("{}:{}", entity_type.0, id)
     }
 
     /// Format field types as a readable string
-    fn format_field_types(field_types: &IndirectFieldType) -> String {
+    fn format_field_types(&self, field_types: &IndirectFieldType) -> String {
         if field_types.len() == 1 {
+            if let Some(ref snapshot) = self.snapshot {
+                if let Some(field_name) = snapshot.field_type_interner.resolve(field_types[0].0 as u64) {
+                    return field_name.clone();
+                }
+            }
+            // Fallback to ID if no snapshot or field not found
             format!("{}", field_types[0].0)
         } else {
             // For indirection, show as field1->field2->...
-            field_types.iter()
-                .map(|ft| format!("{}", ft.0))
-                .collect::<Vec<_>>()
-                .join("->")
+            let field_names: Vec<String> = field_types.iter()
+                .map(|ft| {
+                    if let Some(ref snapshot) = self.snapshot {
+                        if let Some(field_name) = snapshot.field_type_interner.resolve(ft.0 as u64) {
+                            return field_name.clone();
+                        }
+                    }
+                    // Fallback to ID if no snapshot or field not found
+                    format!("{}", ft.0)
+                })
+                .collect();
+            field_names.join("->")
         }
     }
 
     /// Format value in a clean way without Rust type annotations
-    fn format_value_clean(value: &Option<qlib_rs::Value>) -> String {
+    fn format_value_clean(&self, value: &Option<qlib_rs::Value>) -> String {
         match value {
             Some(qlib_rs::Value::String(s)) => format!("\"{}\"", s),
             Some(qlib_rs::Value::Int(i)) => i.to_string(),
@@ -709,14 +834,14 @@ impl WalReader {
                 if list.is_empty() {
                     "[]".to_string()
                 } else if list.len() <= 3 {
-                    format!("[{}]", list.iter().map(Self::format_entity_id).collect::<Vec<_>>().join(", "))
+                    format!("[{}]", list.iter().map(|id| self.format_entity_id(id)).collect::<Vec<_>>().join(", "))
                 } else {
                     format!("[{}, ... {} more]", 
-                        list.iter().take(2).map(Self::format_entity_id).collect::<Vec<_>>().join(", "),
+                        list.iter().take(2).map(|id| self.format_entity_id(id)).collect::<Vec<_>>().join(", "),
                         list.len() - 2)
                 }
             },
-            Some(qlib_rs::Value::EntityReference(Some(entity_id))) => Self::format_entity_id(entity_id),
+            Some(qlib_rs::Value::EntityReference(Some(entity_id))) => self.format_entity_id(entity_id),
             Some(qlib_rs::Value::EntityReference(None)) => "null".to_string(),
             Some(qlib_rs::Value::Blob(blob)) => {
                 if blob.as_slice().len() <= 16 {
