@@ -157,7 +157,7 @@ struct EntityDisplay {
 
 /// Helper function to format EntityId for display
 fn format_entity_id(entity_id: EntityId) -> String {
-    format!("{}:{}", entity_id.extract_type().0, entity_id.extract_id())
+    format!("{}", entity_id.0)
 }
 
 /// Performance metrics for query execution

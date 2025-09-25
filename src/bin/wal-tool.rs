@@ -473,7 +473,7 @@ impl WalReader {
         // Check entity ID filter
         if let Some(ref filter_entity_id) = self.config.entity_id {
             if let Some(entity_id) = request.entity_id() {
-                let formatted_id = format!("{}:{}", entity_id.extract_type().0, entity_id.extract_id());
+                let formatted_id = format!("{}", entity_id.0);
                 if formatted_id != *filter_entity_id {
                     return false;
                 }
@@ -737,12 +737,12 @@ impl WalReader {
     /// Format entity ID in a clean, readable way
     fn format_entity_id(&self, entity_id: &qlib_rs::EntityId) -> String {
         let entity_type = entity_id.extract_type();
-        let id = entity_id.extract_id();
+        let id = entity_id.0;
         
         if let Some(ref snapshot) = self.snapshot {
             if let Some(type_name) = snapshot.entity_type_interner.resolve(entity_type.0 as u64) {
                 info!("Resolved entity type {} -> {}", entity_type.0, type_name);
-                return format!("{}:{}", type_name, entity_id.0);
+                return format!("{}:{}", type_name, id);
             } else {
                 warn!("Could not resolve entity type {} in snapshot", entity_type.0);
             }
@@ -751,7 +751,7 @@ impl WalReader {
         }
         
         // Fallback to ID if no snapshot or type not found
-        format!("{}:{}", entity_type.0, id)
+        format!("{}", id)
     }
 
     /// Format field types as a readable string

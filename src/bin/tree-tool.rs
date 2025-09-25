@@ -165,7 +165,7 @@ fn build_tree(
     // Recursively build child nodes
     let mut children = Vec::new();
     for child_id in children_ids {
-        let child_id_str = format!("{}:{}", child_id.extract_type().0, child_id.extract_id());
+        let child_id_str = format!("{}", child_id.0);
         match build_tree(store, child_id, max_depth, current_depth + 1) {
             Ok(child_node) => children.push(child_node),
             Err(e) => {
@@ -228,7 +228,7 @@ fn get_entity_children(store: &mut StoreProxy, entity_id: EntityId) -> Result<Ve
 /// Print the tree structure using ASCII tree characters
 fn print_tree(node: &TreeNode, prefix: &str, is_last: bool, config: &Config) {
     // Helper function to format entity ID
-    let format_entity_id = || format!("{}:{}", node.entity_id.extract_type().0, node.entity_id.extract_id());
+    let format_entity_id = || format!("{}", node.entity_id.0);
     
     // Determine what to display
     let display_text = if config.verbose {
