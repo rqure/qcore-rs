@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{sfield, sint, sstr, swrite, sread, EntityId, PageOpts, Requests, StoreProxy};
+use qlib_rs::{sfield, sstr, swrite, sread, EntityId, PageOpts, Requests, StoreProxy};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::thread;
@@ -143,14 +143,6 @@ impl TestResult {
     fn requests_per_second(&self) -> f64 {
         if self.duration.as_secs_f64() > 0.0 {
             self.successful_requests as f64 / self.duration.as_secs_f64()
-        } else {
-            0.0
-        }
-    }
-
-    fn success_rate(&self) -> f64 {
-        if self.total_requests > 0 {
-            self.successful_requests as f64 / self.total_requests as f64 * 100.0
         } else {
             0.0
         }
