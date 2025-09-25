@@ -483,6 +483,12 @@ impl CoreService {
                 Ok((mut stream, addr)) => {
                     debug!("Accepted new connection from {}", addr);
                     
+                    // Optimize TCP socket for low latency
+                    if let Err(e) = stream.set_nodelay(true) {
+                        warn!("Failed to set TCP_NODELAY on connection from {}: {}", addr, e);
+                        // Continue anyway, this is just an optimization
+                    }
+                    
                     let token = Token(self.next_token);
                     self.next_token += 1;
                     
@@ -1237,6 +1243,12 @@ impl CoreService {
                         warn!("Peer {} is already connected, ignoring new connection", machine_id);
                         return;
                     }
+                }
+                
+                // Optimize TCP socket for low latency
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!("Failed to set TCP_NODELAY on peer connection from {}: {}", machine_id, e);
+                    // Continue anyway, this is just an optimization
                 }
                 
                 let token = Token(self.next_token);

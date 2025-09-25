@@ -278,12 +278,14 @@ fn run_client_benchmark(
         let mut pipeline_requests = Vec::new();
         
         // Prepare multiple requests for pipelining
-        for _ in 0..pipeline_size {
-            if let Some(request) = prepare_request(&mut store, &context, &test, client_id, requests_processed)? {
+        for i in 0..pipeline_size {
+            if let Some(request) = prepare_request(&mut store, &context, &test, client_id, requests_processed + i as u64)? {
                 pipeline_requests.push(request);
             }
-            requests_processed += 1;
         }
+        
+        let actual_requests_in_pipeline = pipeline_requests.len();
+        requests_processed += pipeline_size as u64;
         
         // Execute the pipeline - send all requests in a single Requests object over the wire
         let pipeline_success = if !pipeline_requests.is_empty() {
@@ -305,15 +307,11 @@ fn run_client_benchmark(
                 result.failed_requests += 1;
             }
             
-            // Latency calculation:
-            // - For non-pipelined requests (pipeline=1): use full pipeline latency (which is single request latency)
-            // - For pipelined requests: divide pipeline latency by number of requests in the pipeline
-            //   This represents the average server-side processing time per request in the pipeline
-            let request_latency = if config.pipeline == 1 {
-                // Non-pipelined: pipeline_latency represents single request latency
-                pipeline_latency
+            // For pipelined requests, the latency represents the amortized time per request
+            // For better throughput measurement, we divide total pipeline time by requests processed
+            let request_latency = if actual_requests_in_pipeline > 0 {
+                pipeline_latency / actual_requests_in_pipeline as u32
             } else {
-                // Pipelined: divide pipeline latency by number of requests processed in the pipeline
                 pipeline_latency / pipeline_size as u32
             };
             
