@@ -318,6 +318,7 @@ impl CoreService {
 
                 // Drain the write queue from the store
                 while let Some(requests) = service.store.write_queue.pop_front() {
+                    debug!("Processing write queue with {} requests", requests.len());
                     // Set the originator to our candidate entity ID only if it wasn't already set
                     let we_are_originator = if requests.originator().is_none() {
                         requests.set_originator(service.candidate_entity_id);
@@ -914,6 +915,7 @@ impl CoreService {
         
         // Apply the requests to our store if they didn't originate from us
         if requests.originator() != self.candidate_entity_id {
+            debug!("Applying {} sync write requests from peer {}", requests.len(), peer_machine_id);
             if let Err(e) = self.store.perform_mut(requests) {
                 warn!("Failed to apply sync write from peer {}: {}", peer_machine_id, e);
             } else {
@@ -1038,6 +1040,7 @@ impl CoreService {
             StoreMessage::Perform { id, requests } => {
                 match self.check_requests_authorization(client_id, requests) {
                     Ok(authorized_requests) => {
+                        debug!("Performing {} authorized requests for client {:?}", authorized_requests.len(), client_id);
                         match self.store.perform_mut(authorized_requests) {
                             Ok(results) => Ok(StoreMessage::PerformResponse {
                                 id,
@@ -1371,6 +1374,7 @@ impl CoreService {
         };
 
         if let Some(candidate) = candidates.first() {
+            debug!("Writing heartbeat fields for candidate {:?}", candidate);
             if let Err(e) = self.store.perform_mut(sreq![
                 swrite!(*candidate, sfield![ft_heartbeat], schoice!(0)),
                 swrite!(*candidate, sfield![ft_make_me], schoice!(1), PushCondition::Changes)
@@ -1558,6 +1562,7 @@ impl CoreService {
             // Update available list only if it has changed
             let current_available = ft_results.extract_entity_list(1).unwrap_or_default();
             if current_available != available {
+                debug!("Updating available list for fault tolerance entity {:?}: {:?}", ft_entity_id, available);
                 if let Err(e) = self.store.perform_mut(sreq![
                     swrite!(ft_entity_id, sfield![ft_available_list], Some(qlib_rs::Value::EntityList(available.clone())))
                 ]) {
@@ -1575,6 +1580,7 @@ impl CoreService {
 
                     // Only write if the current leader is different
                     if current_leader != Some(*me_as_candidate) {
+                        debug!("Setting current leader to {:?} for fault tolerance entity {:?}", me_as_candidate, ft_entity_id);
                         if let Err(e) = self.store.perform_mut(sreq![
                             swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(Some(*me_as_candidate))))
                         ]) {
@@ -1590,6 +1596,7 @@ impl CoreService {
                     // No current leader, pick first available
                     let new_leader = available.first().cloned();
                     if new_leader.is_some() {
+                        debug!("Setting new leader {:?} for fault tolerance entity {:?} (no current leader)", new_leader, ft_entity_id);
                         if let Err(e) = self.store.perform_mut(sreq![
                             swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(new_leader)))
                         ]) {
@@ -1629,6 +1636,7 @@ impl CoreService {
 
                         // Only write if the leader actually changes
                         if current_leader != next_leader {
+                            debug!("Updating leader from {:?} to {:?} for fault tolerance entity {:?} (current leader unavailable)", current_leader, next_leader, ft_entity_id);
                             if let Err(e) = self.store.perform_mut(sreq![
                                 swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(next_leader)))
                             ]) {

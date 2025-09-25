@@ -71,7 +71,10 @@ trap 'cleanup' EXIT
 start_node() {
     local name=$1; shift
     echo "Starting ${name}..."
-    "$@" &
+    # Prefix each line of output with the node name in brackets
+    "$@" 2>&1 | while IFS= read -r line; do
+        echo "[$name] $line"
+    done &
 }
 
 # Start all nodes dynamically
