@@ -731,6 +731,7 @@ impl CoreService {
 
         // Resolve all candidate entity IDs (ours and peers) now that schema is available
         self.resolve_candidate_entity_ids();
+        self.store.default_writer_id = self.candidate_entity_id.clone();
 
         // Re-evaluate leadership after restoration
         self.evaluate_leadership();

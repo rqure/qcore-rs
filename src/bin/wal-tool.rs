@@ -34,7 +34,7 @@ struct Config {
     #[arg(long, short)]
     follow: bool,
 
-    /// Show only specific request types (comma-separated: Read,Write,Create,Delete,SchemaUpdate,Snapshot)
+    /// Show only specific request types (comma-separated: Write,Create,Delete,SchemaUpdate,Snapshot)
     #[arg(long, value_delimiter = ',')]
     request_types: Vec<String>,
 
@@ -57,15 +57,11 @@ struct Config {
     /// Filter by entity type
     #[arg(long)]
     entity_type: Option<String>,
-
-    /// Show verbose output with all request details
-    #[arg(long, short)]
-    verbose: bool,
 }
 
-/// Represents a row in the WAL output table for Read/Write operations
+/// Represents a row in the WAL output table for Write operations
 #[derive(Tabled)]
-struct WalReadWriteEntry {
+struct WalWriteEntry {
     #[tabled(rename = "Timestamp")]
     timestamp: String,
     #[tabled(rename = "Op")]
@@ -82,8 +78,6 @@ struct WalReadWriteEntry {
     adjust: String,
     #[tabled(rename = "Writer")]
     writer: String,
-    #[tabled(rename = "File:Row")]
-    location: String,
 }
 
 /// Represents a row in the WAL output table for Create operations
@@ -101,8 +95,6 @@ struct WalCreateEntry {
     parent: String,
     #[tabled(rename = "CreatedID")]
     created_id: String,
-    #[tabled(rename = "File:Row")]
-    location: String,
 }
 
 /// Represents a row in the WAL output table for Delete operations
@@ -114,8 +106,6 @@ struct WalDeleteEntry {
     operation: String,
     #[tabled(rename = "Entity")]
     entity: String,
-    #[tabled(rename = "File:Row")]
-    location: String,
 }
 
 /// Represents a row in the WAL output table for Schema/Snapshot operations
@@ -127,8 +117,6 @@ struct WalSystemEntry {
     operation: String,
     #[tabled(rename = "Target")]
     target: String,
-    #[tabled(rename = "File:Row")]
-    location: String,
 }
 
 fn main() -> Result<()> {
@@ -207,7 +195,7 @@ struct WalReader {
     config: Config,
     wal_dir: PathBuf,
     request_type_filter: Option<Vec<String>>,
-    write_entries: Vec<WalReadWriteEntry>,
+    write_entries: Vec<WalWriteEntry>,
     create_entries: Vec<WalCreateEntry>,
     delete_entries: Vec<WalDeleteEntry>,
     system_entries: Vec<WalSystemEntry>,
@@ -459,7 +447,7 @@ impl WalReader {
                 Request::Delete { .. } => "Delete",
                 Request::SchemaUpdate { .. } => "SchemaUpdate",
                 Request::Snapshot { .. } => "Snapshot",
-                _ => "Read"
+                _ => return false // Unknown request type, don't show
             };
             
             if !types.contains(&request_type.to_string()) {
@@ -566,7 +554,7 @@ impl WalReader {
         // For follow mode, create temporary entries and print them immediately
         match request {
             Request::Write { .. } => {
-                let entry = self.create_read_write_entry(request, wal_path, entry_index);
+                let entry = self.create_write_entry(request, wal_path, entry_index);
                 let table = Table::new(&[entry]);
                 println!("{}", table);
             },
@@ -595,7 +583,7 @@ impl WalReader {
     fn create_and_store_entry(&mut self, request: &Request, wal_path: &PathBuf, entry_index: usize) {
         match request {
             Request::Write { .. } => {
-                let entry = self.create_read_write_entry(request, wal_path, entry_index);
+                let entry = self.create_write_entry(request, wal_path, entry_index);
                 self.write_entries.push(entry);
             },
             Request::Create { .. } => {
@@ -643,31 +631,13 @@ impl WalReader {
         }
     }
 
-    /// Create a Read/Write entry
-    fn create_read_write_entry(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) -> WalReadWriteEntry {
+    /// Create a Write entry
+    fn create_write_entry(&self, request: &Request, _wal_path: &PathBuf, _entry_index: usize) -> WalWriteEntry {
         let timestamp_str = self.format_timestamp(request);
-        let location = if self.config.verbose {
-            format!("{}:{}", wal_path.file_name().unwrap().to_string_lossy(), entry_index)
-        } else {
-            String::new()
-        };
 
         match request {
-            Request::Read { entity_id, field_types: field_type, value, writer_id, .. } => {
-                WalReadWriteEntry {
-                    timestamp: timestamp_str,
-                    operation: "READ".to_string(),
-                    entity: self.format_entity_id(entity_id),
-                    field: self.format_field_types(field_type),
-                    value: self.format_value_clean(value),
-                    push: "-".to_string(),
-                    adjust: "-".to_string(),
-                    writer: writer_id.as_ref().map(|id| self.format_entity_id(id)).unwrap_or_else(|| "system".to_string()),
-                    location,
-                }
-            },
             Request::Write { entity_id, field_types: field_type, value, push_condition, adjust_behavior, writer_id, .. } => {
-                WalReadWriteEntry {
+                WalWriteEntry {
                     timestamp: timestamp_str,
                     operation: "WRITE".to_string(),
                     entity: self.format_entity_id(entity_id),
@@ -676,21 +646,15 @@ impl WalReader {
                     push: format!("{:?}", push_condition),
                     adjust: format!("{}", adjust_behavior),
                     writer: writer_id.as_ref().map(|id| self.format_entity_id(id)).unwrap_or_else(|| "system".to_string()),
-                    location,
                 }
             },
-            _ => unreachable!("create_read_write_entry called with non-read/write request"),
+            _ => unreachable!("create_write_entry called with non-write request"),
         }
     }
 
     /// Create a Create entry
-    fn create_create_entry(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) -> WalCreateEntry {
+    fn create_create_entry(&self, request: &Request, _wal_path: &PathBuf, _entry_index: usize) -> WalCreateEntry {
         let timestamp_str = self.format_timestamp(request);
-        let location = if self.config.verbose {
-            format!("{}:{}", wal_path.file_name().unwrap().to_string_lossy(), entry_index)
-        } else {
-            String::new()
-        };
 
         match request {
             Request::Create { entity_type, parent_id, name, created_entity_id, timestamp: _ } => {
@@ -701,7 +665,6 @@ impl WalReader {
                     name: name.clone(),
                     parent: parent_id.as_ref().map(|id| self.format_entity_id(id)).unwrap_or_else(|| "root".to_string()),
                     created_id: created_entity_id.as_ref().map(|id| self.format_entity_id(id)).unwrap_or_else(|| "auto".to_string()),
-                    location,
                 }
             },
             _ => unreachable!("create_create_entry called with non-create request"),
@@ -709,13 +672,8 @@ impl WalReader {
     }
 
     /// Create a Delete entry
-    fn create_delete_entry(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) -> WalDeleteEntry {
+    fn create_delete_entry(&self, request: &Request, _wal_path: &PathBuf, _entry_index: usize) -> WalDeleteEntry {
         let timestamp_str = self.format_timestamp(request);
-        let location = if self.config.verbose {
-            format!("{}:{}", wal_path.file_name().unwrap().to_string_lossy(), entry_index)
-        } else {
-            String::new()
-        };
 
         match request {
             Request::Delete { entity_id, timestamp: _ } => {
@@ -723,7 +681,6 @@ impl WalReader {
                     timestamp: timestamp_str,
                     operation: "DELETE".to_string(),
                     entity: self.format_entity_id(entity_id),
-                    location,
                 }
             },
             _ => unreachable!("create_delete_entry called with non-delete request"),
@@ -731,13 +688,8 @@ impl WalReader {
     }
 
     /// Create a System entry (Schema/Snapshot)
-    fn create_system_entry(&self, request: &Request, wal_path: &PathBuf, entry_index: usize) -> WalSystemEntry {
+    fn create_system_entry(&self, request: &Request, _wal_path: &PathBuf, _entry_index: usize) -> WalSystemEntry {
         let timestamp_str = self.format_timestamp(request);
-        let location = if self.config.verbose {
-            format!("{}:{}", wal_path.file_name().unwrap().to_string_lossy(), entry_index)
-        } else {
-            String::new()
-        };
 
         match request {
             Request::SchemaUpdate { schema, timestamp: _ } => {
@@ -745,7 +697,6 @@ impl WalReader {
                     timestamp: timestamp_str,
                     operation: "SCHEMA".to_string(),
                     target: schema.entity_type.clone(),
-                    location,
                 }
             },
             Request::Snapshot { snapshot_counter, timestamp: _ } => {
@@ -753,7 +704,6 @@ impl WalReader {
                     timestamp: timestamp_str,
                     operation: "SNAPSHOT".to_string(),
                     target: format!("#{}", snapshot_counter),
-                    location,
                 }
             },
             _ => unreachable!("create_system_entry called with non-system request"),
