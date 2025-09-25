@@ -7,7 +7,6 @@ use std::fs::{File, read_dir};
 use std::io::Read;
 use time::OffsetDateTime;
 use tracing::{info, warn, error};
-use serde_json;
 
 /// Command-line tool for reading and printing WAL (Write-Ahead Log) files
 #[derive(Parser)]
@@ -329,7 +328,7 @@ impl WalReader {
             offset += len;
 
             // Parse the request
-            match serde_json::from_slice::<Request>(request_data) {
+            match bincode::deserialize::<Request>(request_data) {
                 Ok(request) => {
                     if self.should_show_request(&request, start_time, end_time) {
                         if self.config.follow {
@@ -829,7 +828,7 @@ impl WalReader {
             offset += len;
 
             // Parse the request
-            match serde_json::from_slice::<Request>(request_data) {
+            match bincode::deserialize::<Request>(request_data) {
                 Ok(request) => {
                     if self.should_show_request(&request, start_time, end_time) {
                         self.print_request_immediate(&request, wal_path, entries_processed);
