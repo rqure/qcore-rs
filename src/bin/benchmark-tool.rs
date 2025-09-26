@@ -428,41 +428,6 @@ async fn execute_single_non_request_operation(
     Ok(())
 }
 
-async fn execute_non_request_operations(
-    store: &AsyncStoreProxy,
-    context: &BenchmarkContext,
-    test: &BenchmarkTest,
-    client_id: usize,
-    pipeline_size: usize,
-) -> Result<()> {
-    // For non-request operations, we cannot truly pipeline them since they use direct method calls
-    // However, we can still execute multiple operations in sequence to simulate pipeline behavior
-    for i in 0..pipeline_size {
-        match test {
-            BenchmarkTest::EntityExists => {
-                if !context.test_entities.is_empty() {
-                    let entity_id = &context.test_entities[(client_id + i) % context.test_entities.len()];
-                    let _ = store.entity_exists(*entity_id).await;
-                }
-            }
-            BenchmarkTest::FindEntities => {
-                let entity_type = store.get_entity_type(&context.config.entity_type).await?;
-                let _ = store.find_entities(entity_type, None).await?;
-            }
-            BenchmarkTest::SearchEntities => {
-                let entity_type = store.get_entity_type(&context.config.entity_type).await?;
-                let query = format!("Name != 'NonExistent_{}'", client_id + i);
-                let _ = store.find_entities_paginated(entity_type, Some(&PageOpts::new(20, None)), Some(&query)).await?;
-            }
-            // Request-based operations should not reach here
-            BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField => {
-                return Err(anyhow::anyhow!("Request-based operation should not be executed here"));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn generate_test_data(size: usize, client_id: usize, request_num: u64) -> String {
     if size == 0 {
         return String::new();
