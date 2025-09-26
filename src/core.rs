@@ -589,7 +589,7 @@ impl CoreService {
                     Ok(n) => {
                         connection.message_buffer.add_data(&buffer[0..n]);
                         
-                        // Try to decode messages
+                        // Try to decode messages using the optimized zero-copy path when possible
                         while let Some(message) = connection
                             .message_buffer
                             .try_decode_message()
