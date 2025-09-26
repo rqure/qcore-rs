@@ -264,63 +264,42 @@ async fn run_client_benchmark(
     requests_count: u64,
 ) -> Result<TestResult> {
     let url = format!("{}:{}", config.host, config.port);
-    let store = AsyncStoreProxy::connect_and_authenticate(
+    let store = Arc::new(AsyncStoreProxy::connect_and_authenticate(
         &url,
         &config.username,
         &config.password,
-    ).await.with_context(|| format!("Client {} failed to connect", client_id))?;
+    ).await.with_context(|| format!("Client {} failed to connect", client_id))?);
 
     let mut result = TestResult::new(test.name().to_string());
     let mut handles = Vec::new();
     
-    // Spawn a task for each individual request to maximize throughput
-    for request_num in 0..requests_count {
-        let store_clone = store.clone();
-        let context_clone = context.clone();
-        let test_clone = test.clone();
-        
-        let handle = task::spawn(async move {
-            execute_single_request(store_clone, context_clone, test_clone, client_id, request_num).await
-        });
-        
-        handles.push(handle);
-        
-        // If pipeline is configured > 1, respect it as a concurrency limit by awaiting tasks in batches
-        if config.pipeline > 1 && handles.len() >= config.pipeline {
-            // Process a batch of concurrent requests
-            let batch_results = future::join_all(handles.drain(..)).await;
-            
-            for task_result in batch_results {
-                match task_result {
-                    Ok(request_result) => {
-                        result.total_requests += 1;
-                        match request_result {
-                            Ok(latency) => {
-                                result.successful_requests += 1;
-                                result.latencies.push(latency);
-                            }
-                            Err(_) => {
-                                result.failed_requests += 1;
-                                result.latencies.push(Duration::default()); // Add default latency for failed requests
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Task panicked
-                        result.total_requests += 1;
-                        result.failed_requests += 1;
-                        result.latencies.push(Duration::default());
-                    }
-                }
-            }
-        }
-    }
+    // Spawn tasks for requests, respecting pipeline as a concurrency limit
+    let mut requests_spawned = 0u64;
+    let batch_size = if config.pipeline > 1 { config.pipeline } else { 64 }; // Default reasonable batch size
     
-    // Process any remaining tasks
-    if !handles.is_empty() {
-        let remaining_results = future::join_all(handles).await;
+    while requests_spawned < requests_count {
+        let current_batch_size = std::cmp::min(batch_size, (requests_count - requests_spawned) as usize);
         
-        for task_result in remaining_results {
+        // Spawn tasks for current batch
+        for i in 0..current_batch_size {
+            let store_clone = Arc::clone(&store);
+            let context_clone = Arc::clone(&context);
+            let test_clone = test.clone();
+            let request_num = requests_spawned + i as u64;
+            
+            let handle = task::spawn(async move {
+                execute_single_request(store_clone, context_clone, test_clone, client_id, request_num).await
+            });
+            
+            handles.push(handle);
+        }
+        
+        requests_spawned += current_batch_size as u64;
+        
+        // Process the batch
+        let batch_results = future::join_all(handles.drain(..)).await;
+        
+        for task_result in batch_results {
             match task_result {
                 Ok(request_result) => {
                     result.total_requests += 1;
@@ -331,7 +310,7 @@ async fn run_client_benchmark(
                         }
                         Err(_) => {
                             result.failed_requests += 1;
-                            result.latencies.push(Duration::default());
+                            result.latencies.push(Duration::default()); // Add default latency for failed requests
                         }
                     }
                 }
@@ -351,7 +330,7 @@ async fn run_client_benchmark(
 }
 
 async fn execute_single_request(
-    store: AsyncStoreProxy,
+    store: Arc<AsyncStoreProxy>,
     context: Arc<BenchmarkContext>,
     test: BenchmarkTest,
     client_id: usize,
@@ -372,7 +351,7 @@ async fn execute_single_request(
 }
 
 async fn prepare_request(
-    store: &AsyncStoreProxy,
+    store: &Arc<AsyncStoreProxy>,
     context: &BenchmarkContext,
     test: &BenchmarkTest,
     client_id: usize,
@@ -419,7 +398,7 @@ async fn prepare_request(
 }
 
 async fn execute_single_non_request_operation(
-    store: &AsyncStoreProxy,
+    store: &Arc<AsyncStoreProxy>,
     context: &BenchmarkContext,
     test: &BenchmarkTest,
     client_id: usize,
