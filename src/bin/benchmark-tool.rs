@@ -40,6 +40,10 @@ struct Config {
     #[arg(short = 'P', long, default_value_t = 1)]
     pipeline: usize,
 
+    /// Number of concurrent tasks per client (default 64)
+    #[arg(long, default_value_t = 64)]
+    concurrency: usize,
+
     /// Data size of SET/GET value in bytes (default 3)
     #[arg(short = 'd', long, default_value_t = 3)]
     data_size: usize,
@@ -127,6 +131,12 @@ struct TestResult {
     failed_requests: u64,
     latencies: Vec<Duration>,
     duration: Duration,
+}
+
+#[derive(Debug)]
+struct RequestBatchResult {
+    requests_in_batch: u64,
+    result: Result<Duration>,
 }
 
 impl TestResult {
@@ -273,28 +283,35 @@ async fn run_client_benchmark(
     let mut result = TestResult::new(test.name().to_string());
     let mut handles = Vec::new();
     
-    // Spawn tasks for requests, respecting pipeline as a concurrency limit
-    let mut requests_spawned = 0u64;
-    let batch_size = if config.pipeline > 1 { config.pipeline } else { 64 }; // Default reasonable batch size
+    // Calculate effective tasks needed based on pipelining
+    // For request-based operations that support pipelining, each task will handle pipeline_size requests
+    let supports_pipelining = matches!(test, BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField);
+    let effective_pipeline_size = if supports_pipelining && config.pipeline > 1 { config.pipeline as u64 } else { 1 };
+    let tasks_needed = (requests_count + effective_pipeline_size - 1) / effective_pipeline_size; // Ceiling division
     
-    while requests_spawned < requests_count {
-        let current_batch_size = std::cmp::min(batch_size, (requests_count - requests_spawned) as usize);
+    // Spawn concurrent tasks, using concurrency parameter for batching
+    let mut tasks_spawned = 0u64;
+    let batch_size = config.concurrency;
+    
+    while tasks_spawned < tasks_needed {
+        let current_batch_size = std::cmp::min(batch_size, (tasks_needed - tasks_spawned) as usize);
         
         // Spawn tasks for current batch
         for i in 0..current_batch_size {
             let store_clone = Arc::clone(&store);
             let context_clone = Arc::clone(&context);
             let test_clone = test.clone();
-            let request_num = requests_spawned + i as u64;
+            let config_clone = Arc::clone(&config);
+            let task_num = tasks_spawned + i as u64;
             
             let handle = task::spawn(async move {
-                execute_single_request(store_clone, context_clone, test_clone, client_id, request_num).await
+                execute_request_with_pipeline(store_clone, context_clone, test_clone, config_clone, client_id, task_num).await
             });
             
             handles.push(handle);
         }
         
-        requests_spawned += current_batch_size as u64;
+        tasks_spawned += current_batch_size as u64;
         
         // Process the batch
         let batch_results = future::join_all(handles.drain(..)).await;
@@ -302,20 +319,20 @@ async fn run_client_benchmark(
         for task_result in batch_results {
             match task_result {
                 Ok(request_result) => {
-                    result.total_requests += 1;
-                    match request_result {
+                    result.total_requests += request_result.requests_in_batch;
+                    match request_result.result {
                         Ok(latency) => {
-                            result.successful_requests += 1;
+                            result.successful_requests += request_result.requests_in_batch;
                             result.latencies.push(latency);
                         }
                         Err(_) => {
-                            result.failed_requests += 1;
-                            result.latencies.push(Duration::default()); // Add default latency for failed requests
+                            result.failed_requests += request_result.requests_in_batch;
+                            result.latencies.push(Duration::default());
                         }
                     }
                 }
                 Err(_) => {
-                    // Task panicked
+                    // Task panicked - assume 1 request failed (for single request operations)
                     result.total_requests += 1;
                     result.failed_requests += 1;
                     result.latencies.push(Duration::default());
@@ -327,6 +344,65 @@ async fn run_client_benchmark(
     // Clean shutdown of the async connection
     store.shutdown().await;
     Ok(result)
+}
+
+async fn execute_request_with_pipeline(
+    store: Arc<AsyncStoreProxy>,
+    context: Arc<BenchmarkContext>,
+    test: BenchmarkTest,
+    config: Arc<Config>,
+    client_id: usize,
+    task_num: u64,
+) -> RequestBatchResult {
+    let start_time = Instant::now();
+    
+    // Check if this test type supports pipelining (request-based operations)
+    let supports_pipelining = matches!(test, BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField);
+    
+    if supports_pipelining && config.pipeline > 1 {
+        // Execute pipelined requests - bundle multiple requests in a single Requests object
+        let mut requests = Vec::new();
+        
+        for i in 0..config.pipeline {
+            let request_num = task_num * config.pipeline as u64 + i as u64;
+            if let Ok(Some(request)) = prepare_request(&store, &context, &test, client_id, request_num).await {
+                requests.push(request);
+            }
+        }
+        
+        if !requests.is_empty() {
+            let requests_obj = Requests::new(requests);
+            let requests_count = requests_obj.read().len() as u64;
+            
+            match store.perform(requests_obj).await {
+                Ok(_) => RequestBatchResult {
+                    requests_in_batch: requests_count,
+                    result: Ok(start_time.elapsed()),
+                },
+                Err(e) => RequestBatchResult {
+                    requests_in_batch: requests_count,
+                    result: Err(e),
+                },
+            }
+        } else {
+            RequestBatchResult {
+                requests_in_batch: 1,
+                result: Err(anyhow::anyhow!("Failed to prepare pipelined requests")),
+            }
+        }
+    } else {
+        // Execute single request (either non-pipelined or non-request-based operation)
+        match execute_single_request(store, context, test, client_id, task_num).await {
+            Ok(duration) => RequestBatchResult {
+                requests_in_batch: 1,
+                result: Ok(duration),
+            },
+            Err(e) => RequestBatchResult {
+                requests_in_batch: 1,
+                result: Err(e),
+            },
+        }
+    }
 }
 
 async fn execute_single_request(
@@ -509,6 +585,7 @@ fn print_detailed_results(config: &Config, results: &[TestResult]) {
         println!("  {} requests completed in {:.2} seconds", 
                  result.successful_requests, result.duration.as_secs_f64());
         println!("  {} parallel clients", config.clients);
+        println!("  {} concurrent tasks per client", config.concurrency);
         println!("  {} bytes payload", config.data_size);
         
         if config.pipeline > 1 {
@@ -563,9 +640,10 @@ async fn main() -> Result<()> {
     if !config.quiet && !config.csv {
         info!("QCore async benchmark tool starting");
         info!("Target: {}:{}", config.host, config.port);
-        info!("Clients: {}, Requests: {}, Data size: {} bytes", config.clients, config.requests, config.data_size);
+        info!("Clients: {}, Requests: {}, Concurrency: {}, Data size: {} bytes", 
+              config.clients, config.requests, config.concurrency, config.data_size);
         if config.pipeline > 1 {
-            info!("Pipeline: {}", config.pipeline);
+            info!("Pipeline: {} (requests per batch)", config.pipeline);
         }
     }
 
