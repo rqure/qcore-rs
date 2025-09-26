@@ -381,7 +381,7 @@ async fn execute_request_with_pipeline(
                 },
                 Err(e) => RequestBatchResult {
                     requests_in_batch: requests_count,
-                    result: Err(e),
+                    result: Err(anyhow::anyhow!("Failed to perform pipelined requests: {}", e)),
                 },
             }
         } else {
