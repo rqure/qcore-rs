@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::future;
 use qlib_rs::{sfield, sstr, swrite, sread, EntityId, PageOpts, Requests, AsyncStoreProxy};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -263,61 +264,63 @@ async fn run_client_benchmark(
     requests_count: u64,
 ) -> Result<TestResult> {
     let url = format!("{}:{}", config.host, config.port);
-    let store = AsyncStoreProxy::connect_and_authenticate(
+    let store = Arc::new(AsyncStoreProxy::connect_and_authenticate(
         &url,
         &config.username,
         &config.password,
-    ).await.with_context(|| format!("Client {} failed to connect", client_id))?;
+    ).await.with_context(|| format!("Client {} failed to connect", client_id))?);
 
     let mut result = TestResult::new(test.name().to_string());
-    let mut requests_processed = 0u64;
+    let mut handles = Vec::new();
     
-    while requests_processed < requests_count {
-        let pipeline_start = std::time::Instant::now();
+    // Spawn tasks for requests, respecting pipeline as a concurrency limit
+    let mut requests_spawned = 0u64;
+    let batch_size = if config.pipeline > 1 { config.pipeline } else { 64 }; // Default reasonable batch size
+    
+    while requests_spawned < requests_count {
+        let current_batch_size = std::cmp::min(batch_size, (requests_count - requests_spawned) as usize);
         
-        // Build a pipeline of requests - multiple requests in a single Requests object
-        let pipeline_size = std::cmp::min(config.pipeline, (requests_count - requests_processed) as usize);
-        let mut pipeline_requests = Vec::new();
-        
-        // Prepare multiple requests for pipelining
-        for i in 0..pipeline_size {
-            if let Some(request) = prepare_request(&store, &context, &test, client_id, requests_processed + i as u64).await? {
-                pipeline_requests.push(request);
-            }
+        // Spawn tasks for current batch
+        for i in 0..current_batch_size {
+            let store_clone = Arc::clone(&store);
+            let context_clone = Arc::clone(&context);
+            let test_clone = test.clone();
+            let request_num = requests_spawned + i as u64;
+            
+            let handle = task::spawn(async move {
+                execute_single_request(store_clone, context_clone, test_clone, client_id, request_num).await
+            });
+            
+            handles.push(handle);
         }
         
-        let actual_requests_in_pipeline = pipeline_requests.len();
-        requests_processed += pipeline_size as u64;
+        requests_spawned += current_batch_size as u64;
         
-        // Execute the pipeline - send all requests in a single Requests object over the wire
-        let pipeline_success = if !pipeline_requests.is_empty() {
-            let pipelined_requests = Requests::new(pipeline_requests);
-            store.perform(pipelined_requests).await.is_ok()
-        } else {
-            // For tests that don't generate requests (like EntityExists), execute directly
-            execute_non_request_operations(&store, &context, &test, client_id, pipeline_size).await.is_ok()
-        };
+        // Process the batch
+        let batch_results = future::join_all(handles.drain(..)).await;
         
-        let pipeline_latency = pipeline_start.elapsed();
-        
-        // Record results for each request in the pipeline
-        for _ in 0..pipeline_size {
-            result.total_requests += 1;
-            if pipeline_success {
-                result.successful_requests += 1;
-            } else {
-                result.failed_requests += 1;
+        for task_result in batch_results {
+            match task_result {
+                Ok(request_result) => {
+                    result.total_requests += 1;
+                    match request_result {
+                        Ok(latency) => {
+                            result.successful_requests += 1;
+                            result.latencies.push(latency);
+                        }
+                        Err(_) => {
+                            result.failed_requests += 1;
+                            result.latencies.push(Duration::default()); // Add default latency for failed requests
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Task panicked
+                    result.total_requests += 1;
+                    result.failed_requests += 1;
+                    result.latencies.push(Duration::default());
+                }
             }
-            
-            // For pipelined requests, the latency represents the amortized time per request
-            // For better throughput measurement, we divide total pipeline time by requests processed
-            let request_latency = if actual_requests_in_pipeline > 0 {
-                pipeline_latency / actual_requests_in_pipeline as u32
-            } else {
-                pipeline_latency / pipeline_size as u32
-            };
-            
-            result.latencies.push(request_latency);
         }
     }
 
@@ -326,8 +329,29 @@ async fn run_client_benchmark(
     Ok(result)
 }
 
+async fn execute_single_request(
+    store: Arc<AsyncStoreProxy>,
+    context: Arc<BenchmarkContext>,
+    test: BenchmarkTest,
+    client_id: usize,
+    request_num: u64,
+) -> Result<Duration> {
+    let start_time = Instant::now();
+    
+    // Try to prepare and execute a request-based operation
+    if let Some(request) = prepare_request(&store, &context, &test, client_id, request_num).await? {
+        let requests = Requests::new(vec![request]);
+        store.perform(requests).await?;
+    } else {
+        // Execute non-request operations directly
+        execute_single_non_request_operation(&store, &context, &test, client_id, request_num).await?;
+    }
+    
+    Ok(start_time.elapsed())
+}
+
 async fn prepare_request(
-    store: &AsyncStoreProxy,
+    store: &Arc<AsyncStoreProxy>,
     context: &BenchmarkContext,
     test: &BenchmarkTest,
     client_id: usize,
@@ -371,6 +395,37 @@ async fn prepare_request(
             Ok(None)
         }
     }
+}
+
+async fn execute_single_non_request_operation(
+    store: &Arc<AsyncStoreProxy>,
+    context: &BenchmarkContext,
+    test: &BenchmarkTest,
+    client_id: usize,
+    request_num: u64,
+) -> Result<()> {
+    match test {
+        BenchmarkTest::EntityExists => {
+            if !context.test_entities.is_empty() {
+                let entity_id = &context.test_entities[(client_id + request_num as usize) % context.test_entities.len()];
+                let _ = store.entity_exists(*entity_id).await;
+            }
+        }
+        BenchmarkTest::FindEntities => {
+            let entity_type = store.get_entity_type(&context.config.entity_type).await?;
+            let _ = store.find_entities(entity_type, None).await?;
+        }
+        BenchmarkTest::SearchEntities => {
+            let entity_type = store.get_entity_type(&context.config.entity_type).await?;
+            let query = format!("Name != 'NonExistent_{}'", client_id + request_num as usize);
+            let _ = store.find_entities_paginated(entity_type, Some(&PageOpts::new(20, None)), Some(&query)).await?;
+        }
+        // Request-based operations should not reach here
+        BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField => {
+            return Err(anyhow::anyhow!("Request-based operation should not be executed here"));
+        }
+    }
+    Ok(())
 }
 
 async fn execute_non_request_operations(
