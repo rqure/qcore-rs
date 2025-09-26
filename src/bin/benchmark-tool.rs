@@ -136,7 +136,8 @@ struct TestResult {
 #[derive(Debug)]
 struct RequestBatchResult {
     requests_in_batch: u64,
-    result: Result<Duration>,
+    latencies: Vec<Duration>,
+    success: bool,
 }
 
 impl TestResult {
@@ -163,7 +164,7 @@ impl TestResult {
         if self.latencies.is_empty() {
             return Duration::default();
         }
-        let index = (self.latencies.len() * p / 100).saturating_sub(1);
+        let index = ((self.latencies.len() * p / 100).saturating_sub(1)).min(self.latencies.len() - 1);
         self.latencies[index]
     }
 }
@@ -320,15 +321,13 @@ async fn run_client_benchmark(
             match task_result {
                 Ok(request_result) => {
                     result.total_requests += request_result.requests_in_batch;
-                    match request_result.result {
-                        Ok(latency) => {
-                            result.successful_requests += request_result.requests_in_batch;
-                            result.latencies.push(latency);
-                        }
-                        Err(_) => {
-                            result.failed_requests += request_result.requests_in_batch;
-                            result.latencies.push(Duration::default());
-                        }
+                    if request_result.success {
+                        result.successful_requests += request_result.requests_in_batch;
+                        result.latencies.extend(request_result.latencies);
+                    } else {
+                        result.failed_requests += request_result.requests_in_batch;
+                        // Add zero latencies for failed requests
+                        result.latencies.extend(vec![Duration::default(); request_result.requests_in_batch as usize]);
                     }
                 }
                 Err(_) => {
@@ -346,6 +345,11 @@ async fn run_client_benchmark(
     Ok(result)
 }
 
+/// Execute a request or batch of pipelined requests.
+/// 
+/// Note: For pipelined operations, this records a single latency measurement for the entire
+/// batch rather than individual request latencies. This means latency percentiles for
+/// pipelined tests represent batch completion times, not individual request times.
 async fn execute_request_with_pipeline(
     store: Arc<AsyncStoreProxy>,
     context: Arc<BenchmarkContext>,
@@ -374,20 +378,37 @@ async fn execute_request_with_pipeline(
             let requests_obj = Requests::new(requests);
             let requests_count = requests_obj.read().len() as u64;
             
+            // Measure individual request latencies within the pipeline
+            let mut individual_latencies = Vec::new();
+            
             match store.perform(requests_obj).await {
-                Ok(_) => RequestBatchResult {
+                Ok(_) => {
+                    // For pipelined requests, we approximate individual latencies
+                    // by dividing the total batch time evenly among requests
+                    let total_duration = start_time.elapsed();
+                    let per_request_duration = total_duration / requests_count as u32;
+                    
+                    for _ in 0..requests_count {
+                        individual_latencies.push(per_request_duration);
+                    }
+                    
+                    RequestBatchResult {
+                        requests_in_batch: requests_count,
+                        latencies: individual_latencies,
+                        success: true,
+                    }
+                }
+                Err(_) => RequestBatchResult {
                     requests_in_batch: requests_count,
-                    result: Ok(start_time.elapsed()),
-                },
-                Err(e) => RequestBatchResult {
-                    requests_in_batch: requests_count,
-                    result: Err(anyhow::anyhow!("Failed to perform pipelined requests: {}", e)),
+                    latencies: vec![Duration::default(); requests_count as usize],
+                    success: false,
                 },
             }
         } else {
             RequestBatchResult {
                 requests_in_batch: 1,
-                result: Err(anyhow::anyhow!("Failed to prepare pipelined requests")),
+                latencies: vec![Duration::default()],
+                success: false,
             }
         }
     } else {
@@ -395,11 +416,13 @@ async fn execute_request_with_pipeline(
         match execute_single_request(store, context, test, client_id, task_num).await {
             Ok(duration) => RequestBatchResult {
                 requests_in_batch: 1,
-                result: Ok(duration),
+                latencies: vec![duration],
+                success: true,
             },
-            Err(e) => RequestBatchResult {
+            Err(_) => RequestBatchResult {
                 requests_in_batch: 1,
-                result: Err(e),
+                latencies: vec![Duration::default()],
+                success: false,
             },
         }
     }
@@ -568,7 +591,7 @@ fn print_csv_results(results: &[TestResult]) {
 
 fn print_quiet_results(config: &Config, results: &[TestResult]) {
     for result in results {
-        let p50_ms = result.percentile(50).as_millis() as f64 / 1000.0;
+        let p50_ms = result.percentile(50).as_millis() as f64;
         let p50_formatted = format!("{:.precision$}", p50_ms, precision = config.precision);
         println!(
             "{}: {:.2} requests per second, p50={} msec",
