@@ -16,7 +16,7 @@ use qlib_rs::{
     Request, Snapshot, AuthConfig,
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
-use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer, PeerMessage};
+use qlib_rs::qresp::{QrespMessage, QrespMessageBuffer, PeerMessage, encode_message, encode_store_message};
 
 use crate::snapshot::SnapshotHandle;
 use crate::wal::WalHandle;
@@ -138,7 +138,7 @@ struct Connection {
     notification_queue: NotificationQueue,
     notification_configs: HashSet<NotifyConfig>,
     outbound_messages: VecDeque<Vec<u8>>,
-    message_buffer: MessageBuffer,
+    message_buffer: QrespMessageBuffer,
 }
 
 /// Core service that handles both client and peer connections
@@ -335,11 +335,9 @@ impl CoreService {
                     
                     // Only send SyncWrite message to peers if we are the originator
                     if we_are_originator {
-                        let sync_write_msg = qlib_rs::protocol::ProtocolMessage::Peer(
-                            qlib_rs::protocol::PeerMessage::SyncWrite { 
-                                requests: requests.clone() 
-                            }
-                        );
+                        let sync_write_msg = QrespMessage::Peer(PeerMessage::SyncWrite {
+                            requests: requests.clone(),
+                        });
                         
                         // Send to all peer connections
                         // Collect peer tokens first to avoid borrowing issues
@@ -510,7 +508,7 @@ impl CoreService {
                         notification_queue: NotificationQueue::new(),
                         notification_configs: HashSet::new(),
                         outbound_messages: VecDeque::new(),
-                        message_buffer: MessageBuffer::new(),
+                        message_buffer: QrespMessageBuffer::new(),
                     };
                     
                     self.connections.insert(token, connection);
@@ -592,7 +590,11 @@ impl CoreService {
                         connection.message_buffer.add_data(&buffer[0..n]);
                         
                         // Try to decode messages
-                        while let Some(message) = connection.message_buffer.try_decode()? {
+                        while let Some(message) = connection
+                            .message_buffer
+                            .try_decode_message()
+                            .map_err(|e| anyhow::anyhow!("QRESP decode failed: {}", e))?
+                        {
                             messages_to_process.push(message);
                         }
                     }
@@ -783,7 +785,7 @@ impl CoreService {
         
         // Only send a response if this was a request, not a response
         if !is_response {
-            let handshake_response = ProtocolMessage::Peer(PeerMessage::Handshake {
+            let handshake_response = QrespMessage::Peer(PeerMessage::Handshake {
                 start_time: self.start_time,
                 is_response: true,
                 machine_id: self.config.machine.clone(),
@@ -871,7 +873,7 @@ impl CoreService {
             // Find the token for this peer
             if let Some(peer_info) = self.peers.get(&oldest_machine_id) {
                 if let Some(peer_token) = peer_info.token {
-                    let sync_request = ProtocolMessage::Peer(PeerMessage::FullSyncRequest);
+                    let sync_request = QrespMessage::Peer(PeerMessage::FullSyncRequest);
                     
                     if let Err(e) = self.send_protocol_message(peer_token, sync_request) {
                         error!("Failed to send full sync request to older peer {}: {}", oldest_machine_id, e);
@@ -906,7 +908,7 @@ impl CoreService {
         // Take a snapshot of our current store
         let snapshot = self.store.take_snapshot();
         
-        let sync_response = ProtocolMessage::Peer(PeerMessage::FullSyncResponse {
+        let sync_response = QrespMessage::Peer(PeerMessage::FullSyncResponse {
             snapshot,
         });
         
@@ -957,31 +959,21 @@ impl CoreService {
     }
     
     /// Handle a decoded protocol message
-    fn handle_protocol_message(&mut self, token: Token, message: ProtocolMessage) -> Result<()> {
+    fn handle_protocol_message(&mut self, token: Token, message: QrespMessage) -> Result<()> {
         match message {
-            ProtocolMessage::Store(store_message) => {
-                self.handle_store_message(token, store_message)
-            }
-            ProtocolMessage::Peer(peer_message) => {
-                match peer_message {
-                    PeerMessage::Handshake { start_time, is_response, machine_id } => {
-                        self.handle_peer_handshake(token, start_time, is_response, machine_id)
-                    }
-                    PeerMessage::FullSyncRequest => {
-                        self.handle_peer_full_sync_request(token)
-                    }
-                    PeerMessage::FullSyncResponse { snapshot } => {
-                        self.handle_peer_full_sync_response(token, snapshot)
-                    }
-                    PeerMessage::SyncWrite { requests } => {
-                        self.handle_peer_sync_write(token, requests)
-                    }
+            QrespMessage::Store(store_message) => self.handle_store_message(token, store_message),
+            QrespMessage::Peer(peer_message) => match peer_message {
+                PeerMessage::Handshake { start_time, is_response, machine_id } => {
+                    self.handle_peer_handshake(token, start_time, is_response, machine_id)
                 }
-            }
-            _ => {
-                warn!("Received unsupported protocol message from client");
-                Ok(())
-            }
+                PeerMessage::FullSyncRequest => self.handle_peer_full_sync_request(token),
+                PeerMessage::FullSyncResponse { snapshot } => {
+                    self.handle_peer_full_sync_response(token, snapshot)
+                }
+                PeerMessage::SyncWrite { requests } => {
+                    self.handle_peer_sync_write(token, requests)
+                }
+            },
         }
     }
     
@@ -1136,39 +1128,40 @@ impl CoreService {
     }
     
     /// Send a protocol message to a connection
-    fn send_protocol_message(&mut self, token: Token, message: ProtocolMessage) -> Result<()> {
-        let encoded = ProtocolCodec::encode(&message)?;
-        
+    fn send_protocol_message(&mut self, token: Token, message: QrespMessage) -> Result<()> {
+        let encoded = encode_message(&message)
+            .map_err(|e| anyhow::anyhow!("QRESP encode failed: {}", e))?;
+
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_messages.push_back(encoded);
-            
+
             // Register for write events if we have messages to send
             self.poll.registry().reregister(
                 &mut connection.stream,
                 token,
-                Interest::READABLE | Interest::WRITABLE
+                Interest::READABLE | Interest::WRITABLE,
             )?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Send a response message to a client
     fn send_response(&mut self, token: Token, response: StoreMessage) -> Result<()> {
-        let protocol_message = ProtocolMessage::Store(response);
-        let encoded = ProtocolCodec::encode(&protocol_message)?;
-        
+        let encoded = encode_store_message(&response)
+            .map_err(|e| anyhow::anyhow!("QRESP encode failed: {}", e))?;
+
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_messages.push_back(encoded);
-            
+
             // Register for write events if we have messages to send
             self.poll.registry().reregister(
                 &mut connection.stream,
                 token,
-                Interest::READABLE | Interest::WRITABLE
+                Interest::READABLE | Interest::WRITABLE,
             )?;
         }
-        
+
         Ok(())
     }
     
@@ -1281,14 +1274,14 @@ impl CoreService {
                     notification_queue: NotificationQueue::new(),
                     notification_configs: HashSet::new(),
                     outbound_messages: VecDeque::new(),
-                    message_buffer: MessageBuffer::new()
+                    message_buffer: QrespMessageBuffer::new()
                 };
                 
                 self.connections.insert(token, connection);
                 info!("Peer {} connected with token {:?}", machine_id, token);
                 
                 // Send handshake message directly to the peer
-                let handshake_message = ProtocolMessage::Peer(PeerMessage::Handshake {
+                let handshake_message = QrespMessage::Peer(PeerMessage::Handshake {
                     start_time: self.start_time,
                     is_response: false,
                     machine_id: self.config.machine.clone(),
