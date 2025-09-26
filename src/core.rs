@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use bytes::BytesMut;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ahash::AHashMap;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::{schoice, sfield, sreq, sread, swrite, Requests, PushCondition};
+use qlib_rs::{schoice, sfield, sreq, sread, swrite, IndirectFieldType, Requests, PushCondition};
 use rustc_hash::FxHashMap;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
@@ -16,7 +17,8 @@ use qlib_rs::{
     Request, Snapshot, AuthConfig,
     auth::{authenticate_subject, get_scope, AuthorizationScope}
 };
-use qlib_rs::qresp::{QrespMessage, QrespMessageBuffer, PeerMessage, encode_message, encode_store_message};
+use qlib_rs::qresp::{QrespCodec, QrespFrameRef, QrespMessage, QrespMessageBuffer, PeerMessage, decode_message, encode_message, encode_store_message};
+use qlib_rs::data::{QrespRequestRef, QrespRequestType};
 
 use crate::snapshot::SnapshotHandle;
 use crate::wal::WalHandle;
@@ -426,52 +428,143 @@ impl CoreService {
         requests: Requests,
     ) -> Result<Requests> {
         for request in requests.read().iter() {
-            // Extract entity_id and field_type from the request
-            let authorization_needed = match &request {
-                Request::Read { entity_id, field_types, .. } => Some((entity_id, field_types)),
-                Request::Write { entity_id, field_types, .. } => Some((entity_id, field_types)),
-                Request::Create { .. } => None, // No field-level authorization for creation
-                Request::Delete { .. } => None, // No field-level authorization for deletion
-                Request::SchemaUpdate { .. } => None, // No field-level authorization for schema updates
-                _ => None, // For other request types, skip authorization check
-            };
-            
-            if let Some((entity_id, field_types)) = authorization_needed {
-                // If we don't have a permission cache, skip authorization
-                let cache = match &self.permission_cache {
-                    Some(cache) => cache,
-                    None => {
-                        debug!("No permission cache available, skipping authorization check");
-                        continue;
-                    }
-                };
-                
-                // For authorization, we check against the final field in the indirection chain
-                let (final_entity_id, final_field_type) = self.store.resolve_indirection(*entity_id, field_types)?;
-                
-                let scope = get_scope(&self.store, &mut self.cel_executor, cache, client_id, final_entity_id, final_field_type)?;
-                
-                match scope {
-                    AuthorizationScope::None => {
-                        return Err(anyhow::anyhow!("Client not authorized for request: {}", request));
-                    }
-                    AuthorizationScope::ReadOnly => {
-                        if let Request::Write { .. } = request {
-                            return Err(anyhow::anyhow!("Client not authorized for write request: {}", request));
-                        } else if let Request::Create { .. } = request {
-                            return Err(anyhow::anyhow!("Client not authorized for create request: {}", request));
-                        } else if let Request::Delete { .. } = request {
-                            return Err(anyhow::anyhow!("Client not authorized for delete request: {}", request));
-                        } else if let Request::SchemaUpdate { .. } = request {
-                            return Err(anyhow::anyhow!("Client not authorized for schema update request: {}", request));
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            self.authorize_request(client_id, request)?;
         }
-        
+
         Ok(requests)
+    }
+
+    fn authorize_request(&mut self, client_id: EntityId, request: &Request) -> Result<()> {
+        match request {
+            Request::Read { entity_id, field_types, .. } => {
+                if let Some(scope) =
+                    self.evaluate_authorization_scope(client_id, *entity_id, field_types)?
+                {
+                    if matches!(scope, AuthorizationScope::None) {
+                        return Err(anyhow::anyhow!(
+                            "Client not authorized for request: {}",
+                            request
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Request::Write { entity_id, field_types, .. } => {
+                if let Some(scope) =
+                    self.evaluate_authorization_scope(client_id, *entity_id, field_types)?
+                {
+                    match scope {
+                        AuthorizationScope::None => {
+                            return Err(anyhow::anyhow!(
+                                "Client not authorized for request: {}",
+                                request
+                            ));
+                        }
+                        AuthorizationScope::ReadOnly => {
+                            return Err(anyhow::anyhow!(
+                                "Client not authorized for request type requiring write access: {}",
+                                request
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn authorize_request_ref(
+        &mut self,
+        client_id: EntityId,
+        request_ref: &QrespRequestRef<'_>,
+    ) -> Result<()> {
+        match request_ref.request_type() {
+            QrespRequestType::Read => {
+                let entity_id = request_ref
+                    .entity_id()?
+                    .ok_or_else(|| anyhow::anyhow!("Read request missing entity_id"))?;
+                let field_types = request_ref
+                    .field_types()?
+                    .ok_or_else(|| anyhow::anyhow!("Read request missing fields"))?;
+
+                if let Some(scope) =
+                    self.evaluate_authorization_scope(client_id, entity_id, &field_types)?
+                {
+                    if matches!(scope, AuthorizationScope::None) {
+                        return Err(anyhow::anyhow!(
+                            "Client not authorized for {:?} request targeting entity {:?}",
+                            request_ref.request_type(),
+                            entity_id
+                        ));
+                    }
+                }
+
+                Ok(())
+            }
+            QrespRequestType::Write => {
+                let entity_id = request_ref
+                    .entity_id()?
+                    .ok_or_else(|| anyhow::anyhow!("Write request missing entity_id"))?;
+                let field_types = request_ref
+                    .field_types()?
+                    .ok_or_else(|| anyhow::anyhow!("Write request missing fields"))?;
+
+                if let Some(scope) =
+                    self.evaluate_authorization_scope(client_id, entity_id, &field_types)?
+                {
+                    match scope {
+                        AuthorizationScope::None => {
+                            return Err(anyhow::anyhow!(
+                                "Client not authorized for {:?} request targeting entity {:?}",
+                                request_ref.request_type(),
+                                entity_id
+                            ));
+                        }
+                        AuthorizationScope::ReadOnly => {
+                            return Err(anyhow::anyhow!(
+                                "Client not authorized for write operation targeting entity {:?}",
+                                entity_id
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn evaluate_authorization_scope(
+        &mut self,
+        client_id: EntityId,
+        entity_id: EntityId,
+        field_types: &IndirectFieldType,
+    ) -> Result<Option<AuthorizationScope>> {
+        let cache = match &self.permission_cache {
+            Some(cache) => cache,
+            None => {
+                debug!("No permission cache available, skipping authorization check");
+                return Ok(None);
+            }
+        };
+
+        let (final_entity_id, final_field_type) =
+            self.store.resolve_indirection(entity_id, field_types)?;
+
+        let scope = get_scope(
+            &self.store,
+            &mut self.cel_executor,
+            cache,
+            client_id,
+            final_entity_id,
+            final_field_type,
+        )?;
+
+        Ok(Some(scope))
     }
     
     /// Accept new incoming connections
@@ -573,7 +666,6 @@ impl CoreService {
     /// Handle reading data from a connection
     fn handle_connection_read(&mut self, token: Token) -> Result<()> {
         let mut buffer = [0u8; 8192];
-        let mut messages_to_process = Vec::new();
         
         // First, read data and decode messages
         {
@@ -588,15 +680,6 @@ impl CoreService {
                     }
                     Ok(n) => {
                         connection.message_buffer.add_data(&buffer[0..n]);
-                        
-                        // Try to decode messages using the optimized zero-copy path when possible
-                        while let Some(message) = connection
-                            .message_buffer
-                            .try_decode_message()
-                            .map_err(|e| anyhow::anyhow!("QRESP decode failed: {}", e))?
-                        {
-                            messages_to_process.push(message);
-                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // No more data available right now
@@ -608,10 +691,35 @@ impl CoreService {
                 }
             }
         }
-        
-        // Now process all decoded messages
-        for message in messages_to_process {
-            self.handle_protocol_message(token, message)?;
+
+        loop {
+            let consumed = {
+                let connection = self
+                    .connections
+                    .get_mut(&token)
+                    .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+
+                match connection
+                    .message_buffer
+                    .try_decode_frame_ref()
+                    .map_err(|e| anyhow::anyhow!("QRESP decode failed: {}", e))?
+                {
+                    Some((_, consumed)) => consumed,
+                    None => break,
+                }
+            };
+
+            let chunk = {
+                let connection = self
+                    .connections
+                    .get_mut(&token)
+                    .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+                connection.message_buffer.take_chunk(consumed)
+            };
+
+            if let Err(err) = self.process_frame_chunk(token, chunk) {
+                return Err(err);
+            }
         }
         
         Ok(())
@@ -976,6 +1084,60 @@ impl CoreService {
             },
         }
     }
+
+    fn handle_protocol_frame<'a>(&mut self, token: Token, frame_ref: QrespFrameRef<'a>) -> Result<()> {
+        if let Some((perform_id, requests_frame)) =
+            self.extract_perform_parts(&frame_ref)?
+        {
+            return self.handle_store_perform_frame(token, perform_id, requests_frame);
+        }
+
+        let message = decode_message(frame_ref.to_owned())
+            .map_err(|e| anyhow::anyhow!("QRESP decode failed: {}", e))?;
+        self.handle_protocol_message(token, message)
+    }
+
+    fn process_frame_chunk(&mut self, token: Token, chunk: BytesMut) -> Result<()> {
+        let data = chunk.as_ref();
+        let (frame_ref, consumed) = QrespCodec::decode_ref(data)
+            .map_err(|e| anyhow::anyhow!("QRESP decode failed: {}", e))?
+            .ok_or_else(|| anyhow::anyhow!("Incomplete QRESP frame"))?;
+        debug_assert_eq!(consumed, data.len());
+        let result = self.handle_protocol_frame(token, frame_ref);
+        drop(chunk);
+        result
+    }
+
+    fn extract_perform_parts<'a>(
+        &self,
+        frame_ref: &'a QrespFrameRef<'a>,
+    ) -> Result<Option<(u64, &'a QrespFrameRef<'a>)>> {
+        let items = match frame_ref {
+            QrespFrameRef::Array(items) if !items.is_empty() => items,
+            _ => return Ok(None),
+        };
+
+        if !Self::matches_string_ref(&items[0], "PERFORM") {
+            return Ok(None);
+        }
+
+        if items.len() < 3 {
+            return Err(anyhow::anyhow!("PERFORM message missing parameters"));
+        }
+
+        let id = qlib_rs::qresp::store::extract_u64_ref(&items[1])
+            .map_err(|e| anyhow::anyhow!("Invalid perform id: {}", e))?;
+
+        Ok(Some((id, &items[2])))
+    }
+
+    fn matches_string_ref(frame: &QrespFrameRef<'_>, expected: &str) -> bool {
+        match frame {
+            QrespFrameRef::Bulk(bytes) => *bytes == expected.as_bytes(),
+            QrespFrameRef::Simple(text) => *text == expected,
+            _ => false,
+        }
+    }
     
     /// Handle a store message from a client
     fn handle_store_message(&mut self, token: Token, message: StoreMessage) -> Result<()> {
@@ -1000,6 +1162,71 @@ impl CoreService {
             }
         };
         
+        self.send_response(token, response)?;
+        Ok(())
+    }
+
+    fn handle_store_perform_frame<'a>(
+        &mut self,
+        token: Token,
+        id: u64,
+        requests_frame: &'a QrespFrameRef<'a>,
+    ) -> Result<()> {
+        let (authenticated, client_id_opt) = self
+            .connections
+            .get(&token)
+            .map(|connection| (connection.authenticated, connection.client_id.clone()))
+            .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+
+        if !authenticated {
+            let response = StoreMessage::Error {
+                id,
+                error: "Authentication required".to_string(),
+            };
+            self.send_response(token, response)?;
+            return Ok(());
+        }
+
+        let client_id = match client_id_opt {
+            Some(id) => id,
+            None => {
+                let response = StoreMessage::PerformResponse {
+                    id,
+                    response: Err("Client ID not found".to_string()),
+                };
+                self.send_response(token, response)?;
+                return Ok(());
+            }
+        };
+
+        let requests_ref = qlib_rs::data::QrespRequestsRef::new(requests_frame)
+            .map_err(|e| anyhow::anyhow!("Invalid perform request payload: {}", e))?;
+
+        for request_ref in requests_ref.iter() {
+            let request_ref = request_ref
+                .map_err(|e| anyhow::anyhow!("Invalid request entry: {}", e))?;
+
+            if let Err(auth_err) = self.authorize_request_ref(client_id, &request_ref) {
+                let response = StoreMessage::PerformResponse {
+                    id,
+                    response: Err(format!("Authorization failed: {}", auth_err)),
+                };
+                self.send_response(token, response)?;
+                return Ok(());
+            }
+        }
+
+        let response = match self.store.perform_mut_ref(requests_ref) {
+            Ok(results) => StoreMessage::PerformResponse {
+                id,
+                response: Ok(results),
+            },
+            Err(e) => StoreMessage::PerformResponse {
+                id,
+                response: Err(format!("{:?}", e)),
+            },
+        };
+
         self.send_response(token, response)?;
         Ok(())
     }

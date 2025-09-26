@@ -1046,6 +1046,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
+ "bytes",
  "cel",
  "chrono",
  "clap",
