@@ -283,12 +283,18 @@ async fn run_client_benchmark(
     let mut result = TestResult::new(test.name().to_string());
     let mut handles = Vec::new();
     
+    // Calculate effective tasks needed based on pipelining
+    // For request-based operations that support pipelining, each task will handle pipeline_size requests
+    let supports_pipelining = matches!(test, BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField);
+    let effective_pipeline_size = if supports_pipelining && config.pipeline > 1 { config.pipeline as u64 } else { 1 };
+    let tasks_needed = (requests_count + effective_pipeline_size - 1) / effective_pipeline_size; // Ceiling division
+    
     // Spawn concurrent tasks, using concurrency parameter for batching
-    let mut requests_spawned = 0u64;
+    let mut tasks_spawned = 0u64;
     let batch_size = config.concurrency;
     
-    while requests_spawned < requests_count {
-        let current_batch_size = std::cmp::min(batch_size, (requests_count - requests_spawned) as usize);
+    while tasks_spawned < tasks_needed {
+        let current_batch_size = std::cmp::min(batch_size, (tasks_needed - tasks_spawned) as usize);
         
         // Spawn tasks for current batch
         for i in 0..current_batch_size {
@@ -296,16 +302,16 @@ async fn run_client_benchmark(
             let context_clone = Arc::clone(&context);
             let test_clone = test.clone();
             let config_clone = Arc::clone(&config);
-            let request_num = requests_spawned + i as u64;
+            let task_num = tasks_spawned + i as u64;
             
             let handle = task::spawn(async move {
-                execute_request_with_pipeline(store_clone, context_clone, test_clone, config_clone, client_id, request_num).await
+                execute_request_with_pipeline(store_clone, context_clone, test_clone, config_clone, client_id, task_num).await
             });
             
             handles.push(handle);
         }
         
-        requests_spawned += current_batch_size as u64;
+        tasks_spawned += current_batch_size as u64;
         
         // Process the batch
         let batch_results = future::join_all(handles.drain(..)).await;
@@ -346,7 +352,7 @@ async fn execute_request_with_pipeline(
     test: BenchmarkTest,
     config: Arc<Config>,
     client_id: usize,
-    request_num: u64,
+    task_num: u64,
 ) -> RequestBatchResult {
     let start_time = Instant::now();
     
@@ -358,8 +364,8 @@ async fn execute_request_with_pipeline(
         let mut requests = Vec::new();
         
         for i in 0..config.pipeline {
-            let req_num = request_num * config.pipeline as u64 + i as u64;
-            if let Ok(Some(request)) = prepare_request(&store, &context, &test, client_id, req_num).await {
+            let request_num = task_num * config.pipeline as u64 + i as u64;
+            if let Ok(Some(request)) = prepare_request(&store, &context, &test, client_id, request_num).await {
                 requests.push(request);
             }
         }
@@ -386,7 +392,7 @@ async fn execute_request_with_pipeline(
         }
     } else {
         // Execute single request (either non-pipelined or non-request-based operation)
-        match execute_single_request(store, context, test, client_id, request_num).await {
+        match execute_single_request(store, context, test, client_id, task_num).await {
             Ok(duration) => RequestBatchResult {
                 requests_in_batch: 1,
                 result: Ok(duration),
