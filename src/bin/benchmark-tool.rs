@@ -228,16 +228,62 @@ async fn run_benchmark_test(
     test: BenchmarkTest,
     requests_per_client: u64,
 ) -> Result<TestResult> {
+    // Pre-authenticate all clients before starting benchmark
+    if !config.quiet && !config.csv {
+        info!("Pre-authenticating {} clients...", config.clients);
+    }
+    
+    let mut auth_handles = Vec::new();
+    let url = format!("{}:{}", config.host, config.port);
+    
+    // Spawn authentication tasks for all clients
+    for client_id in 0..config.clients {
+        let url_clone = url.clone();
+        let username = config.username.clone();
+        let password = config.password.clone();
+        
+        let handle = task::spawn(async move {
+            AsyncStoreProxy::connect_and_authenticate(&url_clone, &username, &password)
+                .await
+                .with_context(|| format!("Client {} failed to authenticate", client_id))
+                .map(|store| (client_id, Arc::new(store)))
+        });
+        auth_handles.push(handle);
+    }
+    
+    // Wait for all authentications to complete
+    let mut authenticated_stores = Vec::new();
+    for handle in auth_handles {
+        match handle.await {
+            Ok(Ok((client_id, store))) => {
+                authenticated_stores.push((client_id, store));
+            }
+            Ok(Err(e)) => {
+                error!("Authentication failed: {}", e);
+                return Err(e);
+            }
+            Err(e) => {
+                error!("Authentication task panicked: {}", e);
+                return Err(anyhow::anyhow!("Authentication task panicked: {}", e));
+            }
+        }
+    }
+    
+    if !config.quiet && !config.csv {
+        info!("All clients authenticated. Starting benchmark...");
+    }
+    
+    // Now start the actual benchmark timing
     let start_time = Instant::now();
     let mut handles = Vec::new();
     
-    for client_id in 0..config.clients {
+    for (client_id, store) in authenticated_stores {
         let config_clone = config.clone();
         let context_clone = context.clone();
         let test_clone = test.clone();
         
         let handle = task::spawn(async move {
-            run_client_benchmark(config_clone, context_clone, test_clone, client_id, requests_per_client).await
+            run_client_benchmark_with_store(config_clone, context_clone, test_clone, client_id, requests_per_client, store).await
         });
         handles.push(handle);
     }
@@ -267,20 +313,14 @@ async fn run_benchmark_test(
     Ok(total_result)
 }
 
-async fn run_client_benchmark(
+async fn run_client_benchmark_with_store(
     config: Arc<Config>,
     context: Arc<BenchmarkContext>,
     test: BenchmarkTest,
     client_id: usize,
     requests_count: u64,
+    store: Arc<AsyncStoreProxy>,
 ) -> Result<TestResult> {
-    let url = format!("{}:{}", config.host, config.port);
-    let store = Arc::new(AsyncStoreProxy::connect_and_authenticate(
-        &url,
-        &config.username,
-        &config.password,
-    ).await.with_context(|| format!("Client {} failed to connect", client_id))?);
-
     let mut result = TestResult::new(test.name().to_string());
     let mut handles = Vec::new();
     
@@ -571,27 +611,27 @@ fn print_results(config: &Config, results: &[TestResult]) {
 fn print_csv_results(results: &[TestResult]) {
     println!("\"test\",\"rps\",\"avg_latency_ms\",\"p50_ms\",\"p95_ms\",\"p99_ms\"");
     for result in results {
-        let avg_latency = if !result.latencies.is_empty() {
-            result.latencies.iter().sum::<Duration>().as_millis() / result.latencies.len() as u128
+        let avg_latency_ms = if !result.latencies.is_empty() {
+            result.latencies.iter().map(|d| d.as_nanos() as f64 / 1_000_000.0).sum::<f64>() / result.latencies.len() as f64
         } else {
-            0
+            0.0
         };
         
         println!(
-            "\"{}\",{:.2},{},{},{},{}",
+            "\"{}\",{:.2},{:.3},{:.3},{:.3},{:.3}",
             result.test_name,
             result.requests_per_second(),
-            avg_latency,
-            result.percentile(50).as_millis(),
-            result.percentile(95).as_millis(),
-            result.percentile(99).as_millis()
+            avg_latency_ms,
+            result.percentile(50).as_nanos() as f64 / 1_000_000.0,
+            result.percentile(95).as_nanos() as f64 / 1_000_000.0,
+            result.percentile(99).as_nanos() as f64 / 1_000_000.0
         );
     }
 }
 
 fn print_quiet_results(config: &Config, results: &[TestResult]) {
     for result in results {
-        let p50_ms = result.percentile(50).as_millis() as f64;
+        let p50_ms = result.percentile(50).as_nanos() as f64 / 1_000_000.0;
         let p50_formatted = format!("{:.precision$}", p50_ms, precision = config.precision);
         println!(
             "{}: {:.2} requests per second, p50={} msec",
@@ -622,8 +662,8 @@ fn print_detailed_results(config: &Config, results: &[TestResult]) {
             // Print latency distribution
             let percentiles = [50, 90, 95, 99, 100];
             for &p in &percentiles {
-                let latency_ms = result.percentile(p).as_millis();
-                println!("{:.2}% <= {} milliseconds", 
+                let latency_ms = result.percentile(p).as_nanos() as f64 / 1_000_000.0;
+                println!("{:.2}% <= {:.3} milliseconds", 
                          if p == 100 { 100.0 } else { p as f64 }, 
                          latency_ms);
             }
