@@ -12,9 +12,7 @@ use anyhow::Result;
 use std::thread;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
-    AuthenticationResult, Store, Cache, CelExecutor,
-    Request, Snapshot, AuthConfig,
-    auth::{authenticate_subject, get_scope, AuthorizationScope}
+    Store, Request, Snapshot
 };
 use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer, PeerMessage};
 
@@ -133,8 +131,6 @@ impl PeerInfo {
 struct Connection {
     stream: MioTcpStream,
     addr_string: String,
-    authenticated: bool,
-    client_id: Option<EntityId>,
     notification_queue: NotificationQueue,
     notification_configs: HashSet<NotifyConfig>,
     outbound_messages: VecDeque<Vec<u8>>,
@@ -159,8 +155,6 @@ pub struct CoreService {
     
     // Cached candidate entity ID for this machine
     candidate_entity_id: Option<EntityId>,
-    permission_cache: Option<Cache>,
-    cel_executor: CelExecutor,
     
     // Handles to other services  
     snapshot_handle: Option<SnapshotHandle>,
@@ -170,36 +164,6 @@ pub struct CoreService {
 const LISTENER_TOKEN: Token = Token(0);
 
 impl CoreService {
-    /// Attempt to create a permission cache with the current store state
-    fn create_permission_cache(&mut self) -> Option<Cache> {
-        // Get values needed for cache creation from store.et and store.ft
-        // These are only available after a snapshot has been restored
-        let et = self.store.et.as_ref()?;
-        let ft = self.store.ft.as_ref()?;
-        
-        let permission_entity_type = et.permission?;
-        let resource_type_field = ft.resource_type?;
-        let resource_field_field = ft.resource_field?;
-        let scope_field = ft.scope?;
-        let condition_field = ft.condition?;
-        
-        match Cache::new(
-            &mut self.store,
-            permission_entity_type,
-            vec![resource_type_field, resource_field_field],
-            vec![scope_field, condition_field]
-        ) {
-            Ok((cache, _notification_queue)) => {
-                debug!("Successfully created permission cache");
-                Some(cache)
-            }
-            Err(e) => {
-                debug!("Failed to create permission cache: {}", e);
-                None
-            }
-        }
-    }
-
     /// Create a new core service with peer configuration
     pub fn new(
         config: CoreConfig,
@@ -213,7 +177,6 @@ impl CoreService {
         info!(bind_address = %addr, "Core service unified TCP server initialized");
         
         let store = Store::new();
-        let cel_executor = CelExecutor::new();
         
         // Capture start time as Unix timestamp
         let start_time = SystemTime::now()
@@ -234,14 +197,9 @@ impl CoreService {
             is_leader: true, // Start as leader until we learn about older peers
             store,
             candidate_entity_id: None,
-            permission_cache: None,
-            cel_executor,
             snapshot_handle: None,
             wal_handle: None,
         };
-        
-        // Attempt to create permission cache
-        service.permission_cache = service.create_permission_cache();
 
         // Create initial peer entries without entity IDs (will be resolved after snapshot restore)
         for (machine_id, _address) in &service.config.peers {
@@ -420,62 +378,6 @@ impl CoreService {
         }
     }
     
-    
-    /// Check authorization for a list of requests and return only authorized ones
-    fn check_requests_authorization(
-        &mut self,
-        client_id: EntityId,
-        requests: Requests,
-    ) -> Result<Requests> {
-        for request in requests.read().iter() {
-            // Extract entity_id and field_type from the request
-            let authorization_needed = match &request {
-                Request::Read { entity_id, field_types, .. } => Some((entity_id, field_types)),
-                Request::Write { entity_id, field_types, .. } => Some((entity_id, field_types)),
-                Request::Create { .. } => None, // No field-level authorization for creation
-                Request::Delete { .. } => None, // No field-level authorization for deletion
-                Request::SchemaUpdate { .. } => None, // No field-level authorization for schema updates
-                _ => None, // For other request types, skip authorization check
-            };
-            
-            if let Some((entity_id, field_types)) = authorization_needed {
-                // If we don't have a permission cache, skip authorization
-                let cache = match &self.permission_cache {
-                    Some(cache) => cache,
-                    None => {
-                        debug!("No permission cache available, skipping authorization check");
-                        continue;
-                    }
-                };
-                
-                // For authorization, we check against the final field in the indirection chain
-                let (final_entity_id, final_field_type) = self.store.resolve_indirection(*entity_id, field_types)?;
-                
-                let scope = get_scope(&self.store, &mut self.cel_executor, cache, client_id, final_entity_id, final_field_type)?;
-                
-                match scope {
-                    AuthorizationScope::None => {
-                        return Err(anyhow::anyhow!("Client not authorized for request: {}", request));
-                    }
-                    AuthorizationScope::ReadOnly => {
-                        if let Request::Write { .. } = request {
-                            return Err(anyhow::anyhow!("Client not authorized for write request: {}", request));
-                        } else if let Request::Create { .. } = request {
-                            return Err(anyhow::anyhow!("Client not authorized for create request: {}", request));
-                        } else if let Request::Delete { .. } = request {
-                            return Err(anyhow::anyhow!("Client not authorized for delete request: {}", request));
-                        } else if let Request::SchemaUpdate { .. } = request {
-                            return Err(anyhow::anyhow!("Client not authorized for schema update request: {}", request));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        
-        Ok(requests)
-    }
-    
     /// Accept new incoming connections
     fn accept_new_connections(&mut self) {
         loop {
@@ -505,8 +407,6 @@ impl CoreService {
                     let connection = Connection {
                         stream,
                         addr_string: addr.to_string(),
-                        authenticated: false,
-                        client_id: None,
                         notification_queue: NotificationQueue::new(),
                         notification_configs: HashSet::new(),
                         outbound_messages: VecDeque::new(),
@@ -987,103 +887,18 @@ impl CoreService {
     
     /// Handle a store message from a client
     fn handle_store_message(&mut self, token: Token, message: StoreMessage) -> Result<()> {
-        let response = match &message {
-            StoreMessage::Authenticate { id, subject_name, credential } => {
-                self.handle_authentication(token, *id, subject_name.clone(), credential.clone())?
-            }
-            _ => {
-                // All other messages require authentication
-                let is_authenticated = self.connections.get(&token)
-                    .map(|conn| conn.authenticated)
-                    .unwrap_or(false);
-                    
-                if !is_authenticated {
-                    StoreMessage::Error {
-                        id: self.extract_message_id(&message).unwrap_or(0),
-                        error: "Authentication required".to_string(),
-                    }
-                } else {
-                    self.handle_authenticated_message(token, message)?
-                }
-            }
-        };
-        
-        self.send_response(token, response)?;
-        Ok(())
-    }
-    
-    /// Handle authentication message
-    fn handle_authentication(&mut self, token: Token, id: u64, subject_name: String, credential: String) -> Result<StoreMessage> {
-        let auth_config = AuthConfig::default();
-        
-        match authenticate_subject(&mut self.store, &subject_name, &credential, &auth_config) {
-            Ok(subject_id) => {
-                // Mark connection as authenticated
-                if let Some(connection) = self.connections.get_mut(&token) {
-                    connection.authenticated = true;
-                    connection.client_id = Some(subject_id.clone());
-                    info!("Client {} authenticated as {:?}", connection.addr_string, subject_id);
-                }
-                
-                // Check if this authenticated client is a peer and update the peers map
-                for (machine_id, peer_info) in self.peers.iter_mut() {
-                    if let Some(peer_entity_id) = peer_info.entity_id {
-                        if peer_entity_id == subject_id {
-                            info!("Authenticated client is known peer {}, updating token", machine_id);
-                            peer_info.token = Some(token);
-                            debug!("Updated peer {} with token {:?}", machine_id, token);
-                            break;
-                        }
-                    }
-                }
-                
-                let auth_result = AuthenticationResult {
-                    subject_id: subject_id.clone(),
-                };
-                
-                Ok(StoreMessage::AuthenticateResponse {
-                    id,
-                    response: Ok(auth_result),
-                })
-            }
-            Err(e) => {
-                warn!("Authentication failed for {}: {}", subject_name, e);
-                Ok(StoreMessage::AuthenticateResponse {
-                    id,
-                    response: Err(format!("Authentication failed: {}", e)),
-                })
-            }
-        }
-    }
-    
-    /// Handle messages from authenticated clients
-    fn handle_authenticated_message(&mut self, token: Token, message: StoreMessage) -> Result<StoreMessage> {
-        let connection = self.connections.get(&token)
-            .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
-        
-        let client_id = connection.client_id.clone()
-            .ok_or_else(|| anyhow::anyhow!("Client ID not found"))?;
-        
-        match message {
+        let response = match message {
             StoreMessage::Perform { id, requests } => {
-                match self.check_requests_authorization(client_id, requests) {
-                    Ok(authorized_requests) => {
-                        debug!("Performing {} authorized requests for client {:?}", authorized_requests.len(), client_id);
-                        match self.store.perform_mut(authorized_requests) {
-                            Ok(results) => Ok(StoreMessage::PerformResponse {
-                                id,
-                                response: Ok(results),
-                            }),
-                            Err(e) => Ok(StoreMessage::PerformResponse {
-                                id,
-                                response: Err(format!("{:?}", e)),
-                            }),
-                        }
-                    }
-                    Err(e) => Ok(StoreMessage::PerformResponse {
+                debug!("Performing {} requests", requests.len());
+                match self.store.perform_mut(requests) {
+                    Ok(results) => StoreMessage::PerformResponse {
                         id,
-                        response: Err(format!("Authorization failed: {}", e)),
-                    }),
+                        response: Ok(results),
+                    },
+                    Err(e) => StoreMessage::PerformResponse {
+                        id,
+                        response: Err(format!("{:?}", e)),
+                    },
                 }
             }
             
@@ -1092,20 +907,20 @@ impl CoreService {
                     connection.notification_configs.insert(config.clone());
                     
                     match self.store.register_notification(config.clone(), connection.notification_queue.clone()) {
-                        Ok(_) => Ok(StoreMessage::RegisterNotificationResponse {
+                        Ok(_) => StoreMessage::RegisterNotificationResponse {
                             id,
                             response: Ok(()),
-                        }),
-                        Err(e) => Ok(StoreMessage::RegisterNotificationResponse {
+                        },
+                        Err(e) => StoreMessage::RegisterNotificationResponse {
                             id,
                             response: Err(format!("{:?}", e)),
-                        }),
+                        },
                     }
                 } else {
-                    Ok(StoreMessage::RegisterNotificationResponse {
+                    StoreMessage::RegisterNotificationResponse {
                         id,
                         response: Err("Connection not found".to_string()),
-                    })
+                    }
                 }
             }
             
@@ -1114,25 +929,36 @@ impl CoreService {
                     connection.notification_configs.remove(&config);
                     
                     let removed = self.store.unregister_notification(&config, &connection.notification_queue);
-                    Ok(StoreMessage::UnregisterNotificationResponse {
+                    StoreMessage::UnregisterNotificationResponse {
                         id,
                         response: removed,
-                    })
+                    }
                 } else {
-                    Ok(StoreMessage::UnregisterNotificationResponse {
+                    StoreMessage::UnregisterNotificationResponse {
                         id,
                         response: false,
-                    })
+                    }
+                }
+            }
+            
+            // Legacy authentication messages - return error for compatibility
+            StoreMessage::Authenticate { id, .. } => {
+                StoreMessage::Error {
+                    id,
+                    error: "Authentication is no longer required".to_string(),
                 }
             }
             
             _ => {
-                Ok(StoreMessage::Error {
+                StoreMessage::Error {
                     id: self.extract_message_id(&message).unwrap_or(0),
                     error: "Unsupported message type".to_string(),
-                })
+                }
             }
-        }
+        };
+        
+        self.send_response(token, response)?;
+        Ok(())
     }
     
     /// Send a protocol message to a connection
@@ -1183,21 +1009,19 @@ impl CoreService {
             }
             
             // If this is a peer connection, clear the token from peers mapping and start times
-            if connection.authenticated && connection.client_id.is_some() {
-                for (machine_id, peer_info) in self.peers.iter_mut() {
-                    if let Some(peer_token) = peer_info.token {
-                        if peer_token == token {
-                            info!("Clearing token for disconnected peer {}", machine_id);
-                            peer_info.token = None;
-                            
-                            // Remove the peer's start time
-                            peer_info.start_time = None;
-                            
-                            // Re-evaluate sync needs and leadership with remaining peers
-                            self.evaluate_sync_needs();
-                            
-                            break;
-                        }
+            for (machine_id, peer_info) in self.peers.iter_mut() {
+                if let Some(peer_token) = peer_info.token {
+                    if peer_token == token {
+                        info!("Clearing token for disconnected peer {}", machine_id);
+                        peer_info.token = None;
+                        
+                        // Remove the peer's start time
+                        peer_info.start_time = None;
+                        
+                        // Re-evaluate sync needs and leadership with remaining peers
+                        self.evaluate_sync_needs();
+                        
+                        break;
                     }
                 }
             }
@@ -1276,8 +1100,6 @@ impl CoreService {
                 let connection = Connection {
                     stream,
                     addr_string: addr,
-                    authenticated: true, // Peers are automatically authenticated
-                    client_id,
                     notification_queue: NotificationQueue::new(),
                     notification_configs: HashSet::new(),
                     outbound_messages: VecDeque::new(),
