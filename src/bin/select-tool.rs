@@ -15,14 +15,6 @@ struct Config {
     #[arg(long, default_value = "localhost:9100")]
     core_url: String,
 
-    /// Username for authentication (can be set via QCORE_USERNAME env var)
-    #[arg(long, default_value = "qselect")]
-    username: String,
-
-    /// Password for authentication (can be set via QCORE_PASSWORD env var)
-    #[arg(long, default_value = "qselect")]
-    password: String,
-
     /// Entity type to search for (e.g., "User", "Project")
     #[arg(long, short)]
     entity_type: String,
@@ -299,18 +291,13 @@ fn main() -> Result<()> {
     );
 
     // Get credentials from environment if available
-    let username = std::env::var("QCORE_USERNAME").unwrap_or(config.username.clone());
-    let password = std::env::var("QCORE_PASSWORD").unwrap_or(config.password.clone());
-
     // Mark end of initialization
     metrics.initialization_time = total_start.elapsed();
 
     info!(core_url = %config.core_url, "Connecting to QCore service");
     
-    // Connect to the Core service with authentication
-    let connection_start = Instant::now();
-    let mut store = StoreProxy::connect_and_authenticate(&config.core_url, &username, &password)
-        .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
+    // TODO: Connect to the Core service (no authentication needed)
+    return Err(anyhow::anyhow!("Authentication removal: StoreProxy needs to be updated for unauthenticated connections"));
     metrics.connection_time = connection_start.elapsed();
 
     info!("Connected successfully");

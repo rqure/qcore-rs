@@ -20,14 +20,6 @@ struct Config {
     #[arg(short = 'p', long, default_value_t = 9100)]
     port: u16,
 
-    /// Username for authentication
-    #[arg(long, default_value = "qei")]
-    username: String,
-
-    /// Password for authentication  
-    #[arg(long, default_value = "qei")]
-    password: String,
-
     /// Number of parallel connections (default 50)
     #[arg(short = 'c', long, default_value_t = 50)]
     clients: usize,
@@ -187,13 +179,9 @@ impl BenchmarkContext {
     }
 
     async fn initialize(&mut self) -> Result<()> {
-        // Connect to load test data
-        let url = format!("{}:{}", self.config.host, self.config.port);
-        let store = AsyncStoreProxy::connect_and_authenticate(
-            &url,
-            &self.config.username,
-            &self.config.password,
-        ).await.context("Failed to connect for initialization")?;
+        // TODO: Connect to load test data (no authentication needed)
+        return Err(anyhow::anyhow!("Authentication removal: AsyncStoreProxy needs to be updated for unauthenticated connections"));
+    }
 
         // Load existing entities for read operations
         if let Ok(entity_type) = store.get_entity_type(&self.config.entity_type).await {
@@ -228,28 +216,9 @@ async fn run_benchmark_test(
     test: BenchmarkTest,
     requests_per_client: u64,
 ) -> Result<TestResult> {
-    // Pre-authenticate all clients before starting benchmark
-    if !config.quiet && !config.csv {
-        info!("Pre-authenticating {} clients...", config.clients);
-    }
-    
-    let mut auth_handles = Vec::new();
-    let url = format!("{}:{}", config.host, config.port);
-    
-    // Spawn authentication tasks for all clients
-    for client_id in 0..config.clients {
-        let url_clone = url.clone();
-        let username = config.username.clone();
-        let password = config.password.clone();
-        
-        let handle = task::spawn(async move {
-            AsyncStoreProxy::connect_and_authenticate(&url_clone, &username, &password)
-                .await
-                .with_context(|| format!("Client {} failed to authenticate", client_id))
-                .map(|store| (client_id, Arc::new(store)))
-        });
-        auth_handles.push(handle);
-    }
+    // TODO: Implement unauthenticated benchmark connections
+    return Err(anyhow::anyhow!("Authentication removal: AsyncStoreProxy needs to be updated for unauthenticated connections"));
+}
     
     // Wait for all authentications to complete
     let mut authenticated_stores = Vec::new();
