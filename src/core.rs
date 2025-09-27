@@ -12,9 +12,7 @@ use anyhow::Result;
 use std::thread;
 use qlib_rs::{
     StoreMessage, EntityId, NotificationQueue, NotifyConfig,
-    AuthenticationResult, Store, Cache, CelExecutor,
-    Request, Snapshot, AuthConfig,
-    auth::{authenticate_subject, get_scope, AuthorizationScope}
+    Store, Request, Snapshot
 };
 use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer, PeerMessage};
 

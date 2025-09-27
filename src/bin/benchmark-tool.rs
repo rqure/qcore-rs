@@ -20,14 +20,6 @@ struct Config {
     #[arg(short = 'p', long, default_value_t = 9100)]
     port: u16,
 
-    /// Username for authentication
-    #[arg(long, default_value = "qei")]
-    username: String,
-
-    /// Password for authentication  
-    #[arg(long, default_value = "qei")]
-    password: String,
-
     /// Number of parallel connections (default 50)
     #[arg(short = 'c', long, default_value_t = 50)]
     clients: usize,
@@ -189,10 +181,8 @@ impl BenchmarkContext {
     async fn initialize(&mut self) -> Result<()> {
         // Connect to load test data
         let url = format!("{}:{}", self.config.host, self.config.port);
-        let store = AsyncStoreProxy::connect_and_authenticate(
+        let store = AsyncStoreProxy::connect(
             &url,
-            &self.config.username,
-            &self.config.password,
         ).await.context("Failed to connect for initialization")?;
 
         // Load existing entities for read operations
@@ -243,9 +233,9 @@ async fn run_benchmark_test(
         let password = config.password.clone();
         
         let handle = task::spawn(async move {
-            AsyncStoreProxy::connect_and_authenticate(&url_clone, &username, &password)
+            AsyncStoreProxy::connect(&url_clone)
                 .await
-                .with_context(|| format!("Client {} failed to authenticate", client_id))
+                .with_context(|| format!("Client {} failed to connect", client_id))
                 .map(|store| (client_id, Arc::new(store)))
         });
         auth_handles.push(handle);
