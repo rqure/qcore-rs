@@ -1089,7 +1089,7 @@ impl CoreService {
                 }
 
                 let addr = stream.peer_addr().map(|addr| addr.to_string()).expect("Failed to get peer address");
-                let client_id = if let Some(peer_info) = self.peers.get_mut(&machine_id) {
+                let _client_id = if let Some(peer_info) = self.peers.get_mut(&machine_id) {
                     // Update the token in the peers mapping
                     peer_info.token = Some(token);
                     peer_info.entity_id
