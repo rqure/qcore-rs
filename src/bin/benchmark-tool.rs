@@ -20,13 +20,7 @@ struct Config {
     #[arg(short = 'p', long, default_value_t = 9100)]
     port: u16,
 
-    /// Username for authentication
-    #[arg(long, default_value = "qei")]
-    username: String,
 
-    /// Password for authentication  
-    #[arg(long, default_value = "qei")]
-    password: String,
 
     /// Number of parallel connections (default 50)
     #[arg(short = 'c', long, default_value_t = 50)]
@@ -189,10 +183,8 @@ impl BenchmarkContext {
     async fn initialize(&mut self) -> Result<()> {
         // Connect to load test data
         let url = format!("{}:{}", self.config.host, self.config.port);
-        let store = AsyncStoreProxy::connect_and_authenticate(
+        let store = AsyncStoreProxy::connect(
             &url,
-            &self.config.username,
-            &self.config.password,
         ).await.context("Failed to connect for initialization")?;
 
         // Load existing entities for read operations
@@ -228,32 +220,30 @@ async fn run_benchmark_test(
     test: BenchmarkTest,
     requests_per_client: u64,
 ) -> Result<TestResult> {
-    // Pre-authenticate all clients before starting benchmark
+    // Pre-connect all clients before starting benchmark
     if !config.quiet && !config.csv {
-        info!("Pre-authenticating {} clients...", config.clients);
+        info!("Pre-connecting {} clients...", config.clients);
     }
     
-    let mut auth_handles = Vec::new();
+    let mut connection_handles = Vec::new();
     let url = format!("{}:{}", config.host, config.port);
     
     // Spawn authentication tasks for all clients
     for client_id in 0..config.clients {
         let url_clone = url.clone();
-        let username = config.username.clone();
-        let password = config.password.clone();
         
         let handle = task::spawn(async move {
-            AsyncStoreProxy::connect_and_authenticate(&url_clone, &username, &password)
+            AsyncStoreProxy::connect(&url_clone)
                 .await
-                .with_context(|| format!("Client {} failed to authenticate", client_id))
+                .with_context(|| format!("Client {} failed to connect", client_id))
                 .map(|store| (client_id, Arc::new(store)))
         });
-        auth_handles.push(handle);
+        connection_handles.push(handle);
     }
     
-    // Wait for all authentications to complete
+    // Wait for all connections to complete
     let mut authenticated_stores = Vec::new();
-    for handle in auth_handles {
+    for handle in connection_handles {
         match handle.await {
             Ok(Ok((client_id, store))) => {
                 authenticated_stores.push((client_id, store));
@@ -270,7 +260,7 @@ async fn run_benchmark_test(
     }
     
     if !config.quiet && !config.csv {
-        info!("All clients authenticated. Starting benchmark...");
+        info!("All clients connected. Starting benchmark...");
     }
     
     // Now start the actual benchmark timing

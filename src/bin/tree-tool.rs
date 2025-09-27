@@ -11,13 +11,7 @@ struct Config {
     #[arg(long, default_value = "localhost:9100")]
     core_url: String,
 
-    /// Username for authentication (can be set via QCORE_USERNAME env var)
-    #[arg(long, default_value = "qtree")]
-    username: String,
 
-    /// Password for authentication (can be set via QCORE_PASSWORD env var)
-    #[arg(long, default_value = "qtree")]
-    password: String,
 
     /// Maximum depth to traverse (0 = unlimited)
     #[arg(long, default_value_t = 0)]
@@ -72,14 +66,10 @@ fn main() -> Result<()> {
         "Starting tree tool"
     );
 
-    // Get credentials from environment if available
-    let username = std::env::var("QCORE_USERNAME").unwrap_or(config.username.clone());
-    let password = std::env::var("QCORE_PASSWORD").unwrap_or(config.password.clone());
-
     info!(core_url = %config.core_url, "Connecting to QCore service");
     
-    // Connect to the Core service with authentication
-    let mut store = StoreProxy::connect_and_authenticate(&config.core_url, &username, &password)
+    // Connect to the Core service
+    let mut store = StoreProxy::connect(&config.core_url)
         .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
 
     info!("Connected successfully, building tree structure");
