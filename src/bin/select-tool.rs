@@ -296,8 +296,10 @@ fn main() -> Result<()> {
 
     info!(core_url = %config.core_url, "Connecting to QCore service");
     
-    // TODO: Connect to the Core service (no authentication needed)
-    return Err(anyhow::anyhow!("Authentication removal: StoreProxy needs to be updated for unauthenticated connections"));
+    // Connect to the Core service (no authentication needed)
+    let connection_start = Instant::now();
+    let mut store = StoreProxy::connect(&config.core_url)
+        .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
     metrics.connection_time = connection_start.elapsed();
 
     info!("Connected successfully");

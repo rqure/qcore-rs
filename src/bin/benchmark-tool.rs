@@ -179,9 +179,9 @@ impl BenchmarkContext {
     }
 
     async fn initialize(&mut self) -> Result<()> {
-        // TODO: Connect to load test data (no authentication needed)
-        return Err(anyhow::anyhow!("Authentication removal: AsyncStoreProxy needs to be updated for unauthenticated connections"));
-    }
+        // Connect to load test data (no authentication needed)
+        let url = format!("{}:{}", self.config.host, self.config.port);
+        let store = AsyncStoreProxy::connect(&url).await.context("Failed to connect for initialization")?;
 
         // Load existing entities for read operations
         if let Ok(entity_type) = store.get_entity_type(&self.config.entity_type).await {
@@ -216,8 +216,87 @@ async fn run_benchmark_test(
     test: BenchmarkTest,
     requests_per_client: u64,
 ) -> Result<TestResult> {
-    // TODO: Implement unauthenticated benchmark connections
-    return Err(anyhow::anyhow!("Authentication removal: AsyncStoreProxy needs to be updated for unauthenticated connections"));
+    // Pre-connect all clients before starting benchmark
+    if !config.quiet && !config.csv {
+        info!("Pre-connecting {} clients...", config.clients);
+    }
+    
+    let mut connection_handles = Vec::new();
+    let url = format!("{}:{}", config.host, config.port);
+    
+    // Spawn connection tasks for all clients
+    for client_id in 0..config.clients {
+        let url_clone = url.clone();
+        
+        let handle = task::spawn(async move {
+            AsyncStoreProxy::connect(&url_clone)
+                .await
+                .with_context(|| format!("Client {} failed to connect", client_id))
+                .map(|store| (client_id, Arc::new(store)))
+        });
+        connection_handles.push(handle);
+    }
+    
+    // Wait for all connections to complete
+    let mut connected_stores = Vec::new();
+    for handle in connection_handles {
+        match handle.await {
+            Ok(Ok((client_id, store))) => {
+                connected_stores.push((client_id, store));
+            }
+            Ok(Err(e)) => {
+                error!("Connection failed: {}", e);
+                return Err(e);
+            }
+            Err(e) => {
+                error!("Connection task panicked: {}", e);
+                return Err(anyhow::anyhow!("Connection task panicked: {}", e));
+            }
+        }
+    }
+    
+    if !config.quiet && !config.csv {
+        info!("All clients connected. Starting benchmark...");
+    }
+    
+    // Now start the actual benchmark timing
+    let start_time = Instant::now();
+    let mut handles = Vec::new();
+    
+    for (client_id, store) in connected_stores {
+        let config_clone = config.clone();
+        let context_clone = context.clone();
+        let test_clone = test.clone();
+        
+        let handle = task::spawn(async move {
+            run_client_benchmark_with_store(config_clone, context_clone, test_clone, client_id, requests_per_client, store).await
+        });
+        handles.push(handle);
+    }
+
+    let mut total_result = TestResult::new(test.name().to_string());
+    
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(client_result)) => {
+                total_result.total_requests += client_result.total_requests;
+                total_result.successful_requests += client_result.successful_requests;
+                total_result.failed_requests += client_result.failed_requests;
+                total_result.latencies.extend(client_result.latencies);
+            }
+            Ok(Err(e)) => {
+                error!("Client benchmark failed: {}", e);
+                total_result.failed_requests += requests_per_client;
+            }
+            Err(e) => {
+                error!("Client benchmark task panicked: {}", e);
+                total_result.failed_requests += requests_per_client;
+            }
+        }
+    }
+
+    total_result.total_time = start_time.elapsed();
+    Ok(total_result)
 }
     
     // Wait for all authentications to complete
