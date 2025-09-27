@@ -185,51 +185,9 @@ fn take_snapshot(
     Progress::step(1, 4, "Connecting to QCore service");
     let spinner = Progress::new_spinner("Establishing connection...");
     
-    // Connect to the Core service (no authentication needed)
+    // Connect to the Core service
     let mut store = StoreProxy::connect(core_url)
         .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
-
-    spinner.finish_with_message("Connected successfully");
-
-    Progress::step(2, 4, "Taking snapshot from QCore service");
-    let spinner = Progress::new_spinner("Retrieving schemas and entities...");
-
-    // Take the JSON snapshot using the library function
-    let snapshot = take_json_snapshot(&mut store)
-        .context("Failed to take snapshot")?;
-
-    let entity_count = count_entities_in_tree(&snapshot.tree);
-    spinner.finish_with_message(format!("Retrieved {} entities", entity_count));
-
-    Progress::step(3, 4, "Processing snapshot data");
-    let spinner = Progress::new_spinner("Serializing to JSON...");
-
-    // Serialize the snapshot to JSON
-    let json_data = if pretty {
-        serde_json::to_string_pretty(&snapshot)
-    } else {
-        serde_json::to_string(&snapshot)
-    }.context("Failed to serialize snapshot to JSON")?;
-
-    spinner.finish_with_message("JSON serialization complete");
-
-    Progress::step(4, 4, "Writing snapshot to file");
-    let spinner = Progress::new_spinner(format!("Writing to {}...", output_path.display()));
-
-    // Write to file
-    write(output_path, json_data)
-        .with_context(|| format!("Failed to write snapshot to {}", output_path.display()))?;
-
-    spinner.finish_with_message("Snapshot saved successfully");
-
-    Progress::success(&format!(
-        "Snapshot with {} entities saved to {}",
-        entity_count,
-        output_path.display()
-    ));
-    
-    Ok(())
-}
 
     spinner.finish_with_message("Connected successfully");
 
@@ -381,7 +339,7 @@ fn normal_restore_snapshot(
     Progress::step(2, 4, "Connecting to QCore service");
     let spinner = Progress::new_spinner("Establishing connection...");
     
-    // Connect to the Core service (no authentication needed)
+    // Connect to the Core service with authentication
     let mut store = StoreProxy::connect(core_url)
         .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
 
@@ -422,7 +380,7 @@ fn report_snapshot_diff(
     Progress::step(2, 4, "Connecting to QCore service");
     let spinner = Progress::new_spinner("Establishing connection...");
     
-    // Connect to the Core service (no authentication needed)
+    // Connect to the Core service with authentication
     let mut store = StoreProxy::connect(core_url)
         .with_context(|| format!("Failed to connect to Core service at {}", core_url))?;
 
