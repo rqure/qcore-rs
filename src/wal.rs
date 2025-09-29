@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossbeam::channel::Sender;
-use qlib_rs::Requests;
+use qlib_rs::WriteInfo;
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ pub struct WalConfig {
 /// WAL manager request types
 #[derive(Debug)]
 pub enum WalCommand {
-    AppendRequest { requests: qlib_rs::Requests },
+    LogWrite { write_info: WriteInfo },
     Replay,
     SetCoreHandle { handle: CoreHandle },
 }
@@ -34,10 +34,10 @@ pub enum WalCommand {
 /// Trait for WAL operations
 pub trait WalTrait {
     /// Write a request to WAL
-    fn append_requests(&mut self, requests: &qlib_rs::Requests) -> Result<()>;
+    fn log_write(&mut self, requests: &WriteInfo) -> Result<()>;
 
     /// Replay WAL files to restore store state
-    fn replay(&self) -> Result<Requests>;
+    fn replay(&self) -> Result<WriteInfo>;
 
     /// Initialize WAL counter from existing files
     fn initialize_counter(&mut self) -> Result<()>;
@@ -120,9 +120,9 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
-    pub fn append_requests(&self, requests: qlib_rs::Requests) {
+    pub fn log_write(&self, requests: WriteInfo) {
         self.sender
-            .send(WalCommand::AppendRequest { requests })
+            .send(WalCommand::LogWrite { write_info: requests })
             .unwrap();
     }
 
@@ -156,8 +156,8 @@ impl WalService {
 
             while let Ok(request) = receiver.recv() {
                 match request {
-                    WalCommand::AppendRequest { requests } => {
-                        match service.append_requests(&requests) {
+                    WalCommand::LogWrite { write_info: requests } => {
+                        match service.log_write(&requests) {
                             Ok(_) => debug!("Wrote request to WAL"),
                             Err(e) => error!(error = %e, "Failed to write request to WAL"),
                         }
@@ -222,7 +222,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
 
 impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     /// Write a request to WAL with file rotation and snapshot handling
-    fn append_requests(&mut self, requests: &qlib_rs::Requests) -> Result<()> {
+    fn log_write(&mut self, requests: &WriteInfo) -> Result<()> {
         for request in requests.read().iter() {
             if let qlib_rs::Request::Read { .. } = request {
                 continue;
