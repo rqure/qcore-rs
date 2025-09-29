@@ -550,34 +550,51 @@ impl CoreService {
                         break;
                     }
 
-                    let decode_result = {
-                        if let Some(connection) = self.connections.get(&token) {
-                            if let Ok((command, next_remaining)) = ReadCommand::decode(&remaining) {
-                                remaining = next_remaining;
+                    if let Some(connection) = self.connections.get(&token) {
+                        if let Ok((command, next_remaining)) = ReadCommand::decode(&remaining) {
+                            remaining = next_remaining;
 
-                                match self.store.read(
-                                    command.entity_id,
-                                    &command.field_path,
-                                ) {
-                                    Ok((value, timestamp, writer_id)) => {
-                                        let response = ReadResponse {
-                                            value,
-                                            timestamp,
-                                            writer_id,
-                                        };
-                                        self.send_resp_response(token, response.encode())
-                                    }
-                                    Err(e) => {
-                                        Err(anyhow::anyhow!("Read error: {}", e))
-                                    }
+                            match self.store.read(
+                                command.entity_id,
+                                &command.field_path,
+                            ) {
+                                Ok((value, timestamp, writer_id)) => {
+                                    let response = ReadResponse {
+                                        value,
+                                        timestamp,
+                                        writer_id,
+                                    };
+                                    self.send_resp_response(token, response.encode())?;
                                 }
-                            } else {
-                                Err(anyhow::anyhow!("Failed to decode command"))
+                                Err(e) => {
+                                    self.send_response(token, RespValue::Error(&format!("Read error: {}", e)))?;
+                                }
                             }
+                        } else if let Ok((command, next_remaining)) = WriteCommand::decode(&remaining) {
+                            remaining = next_remaining;
+
+                            match self.store.write(
+                                command.entity_id,
+                                &command.field_path,
+                                command.value,
+                                command.writer_id,
+                                command.write_time,
+                                command.push_condition,
+                                command.adjust_behavior,
+                            ) {
+                                Ok(_) => {
+                                    self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
+                                }
+                                Err(e) => {
+                                    self.send_response(token, RespValue::Error(&format!("Write error: {}", e)))?;
+                                }
+                            }                        
                         } else {
-                            return Err(anyhow::anyhow!("Connection not found"));
+                            break; // Incomplete command, wait for more data
                         }
-                    };
+                    } else {
+                        return Err(anyhow::anyhow!("Connection not found"));
+                    }
 
                     match decode_result {
                         Ok((resp_value, remaining)) => {
@@ -2116,14 +2133,6 @@ impl CoreService {
                                     Ok(())
                                 }
                             };
-
-                            if let Err(e) = resp_command_result {
-                                error!("Error handling RESP command: {}", e);
-                                let error_str = format!("Error: {}", e);
-                                let error_response = RespValue::Error(&error_str);
-                                self.send_resp_response(token, error_response)?;
-                            }
-                            total_consumed += consumed;
                         }
                         Err(_) => break, // Incomplete command
                     }
