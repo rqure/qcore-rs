@@ -535,27 +535,26 @@ impl CoreService {
 
             // Process any complete commands after reading new data
             if bytes_read > 0 {
-                let mut total_consumed = 0;
-
                 // Parse all complete commands from the buffer
                 loop {
                     // Check if we have data to process
-                    let has_data = {
+                    let mut remaining: &[u8] = {
                         if let Some(connection) = self.connections.get(&token) {
-                            total_consumed < connection.read_buffer.len()
+                            &connection.read_buffer
                         } else {
                             return Err(anyhow::anyhow!("Connection not found"));
                         }
                     };
 
-                    if !has_data {
+                    if remaining.is_empty() {
                         break;
                     }
 
-                    // Try to decode a command (this creates a copy of the needed data)
                     let decode_result = {
                         if let Some(connection) = self.connections.get(&token) {
-                            if let Ok((command, remaining)) = ReadCommand::decode(&connection.read_buffer[total_consumed..]) {
+                            if let Ok((command, next_remaining)) = ReadCommand::decode(&remaining) {
+                                remaining = next_remaining;
+
                                 match self.store.read(
                                     command.entity_id,
                                     &command.field_path,
