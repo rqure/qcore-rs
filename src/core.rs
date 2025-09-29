@@ -471,30 +471,474 @@ impl CoreService {
 
             // Process any complete commands after reading new data
             if bytes_read > 0 {
-                let mut commands = Vec::new();
                 let mut total_consumed = 0;
                 
                 // Parse all complete commands from the buffer
-                {
-                    let connection = self.connections.get(&token)
-                        .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
-                    
-                    let mut offset = 0;
-                    while offset < connection.read_buffer.len() {
-                        match RespValue::decode(&connection.read_buffer[offset..]) {
-                            Ok((resp_value, remaining)) => {
-                                let consumed = connection.read_buffer.len() - offset - remaining.len();
-                                if consumed == 0 {
-                                    break; // No progress, wait for more data
-                                }
-                                
-                                // Convert to owned to avoid lifetime issues
-                                commands.push(resp_value.to_owned());
-                                offset += consumed;
-                                total_consumed += consumed;
-                            }
-                            Err(_) => break, // Incomplete command
+                loop {
+                    // Check if we have data to process
+                    let has_data = {
+                        if let Some(connection) = self.connections.get(&token) {
+                            total_consumed < connection.read_buffer.len()
+                        } else {
+                            return Err(anyhow::anyhow!("Connection not found"));
                         }
+                    };
+                    
+                    if !has_data {
+                        break;
+                    }
+                    
+                    // Try to decode a command (this creates a copy of the needed data)
+                    let decode_result = {
+                        if let Some(connection) = self.connections.get(&token) {
+                            RespValue::decode(&connection.read_buffer[total_consumed..])
+                        } else {
+                            return Err(anyhow::anyhow!("Connection not found"));
+                        }
+                    };
+                    
+                    match decode_result {
+                        Ok((resp_value, remaining)) => {
+                            let buffer_len = {
+                                if let Some(connection) = self.connections.get(&token) {
+                                    connection.read_buffer.len()
+                                } else {
+                                    return Err(anyhow::anyhow!("Connection not found"));
+                                }
+                            };
+                            
+                            let consumed = buffer_len - total_consumed - remaining.len();
+                            if consumed == 0 {
+                                break; // No progress, wait for more data
+                            }
+
+                            // Now we can safely call methods that mutably borrow self
+                            // Inlined handle_resp_command logic
+                            let resp_command_result = {
+                                // Expect an array representing a command
+                                if let RespValue::Array(args) = resp_value {
+                                    if args.is_empty() {
+                                        Err(anyhow::anyhow!("Empty command"))
+                                    } else {
+                                        // First element should be the command name
+                                        let cmd_name = match &args[0] {
+                                            RespValue::BulkString(name) => std::str::from_utf8(name)?,
+                                            RespValue::SimpleString(name) => name,
+                                            _ => return Err(anyhow::anyhow!("Command name must be a string")),
+                                        };
+                                        
+                                        // Handle different commands
+                                        match cmd_name.to_uppercase().as_str() {
+                                            "READ" => {
+                                                // Decode the command using the ReadCommand struct
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = ReadCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode READ command: {}", e))?;
+
+                                                // Execute read
+                                                match self.store.read(command.entity_id, &command.field_path) {
+                                                    Ok((value, timestamp, writer_id)) => {
+                                                        let response_struct = ReadResponse {
+                                                            value,
+                                                            timestamp,
+                                                            writer_id,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Read error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "WRITE" => {
+                                                // Decode the command using the WriteCommand struct
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = WriteCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode WRITE command: {}", e))?;
+
+                                                // Execute write
+                                                match self.store.write(command.entity_id, &command.field_path, command.value, command.writer_id, command.write_time, command.push_condition, command.adjust_behavior) {
+                                                    Ok(_) => {
+                                                        self.send_resp_response(token, RespValue::SimpleString("OK"))
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Write error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "CREATE_ENTITY" => {
+                                                // Decode the command using the CreateEntityCommand struct
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = CreateEntityCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode CREATE_ENTITY command: {}", e))?;
+
+                                                // Execute create entity
+                                                match self.store.create_entity(command.entity_type, command.parent_id, &command.name) {
+                                                    Ok(entity_id) => {
+                                                        let response_struct = CreateEntityResponse {
+                                                            entity_id,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Create entity error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "DELETE_ENTITY" => {
+                                                // Decode the command using the DeleteEntityCommand struct
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = DeleteEntityCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode DELETE_ENTITY command: {}", e))?;
+
+                                                // Execute delete entity
+                                                match self.store.delete_entity(command.entity_id) {
+                                                    Ok(_) => {
+                                                        self.send_resp_response(token, RespValue::SimpleString("OK"))
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Delete entity error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "GET_ENTITY_TYPE" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("GET_ENTITY_TYPE requires name"));
+                                                }
+                                                
+                                                // Parse name
+                                                let name = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    _ => return Err(anyhow::anyhow!("Invalid name format")),
+                                                };
+                                                
+                                                // Execute get entity type
+                                                match self.store.get_entity_type(name) {
+                                                    Ok(entity_type) => {
+                                                        let response_struct = IntegerResponse {
+                                                            value: entity_type.0 as i64,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Get entity type error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "RESOLVE_ENTITY_TYPE" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("RESOLVE_ENTITY_TYPE requires entity_type"));
+                                                }
+                                                
+                                                // Parse entity_type
+                                                let entity_type_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+                                                };
+                                                let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+                                                
+                                                // Execute resolve entity type
+                                                match self.store.resolve_entity_type(entity_type) {
+                                                    Ok(name) => {
+                                                        let response_struct = StringResponse {
+                                                            value: name,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Resolve entity type error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "GET_FIELD_TYPE" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("GET_FIELD_TYPE requires name"));
+                                                }
+                                                
+                                                // Parse name
+                                                let name = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    _ => return Err(anyhow::anyhow!("Invalid name format")),
+                                                };
+                                                
+                                                // Execute get field type
+                                                match self.store.get_field_type(name) {
+                                                    Ok(field_type) => {
+                                                        let response_struct = IntegerResponse {
+                                                            value: field_type.0 as i64,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Get field type error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "RESOLVE_FIELD_TYPE" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("RESOLVE_FIELD_TYPE requires field_type"));
+                                                }
+                                                
+                                                // Parse field_type
+                                                let field_type_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid field_type format")),
+                                                };
+                                                let field_type: FieldType = FieldType(field_type_str.parse::<u64>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid field_type"))?);
+                                                
+                                                // Execute resolve field type
+                                                match self.store.resolve_field_type(field_type) {
+                                                    Ok(name) => {
+                                                        let response_struct = StringResponse {
+                                                            value: name,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Resolve field type error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "GET_ENTITY_SCHEMA" => self.handle_get_entity_schema_command(token, &args[1..]),
+                                            "UPDATE_SCHEMA" => self.handle_update_schema_command(token, &args[1..]),
+                                            "GET_FIELD_SCHEMA" => self.handle_get_field_schema_command(token, &args[1..]),
+                                            "SET_FIELD_SCHEMA" => self.handle_set_field_schema_command(token, &args[1..]),
+                                            "FIND_ENTITIES" => self.handle_find_entities_command(token, &args[1..]),
+                                            "FIND_ENTITIES_EXACT" => self.handle_find_entities_exact_command(token, &args[1..]),
+                                            "FIND_ENTITIES_PAGINATED" => self.handle_find_entities_paginated_command(token, &args[1..]),
+                                            "GET_ENTITY_TYPES" => {
+                                                // Execute get entity types
+                                                match self.store.get_entity_types() {
+                                                    Ok(entity_types) => {
+                                                        let response_struct = EntityTypeListResponse {
+                                                            entity_types,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Get entity types error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "GET_ENTITY_TYPES_PAGINATED" => self.handle_get_entity_types_paginated_command(token, &args[1..]),
+                                            "ENTITY_EXISTS" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("ENTITY_EXISTS requires entity_id"));
+                                                }
+                                                
+                                                // Parse entity_id
+                                                let entity_id_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_id format")),
+                                                };
+                                                let entity_id: EntityId = EntityId(entity_id_str.parse::<u64>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_id"))?);
+                                                
+                                                // Execute entity exists check
+                                                let exists = self.store.entity_exists(entity_id);
+                                                let response_struct = BooleanResponse {
+                                                    result: exists,
+                                                };
+                                                let response_bytes = response_struct.encode();
+                                                let (response, _) = RespValue::decode(&response_bytes)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                self.send_resp_response(token, response)
+                                            },
+                                            "FIELD_EXISTS" => {
+                                                if args.len() < 3 {
+                                                    return Err(anyhow::anyhow!("FIELD_EXISTS requires entity_type and field_type"));
+                                                }
+                                                
+                                                // Parse entity_type
+                                                let entity_type_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+                                                };
+                                                let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+                                                    
+                                                // Parse field_type
+                                                let field_type_str = match &args[2] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid field_type format")),
+                                                };
+                                                let field_type: FieldType = FieldType(field_type_str.parse::<u64>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid field_type"))?);
+                                                
+                                                // Execute field exists check
+                                                let exists = self.store.field_exists(entity_type, field_type);
+                                                let response_struct = BooleanResponse {
+                                                    result: exists,
+                                                };
+                                                let response_bytes = response_struct.encode();
+                                                let (response, _) = RespValue::decode(&response_bytes)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                self.send_resp_response(token, response)
+                                            },
+                                            "RESOLVE_INDIRECTION" => {
+                                                if args.len() < 3 {
+                                                    return Err(anyhow::anyhow!("RESOLVE_INDIRECTION requires entity_id and field_path"));
+                                                }
+                                                
+                                                // Parse entity_id
+                                                let entity_id_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_id format")),
+                                                };
+                                                let entity_id: EntityId = EntityId(entity_id_str.parse::<u64>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_id"))?);
+                                                    
+                                                // Parse field_path
+                                                let field_path_str = match &args[2] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    _ => return Err(anyhow::anyhow!("Invalid field_path format")),
+                                                };
+                                                
+                                                let field_path: Vec<FieldType> = if field_path_str.is_empty() {
+                                                    vec![]
+                                                } else {
+                                                    field_path_str.split(',')
+                                                        .map(|s| s.trim().parse::<u64>().map(|v| FieldType(v)))
+                                                        .collect::<std::result::Result<Vec<_>, _>>()
+                                                        .map_err(|_| anyhow::anyhow!("Invalid field_path"))?
+                                                };
+                                                
+                                                // Execute resolve indirection
+                                                match self.store.resolve_indirection(entity_id, &field_path) {
+                                                    Ok((resolved_entity_id, resolved_field_type)) => {
+                                                        let entity_id_bytes = format!("{}", resolved_entity_id.0).into_bytes();
+                                                        let response = RespValue::Array(vec![
+                                                            RespValue::BulkString(&entity_id_bytes),
+                                                            RespValue::Integer(resolved_field_type.0 as i64),
+                                                        ]);
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Resolve indirection error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "TAKE_SNAPSHOT" => {
+                                                // Execute take snapshot
+                                                let snapshot = self.store.take_snapshot();
+                                                let encoded_snapshot = serde_json::to_vec(&snapshot)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to serialize snapshot: {}", e))?;
+                                                let response = RespValue::BulkString(&encoded_snapshot);
+                                                self.send_resp_response(token, response)
+                                            },
+                                            "REGISTER_NOTIFICATION" => self.handle_register_notification_command(token, &args[1..]),
+                                            "UNREGISTER_NOTIFICATION" => self.handle_unregister_notification_command(token, &args[1..]),
+                                            // Peer protocol commands
+                                            "PEER_HANDSHAKE" => {
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = PeerHandshakeCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode PEER_HANDSHAKE command: {}", e))?;
+
+                                                self.handle_peer_handshake(token, command.start_time, command.is_response, command.machine_id)?;
+                                                
+                                                // Send OK response
+                                                let ok_response = RespValue::SimpleString("OK");
+                                                self.send_resp_response(token, ok_response)
+                                            },
+                                            "FULL_SYNC_REQUEST" => {
+                                                self.handle_peer_full_sync_request(token)
+                                            },
+                                            "FULL_SYNC_RESPONSE" => {
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = FullSyncResponseCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode FULL_SYNC_RESPONSE command: {}", e))?;
+
+                                                self.handle_peer_full_sync_response(token, command.snapshot_data)
+                                            },
+                                            "SYNC_WRITE" => {
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = SyncWriteCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode SYNC_WRITE command: {}", e))?;
+
+                                                self.handle_peer_sync_write(token, command.requests_data)
+                                            },
+                                            "NOTIFICATION" => {
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = NotificationCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode NOTIFICATION command: {}", e))?;
+
+                                                // Deserialize the notification
+                                                let notification: qlib_rs::Notification = serde_json::from_str(&command.notification_data)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to deserialize notification: {}", e))?;
+                                                
+                                                debug!("Received notification from peer: {:?}", notification);
+                                                
+                                                // Forward the notification to local clients if needed
+                                                // This might require additional logic based on your notification system
+                                                
+                                                Ok(())
+                                            },
+                                            _ => {
+                                                let error_str = format!("Unknown command: {}", cmd_name);
+                                                self.send_resp_response(token, RespValue::Error(&error_str))
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Err(anyhow::anyhow!("Expected array for command"))
+                                }
+                            };
+                            
+                            if let Err(e) = resp_command_result {
+                                error!("Error handling RESP command: {}", e);
+                                let error_str = format!("Error: {}", e);
+                                let error_response = RespValue::Error(&error_str);
+                                self.send_resp_response(token, error_response)?;
+                            }
+                            total_consumed += consumed;
+                        }
+                        Err(_) => break, // Incomplete command
                     }
                 }
                 
@@ -502,17 +946,6 @@ impl CoreService {
                 if total_consumed > 0 {
                     if let Some(connection) = self.connections.get_mut(&token) {
                         connection.read_buffer.drain(0..total_consumed);
-                    }
-                }
-                
-                // Process all commands
-                for owned_command in commands {
-                    let resp_value = owned_command.to_borrowed();
-                    if let Err(e) = self.handle_resp_command(token, resp_value) {
-                        error!("Error handling RESP command: {}", e);
-                        let error_str = format!("Error: {}", e);
-                        let error_response = RespValue::Error(&error_str);
-                        self.send_resp_response(token, error_response)?;
                     }
                 }
             }
@@ -524,150 +957,7 @@ impl CoreService {
         
         Ok(())
     }
-    
-    /// Process any complete commands in the connection buffer
-    fn process_buffered_commands(&mut self, token: Token) -> Result<()> {
-        loop {
-            // Check if we have a complete command and get it
-            let command_data = {
-                let connection = self.connections.get(&token)
-                    .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
-                    
-                if connection.read_buffer.is_empty() {
-                    return Ok(());
-                }
-                
-                // Try to parse the command, but clone the buffer portion we need
-                match RespValue::decode(&connection.read_buffer) {
-                    Ok((resp_value, remaining)) => {
-                        let consumed = connection.read_buffer.len() - remaining.len();
-                        if consumed == 0 {
-                            return Ok(()); // No progress, wait for more data
-                        }
-                        
-                        // Convert to owned version to avoid lifetime issues
-                        let owned_command = match resp_value {
-                            RespValue::SimpleString(s) => qlib_rs::data::resp::OwnedRespValue::SimpleString(s.to_string()),
-                            RespValue::Error(s) => qlib_rs::data::resp::OwnedRespValue::Error(s.to_string()),
-                            RespValue::Integer(i) => qlib_rs::data::resp::OwnedRespValue::Integer(i),
-                            RespValue::BulkString(b) => qlib_rs::data::resp::OwnedRespValue::BulkString(b.to_vec()),
-                            RespValue::Array(arr) => {
-                                let owned_arr: Vec<qlib_rs::data::resp::OwnedRespValue> = arr.into_iter().map(|v| match v {
-                                    RespValue::SimpleString(s) => qlib_rs::data::resp::OwnedRespValue::SimpleString(s.to_string()),
-                                    RespValue::Error(s) => qlib_rs::data::resp::OwnedRespValue::Error(s.to_string()),
-                                    RespValue::Integer(i) => qlib_rs::data::resp::OwnedRespValue::Integer(i),
-                                    RespValue::BulkString(b) => qlib_rs::data::resp::OwnedRespValue::BulkString(b.to_vec()),
-                                    RespValue::Null => qlib_rs::data::resp::OwnedRespValue::Null,
-                                    _ => qlib_rs::data::resp::OwnedRespValue::SimpleString("".to_string()),
-                                }).collect();
-                                qlib_rs::data::resp::OwnedRespValue::Array(owned_arr)
-                            },
-                            RespValue::Null => qlib_rs::data::resp::OwnedRespValue::Null,
-                        };
-                        
-                        Some((owned_command, consumed))
-                    }
-                    Err(_) => None, // Incomplete command, wait for more data
-                }
-            };
-            
-            if let Some((owned_command, consumed_bytes)) = command_data {
-                // Remove consumed bytes from buffer
-                if let Some(connection) = self.connections.get_mut(&token) {
-                    connection.read_buffer.drain(0..consumed_bytes);
-                }
-                
-                // Convert back to borrowed form for processing
-                let resp_value = match &owned_command {
-                    qlib_rs::data::resp::OwnedRespValue::SimpleString(s) => RespValue::SimpleString(s),
-                    qlib_rs::data::resp::OwnedRespValue::Error(s) => RespValue::Error(s),
-                    qlib_rs::data::resp::OwnedRespValue::Integer(i) => RespValue::Integer(*i),
-                    qlib_rs::data::resp::OwnedRespValue::BulkString(b) => RespValue::BulkString(b),
-                    qlib_rs::data::resp::OwnedRespValue::Array(arr) => {
-                        let borrowed_arr: Vec<RespValue> = arr.iter().map(|v| match v {
-                            qlib_rs::data::resp::OwnedRespValue::SimpleString(s) => RespValue::SimpleString(s),
-                            qlib_rs::data::resp::OwnedRespValue::Error(s) => RespValue::Error(s),
-                            qlib_rs::data::resp::OwnedRespValue::Integer(i) => RespValue::Integer(*i),
-                            qlib_rs::data::resp::OwnedRespValue::BulkString(b) => RespValue::BulkString(b),
-                            qlib_rs::data::resp::OwnedRespValue::Array(_) => RespValue::Array(vec![]), // Nested arrays simplified
-                            qlib_rs::data::resp::OwnedRespValue::Null => RespValue::Null,
-                        }).collect();
-                        RespValue::Array(borrowed_arr)
-                    },
-                    qlib_rs::data::resp::OwnedRespValue::Null => RespValue::Null,
-                };
-                
-                // Process the command
-                if let Err(e) = self.handle_resp_command(token, resp_value) {
-                    error!("Error handling RESP command: {}", e);
-                    let error_str = format!("Error: {}", e);
-                    let error_response = RespValue::Error(&error_str);
-                    self.send_resp_response(token, error_response)?;
-                }
-            } else {
-                return Ok(()); // No complete command available
-            }
-        }
-    }
 
-    /// Handle a RESP command
-    fn handle_resp_command(&mut self, token: Token, resp_value: RespValue) -> Result<()> {
-        // Expect an array representing a command
-        if let RespValue::Array(args) = resp_value {
-            if args.is_empty() {
-                return Err(anyhow::anyhow!("Empty command"));
-            }
-            
-            // First element should be the command name
-            let cmd_name = match &args[0] {
-                RespValue::BulkString(name) => std::str::from_utf8(name)?,
-                RespValue::SimpleString(name) => name,
-                _ => return Err(anyhow::anyhow!("Command name must be a string")),
-            };
-            
-            // Handle different commands
-            match cmd_name.to_uppercase().as_str() {
-                "READ" => self.handle_read_command(token, &args[1..])?,
-                "WRITE" => self.handle_write_command(token, &args[1..])?,
-                "CREATE_ENTITY" => self.handle_create_entity_command(token, &args[1..])?,
-                "DELETE_ENTITY" => self.handle_delete_entity_command(token, &args[1..])?,
-                "GET_ENTITY_TYPE" => self.handle_get_entity_type_command(token, &args[1..])?,
-                "RESOLVE_ENTITY_TYPE" => self.handle_resolve_entity_type_command(token, &args[1..])?,
-                "GET_FIELD_TYPE" => self.handle_get_field_type_command(token, &args[1..])?,
-                "RESOLVE_FIELD_TYPE" => self.handle_resolve_field_type_command(token, &args[1..])?,
-                "GET_ENTITY_SCHEMA" => self.handle_get_entity_schema_command(token, &args[1..])?,
-                "UPDATE_SCHEMA" => self.handle_update_schema_command(token, &args[1..])?,
-                "GET_FIELD_SCHEMA" => self.handle_get_field_schema_command(token, &args[1..])?,
-                "SET_FIELD_SCHEMA" => self.handle_set_field_schema_command(token, &args[1..])?,
-                "FIND_ENTITIES" => self.handle_find_entities_command(token, &args[1..])?,
-                "FIND_ENTITIES_EXACT" => self.handle_find_entities_exact_command(token, &args[1..])?,
-                "FIND_ENTITIES_PAGINATED" => self.handle_find_entities_paginated_command(token, &args[1..])?,
-                "GET_ENTITY_TYPES" => self.handle_get_entity_types_command(token, &args[1..])?,
-                "GET_ENTITY_TYPES_PAGINATED" => self.handle_get_entity_types_paginated_command(token, &args[1..])?,
-                "ENTITY_EXISTS" => self.handle_entity_exists_command(token, &args[1..])?,
-                "FIELD_EXISTS" => self.handle_field_exists_command(token, &args[1..])?,
-                "RESOLVE_INDIRECTION" => self.handle_resolve_indirection_command(token, &args[1..])?,
-                "TAKE_SNAPSHOT" => self.handle_take_snapshot_command(token, &args[1..])?,
-                "REGISTER_NOTIFICATION" => self.handle_register_notification_command(token, &args[1..])?,
-                "UNREGISTER_NOTIFICATION" => self.handle_unregister_notification_command(token, &args[1..])?,
-                // Peer protocol commands
-                "PEER_HANDSHAKE" => self.handle_peer_handshake_command(token, &args[1..])?,
-                "FULL_SYNC_REQUEST" => self.handle_peer_full_sync_request_command(token, &args[1..])?,
-                "FULL_SYNC_RESPONSE" => self.handle_peer_full_sync_response_command(token, &args[1..])?,
-                "SYNC_WRITE" => self.handle_peer_sync_write_command(token, &args[1..])?,
-                "NOTIFICATION" => self.handle_notification_command(token, &args[1..])?,
-                _ => {
-                    let error_str = format!("Unknown command: {}", cmd_name);
-                    self.send_resp_response(token, RespValue::Error(&error_str))?;
-                }
-            }
-        } else {
-            return Err(anyhow::anyhow!("Expected array for command"));
-        }
-        
-        Ok(())
-    }
-    
     
     /// Send a RESP command to a peer connection
     fn send_peer_command<T: RespCommand<'static>>(&mut self, token: Token, command: &T) -> Result<()> {
