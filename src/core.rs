@@ -567,7 +567,7 @@ impl CoreService {
                                     self.send_resp_response(token, response.encode())?;
                                 }
                                 Err(e) => {
-                                    self.send_response(token, RespValue::Error(&format!("Read error: {}", e)))?;
+                                    self.send_resp_response(token, RespValue::Error(format!("Read error: {}", e).as_str()).encode())?;
                                 }
                             }
                         } else if let Ok((command, next_remaining)) = WriteCommand::decode(&remaining) {
@@ -585,8 +585,8 @@ impl CoreService {
                                 Ok(_) => {
                                     self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
                                 }
-                                Err(e) => {
-                                    self.send_response(token, RespValue::Error(&format!("Write error: {}", e)))?;
+                                    Err(e) => {
+                                        self.send_resp_response(token, RespValue::Error(format!("Write error: {}", e).as_str()).encode())?;
                                 }
                             }                        
                         } else {
