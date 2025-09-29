@@ -733,13 +733,319 @@ impl CoreService {
                                                     }
                                                 }
                                             },
-                                            "GET_ENTITY_SCHEMA" => self.handle_get_entity_schema_command(token, &args[1..]),
-                                            "UPDATE_SCHEMA" => self.handle_update_schema_command(token, &args[1..]),
-                                            "GET_FIELD_SCHEMA" => self.handle_get_field_schema_command(token, &args[1..]),
-                                            "SET_FIELD_SCHEMA" => self.handle_set_field_schema_command(token, &args[1..]),
-                                            "FIND_ENTITIES" => self.handle_find_entities_command(token, &args[1..]),
-                                            "FIND_ENTITIES_EXACT" => self.handle_find_entities_exact_command(token, &args[1..]),
-                                            "FIND_ENTITIES_PAGINATED" => self.handle_find_entities_paginated_command(token, &args[1..]),
+                                            "GET_ENTITY_SCHEMA" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("GET_ENTITY_SCHEMA requires entity_type"));
+                                                }
+                                                
+                                                // Parse entity_type
+                                                let entity_type_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+                                                };
+                                                let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+                                                
+                                                // Execute get entity schema
+                                                match self.store.get_entity_schema(entity_type) {
+                                                    Ok(schema) => {
+                                                        let schema_resp = EntitySchemaResp::from_entity_schema(&schema, &self.store);
+                                                        let encoded_schema = schema_resp.encode();
+                                                        let response = RespValue::BulkString(&encoded_schema);
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Get entity schema error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "UPDATE_SCHEMA" => {
+                                                // Decode the command using the UpdateSchemaCommand struct
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = UpdateSchemaCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode UPDATE_SCHEMA command: {}", e))?;
+
+                                                // Convert EntitySchemaResp back to EntitySchema<Single, String, String>
+                                                let schema_string = command.schema.to_entity_schema(&self.store)?;
+                                                
+                                                // Execute update schema
+                                                match self.store.update_schema(schema_string) {
+                                                    Ok(_) => {
+                                                        self.send_resp_response(token, RespValue::SimpleString("OK"))
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Update schema error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "GET_FIELD_SCHEMA" => {
+                                                if args.len() < 3 {
+                                                    return Err(anyhow::anyhow!("GET_FIELD_SCHEMA requires entity_type and field_type"));
+                                                }
+                                                
+                                                // Parse entity_type
+                                                let entity_type_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+                                                };
+                                                let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+                                                    
+                                                // Parse field_type
+                                                let field_type_str = match &args[2] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid field_type format")),
+                                                };
+                                                let field_type: FieldType = FieldType(field_type_str.parse::<u64>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid field_type"))?);
+                                                
+                                                // Execute get field schema
+                                                match self.store.get_field_schema(entity_type, field_type) {
+                                                    Ok(field_schema) => {
+                                                        let field_schema_resp = FieldSchemaResp::from_field_schema(&field_schema, &self.store);
+                                                        let encoded_schema = field_schema_resp.encode();
+                                                        let response = RespValue::BulkString(&encoded_schema);
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Get field schema error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "SET_FIELD_SCHEMA" => {
+                                                // Decode the command using the SetFieldSchemaCommand struct
+                                                let encoded = RespValue::Array(args[1..].to_vec()).encode();
+                                                let (command, _) = SetFieldSchemaCommand::decode(&encoded)
+                                                    .map_err(|e| anyhow::anyhow!("Failed to decode SET_FIELD_SCHEMA command: {}", e))?;
+
+                                                // Convert FieldSchemaResp back to FieldSchema
+                                                let field_schema_string = command.schema.to_field_schema();
+                                                let field_schema = qlib_rs::FieldSchema::from_string_schema(field_schema_string, &self.store);
+                                                
+                                                // Execute set field schema
+                                                match self.store.set_field_schema(command.entity_type, command.field_type, field_schema) {
+                                                    Ok(_) => {
+                                                        self.send_resp_response(token, RespValue::SimpleString("OK"))
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Set field schema error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "FIND_ENTITIES" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("FIND_ENTITIES requires entity_type"));
+                                                }
+                                                
+                                                // Parse entity_type
+                                                let entity_type_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+                                                };
+                                                let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+                                                
+                                                // Parse optional filter
+                                                let filter = if args.len() > 2 {
+                                                    match &args[2] {
+                                                        RespValue::BulkString(s) => {
+                                                            let filter_str = std::str::from_utf8(s)?;
+                                                            if filter_str == "null" || filter_str.is_empty() {
+                                                                None
+                                                            } else {
+                                                                Some(filter_str)
+                                                            }
+                                                        }
+                                                        RespValue::Null => None,
+                                                        _ => return Err(anyhow::anyhow!("Invalid filter format")),
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                
+                                                // Execute find entities
+                                                match self.store.find_entities(entity_type, filter) {
+                                                    Ok(entities) => {
+                                                        let response_struct = EntityListResponse {
+                                                            entities,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Find entities error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "FIND_ENTITIES_EXACT" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("FIND_ENTITIES_EXACT requires entity_type"));
+                                                }
+                                                
+                                                // Parse entity_type
+                                                let entity_type_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+                                                };
+                                                let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+                                                
+                                                // Parse optional pagination options and filter
+                                                let page_opts = if args.len() > 2 {
+                                                    match &args[2] {
+                                                        RespValue::BulkString(s) => {
+                                                            let opts_str = std::str::from_utf8(s)?;
+                                                            if opts_str == "null" || opts_str.is_empty() {
+                                                                None
+                                                            } else {
+                                                                // Simple format: "limit,cursor" or just "limit"
+                                                                let parts: Vec<&str> = opts_str.split(',').collect();
+                                                                let limit = parts[0].parse::<usize>().unwrap_or(100);
+                                                                let cursor = if parts.len() > 1 { 
+                                                                    Some(parts[1].parse::<usize>().unwrap_or(0))
+                                                                } else {
+                                                                    None
+                                                                };
+                                                                Some(PageOpts::new(limit, cursor))
+                                                            }
+                                                        }
+                                                        RespValue::Null => None,
+                                                        _ => return Err(anyhow::anyhow!("Invalid page_opts format")),
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                
+                                                let filter = if args.len() > 3 {
+                                                    match &args[3] {
+                                                        RespValue::BulkString(s) => {
+                                                            let filter_str = std::str::from_utf8(s)?;
+                                                            if filter_str == "null" || filter_str.is_empty() {
+                                                                None
+                                                            } else {
+                                                                Some(filter_str)
+                                                            }
+                                                        }
+                                                        RespValue::Null => None,
+                                                        _ => return Err(anyhow::anyhow!("Invalid filter format")),
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                
+                                                // Execute find entities exact
+                                                match self.store.find_entities_exact(entity_type, page_opts.as_ref(), filter) {
+                                                    Ok(page_result) => {
+                                                        let response_struct = PaginatedEntityResponse {
+                                                            items: page_result.items,
+                                                            total: page_result.total,
+                                                            next_cursor: page_result.next_cursor,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Find entities exact error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
+                                            "FIND_ENTITIES_PAGINATED" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("FIND_ENTITIES_PAGINATED requires entity_type"));
+                                                }
+                                                
+                                                // Parse entity_type
+                                                let entity_type_str = match &args[1] {
+                                                    RespValue::BulkString(s) => std::str::from_utf8(s)?,
+                                                    RespValue::SimpleString(s) => s,
+                                                    RespValue::Integer(i) => &i.to_string(),
+                                                    _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+                                                };
+                                                let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+                                                    .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+                                                
+                                                // Parse optional pagination options and filter
+                                                let page_opts = if args.len() > 2 {
+                                                    match &args[2] {
+                                                        RespValue::BulkString(s) => {
+                                                            let opts_str = std::str::from_utf8(s)?;
+                                                            if opts_str == "null" || opts_str.is_empty() {
+                                                                None
+                                                            } else {
+                                                                // Simple format: "limit,cursor" or just "limit"
+                                                                let parts: Vec<&str> = opts_str.split(',').collect();
+                                                                let limit = parts[0].parse::<usize>().unwrap_or(100);
+                                                                let cursor = if parts.len() > 1 { 
+                                                                    Some(parts[1].parse::<usize>().unwrap_or(0))
+                                                                } else {
+                                                                    None
+                                                                };
+                                                                Some(qlib_rs::PageOpts::new(limit, cursor))
+                                                            }
+                                                        }
+                                                        RespValue::Null => None,
+                                                        _ => return Err(anyhow::anyhow!("Invalid page_opts format")),
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                
+                                                let filter = if args.len() > 3 {
+                                                    match &args[3] {
+                                                        RespValue::BulkString(s) => {
+                                                            let filter_str = std::str::from_utf8(s)?;
+                                                            if filter_str == "null" || filter_str.is_empty() {
+                                                                None
+                                                            } else {
+                                                                Some(filter_str)
+                                                            }
+                                                        }
+                                                        RespValue::Null => None,
+                                                        _ => return Err(anyhow::anyhow!("Invalid filter format")),
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                
+                                                // Execute find entities paginated
+                                                match self.store.find_entities_paginated(entity_type, page_opts.as_ref(), filter) {
+                                                    Ok(page_result) => {
+                                                        let response_struct = PaginatedEntityResponse {
+                                                            items: page_result.items,
+                                                            total: page_result.total,
+                                                            next_cursor: page_result.next_cursor,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Find entities paginated error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
                                             "GET_ENTITY_TYPES" => {
                                                 // Execute get entity types
                                                 match self.store.get_entity_types() {
@@ -758,7 +1064,52 @@ impl CoreService {
                                                     }
                                                 }
                                             },
-                                            "GET_ENTITY_TYPES_PAGINATED" => self.handle_get_entity_types_paginated_command(token, &args[1..]),
+                                            "GET_ENTITY_TYPES_PAGINATED" => {
+                                                // Parse optional pagination options
+                                                let page_opts = if args.len() > 1 {
+                                                    match &args[1] {
+                                                        RespValue::BulkString(s) => {
+                                                            let opts_str = std::str::from_utf8(s)?;
+                                                            if opts_str == "null" || opts_str.is_empty() {
+                                                                None
+                                                            } else {
+                                                                // Simple format: "limit,cursor" or just "limit"
+                                                                let parts: Vec<&str> = opts_str.split(',').collect();
+                                                                let limit = parts[0].parse::<usize>().unwrap_or(100);
+                                                                let cursor = if parts.len() > 1 { 
+                                                                    Some(parts[1].parse::<usize>().unwrap_or(0))
+                                                                } else {
+                                                                    None
+                                                                };
+                                                                Some(PageOpts::new(limit, cursor))
+                                                            }
+                                                        }
+                                                        RespValue::Null => None,
+                                                        _ => return Err(anyhow::anyhow!("Invalid page_opts format")),
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                
+                                                // Execute get entity types paginated
+                                                match self.store.get_entity_types_paginated(page_opts.as_ref()) {
+                                                    Ok(page_result) => {
+                                                        let response_struct = PaginatedEntityTypeResponse {
+                                                            items: page_result.items,
+                                                            total: page_result.total,
+                                                            next_cursor: page_result.next_cursor,
+                                                        };
+                                                        let response_bytes = response_struct.encode();
+                                                        let (response, _) = RespValue::decode(&response_bytes)
+                                                            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                                                        self.send_resp_response(token, response)
+                                                    }
+                                                    Err(e) => {
+                                                        let error_str = format!("Get entity types paginated error: {}", e);
+                                                        self.send_resp_response(token, RespValue::Error(&error_str))
+                                                    }
+                                                }
+                                            },
                                             "ENTITY_EXISTS" => {
                                                 if args.len() <= 1 {
                                                     return Err(anyhow::anyhow!("ENTITY_EXISTS requires entity_id"));
@@ -872,8 +1223,60 @@ impl CoreService {
                                                 let response = RespValue::BulkString(&encoded_snapshot);
                                                 self.send_resp_response(token, response)
                                             },
-                                            "REGISTER_NOTIFICATION" => self.handle_register_notification_command(token, &args[1..]),
-                                            "UNREGISTER_NOTIFICATION" => self.handle_unregister_notification_command(token, &args[1..]),
+                                            "REGISTER_NOTIFICATION" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("REGISTER_NOTIFICATION requires config"));
+                                                }
+                                                
+                                                // Parse notification config
+                                                let config_bytes = match &args[1] {
+                                                    RespValue::BulkString(s) => s,
+                                                    _ => return Err(anyhow::anyhow!("Invalid config format")),
+                                                };
+                                                let (config, _) = NotifyConfig::decode(config_bytes)
+                                                    .map_err(|_| anyhow::anyhow!("Invalid config encoding"))?;
+                                                
+                                                // Get the connection's notification queue
+                                                if let Some(connection) = self.connections.get_mut(&token) {
+                                                    connection.notification_configs.insert(config.clone());
+                                                    
+                                                    match self.store.register_notification(config.clone(), connection.notification_queue.clone()) {
+                                                        Ok(_) => {
+                                                            self.send_resp_response(token, RespValue::SimpleString("OK"))
+                                                        }
+                                                        Err(e) => {
+                                                            let error_str = format!("Register notification error: {}", e);
+                                                            self.send_resp_response(token, RespValue::Error(&error_str))
+                                                        }
+                                                    }
+                                                } else {
+                                                    self.send_resp_response(token, RespValue::Error("Connection not found"))
+                                                }
+                                            },
+                                            "UNREGISTER_NOTIFICATION" => {
+                                                if args.len() <= 1 {
+                                                    return Err(anyhow::anyhow!("UNREGISTER_NOTIFICATION requires config"));
+                                                }
+                                                
+                                                // Parse notification config
+                                                let config_bytes = match &args[1] {
+                                                    RespValue::BulkString(s) => s,
+                                                    _ => return Err(anyhow::anyhow!("Invalid config format")),
+                                                };
+                                                let (config, _) = NotifyConfig::decode(config_bytes)
+                                                    .map_err(|_| anyhow::anyhow!("Invalid config encoding"))?;
+                                                
+                                                // Get the connection's notification queue
+                                                if let Some(connection) = self.connections.get_mut(&token) {
+                                                    connection.notification_configs.remove(&config);
+                                                    
+                                                    let removed = self.store.unregister_notification(&config, &connection.notification_queue);
+                                                    let response = RespValue::Integer(if removed { 1 } else { 0 });
+                                                    self.send_resp_response(token, response)
+                                                } else {
+                                                    self.send_resp_response(token, RespValue::Error("Connection not found"))
+                                                }
+                                            },
                                             // Peer protocol commands
                                             "PEER_HANDSHAKE" => {
                                                 let encoded = RespValue::Array(args[1..].to_vec()).encode();
@@ -1026,35 +1429,7 @@ impl CoreService {
         Ok(())
     }
 
-    /// Handle READ command
-    fn handle_read_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
-        // Decode the command using the ReadCommand struct
-        let encoded = RespValue::Array(args.to_vec()).encode();
-        let (command, _) = ReadCommand::decode(&encoded)
-            .map_err(|e| anyhow::anyhow!("Failed to decode READ command: {}", e))?;
-
-        // Execute read
-        match self.store.read(command.entity_id, &command.field_path) {
-            Ok((value, timestamp, writer_id)) => {
-                let response_struct = ReadResponse {
-                    value,
-                    timestamp,
-                    writer_id,
-                };
-                let response_bytes = response_struct.encode();
-                let (response, _) = RespValue::decode(&response_bytes)
-                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
-                self.send_resp_response(token, response)?;
-            }
-            Err(e) => {
-                let error_str = format!("Read error: {}", e);
-                self.send_resp_response(token, RespValue::Error(&error_str))?;
-            }
-        }
-
-        Ok(())
-    }
-
+    
     /// Handle WRITE command  
     fn handle_write_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
         // Decode the command using the WriteCommand struct
