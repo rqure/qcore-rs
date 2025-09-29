@@ -12,9 +12,7 @@ use std::thread;
 use serde_json;
 
 use qlib_rs::{
-    EntityId, NotificationQueue, NotifyConfig, Store, Snapshot, StoreTrait,
-    EntityType, FieldType, Value,
-    PageOpts, Requests
+    EntityId, EntityType, FieldType, NotificationQueue, NotifyConfig, PageOpts, Snapshot, Store, StoreTrait, Value, WriteInfo
 };
 use qlib_rs::data::resp::{
     RespValue, RespCommand, RespEncode, RespDecode,
@@ -78,9 +76,9 @@ pub enum CoreCommand {
     GetPeers {
         respond_to: Sender<AHashMap<String, (Option<Token>, Option<EntityId>)>>,
     },
-    PerformRequests {
-        requests: qlib_rs::Requests,
-    },
+    Replay {
+        writes: Vec<WriteInfo>,
+    }
 }
 
 /// Handle for communicating with core service
@@ -115,9 +113,9 @@ impl CoreHandle {
         self.sender.send(CoreCommand::GetPeers { respond_to: resp_sender }).unwrap();
         resp_receiver.recv().unwrap_or_default()
     }
-
-    pub fn perform(&self, requests: qlib_rs::Requests) {
-        self.sender.send(CoreCommand::PerformRequests { requests }).unwrap();
+    
+    pub fn replay(&self, writes: Vec<WriteInfo>) {
+        self.sender.send(CoreCommand::Replay { writes }).unwrap();
     }
 }
 
@@ -287,10 +285,10 @@ impl CoreService {
                 // Drain the write queue from the store (WriteInfo items for internal tracking)
                 while let Some(write_info) = service.store.write_queue.pop_front() {
                     if let Some(wal_handle) = &service.wal_handle {
-                        if let Err(e) = wal_handle.log_write(&write_info) {
-                            error!("Failed to log write to WAL: {}", e);
-                        }
+                        wal_handle.log_write(write_info);
                     }
+
+
                 }
             }
         });
@@ -1750,129 +1748,37 @@ impl CoreService {
     /// Handle peer sync write message
     fn handle_peer_sync_write(&mut self, _token: Token, requests_json: String) -> Result<()> {
         debug!("Received sync write from peer");
-        
+
         // Deserialize requests from JSON
-        let requests: Requests = serde_json::from_str(&requests_json)
+        let write_info: WriteInfo = serde_json::from_str(&requests_json)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize requests: {}", e))?;
         
-        debug!("Applying {} requests from peer", requests.len());
-        
-        // Apply the requests to our store
-        self.perform_requests(requests);
+        // Apply the write to our store
+        match write_info {
+            WriteInfo::CreateEntity { entity_type, parent_id, name, created_entity_id, timestamp } => {
+                self.store.create_entity(entity_type, parent_id, &name, Some(created_entity_id), Some(timestamp))
+                    .map_err(|e| anyhow::anyhow!("Failed to apply CreateEntity from peer: {}", e))?;
+            }
+            WriteInfo::DeleteEntity { entity_id, timestamp } => {
+                self.store.delete_entity(entity_id, Some(timestamp))
+                    .map_err(|e| anyhow::anyhow!("Failed to apply DeleteEntity from peer: {}", e))?;
+            }
+            WriteInfo::FieldUpdate { entity_id, field_type, value, push_condition, adjust_behavior, write_time, writer_id } => {
+                self.store.write(entity_id, field_type, &value, push_condition, adjust_behavior, Some(write_time), writer_id)
+                    .map_err(|e| anyhow::anyhow!("Failed to apply FieldUpdate from peer: {}", e))?;
+            }
+            WriteInfo::SchemaUpdate { schema, timestamp } => {
+                self.store.update_schema(&schema, Some(timestamp))
+                    .map_err(|e| anyhow::anyhow!("Failed to apply SchemaUpdate from peer: {}", e))?;
+            }
+            WriteInfo::Snapshot { .. } => {
+                // Ignore snapshot writes in sync
+            }
+        }
         
         Ok(())
     }
-    
-    /// Apply a batch of requests to the store
-    fn perform_requests(&mut self, requests: qlib_rs::Requests) {
-        for request in requests.read().iter() {
-            match request {
-                qlib_rs::Request::Read { entity_id, field_types, value, write_time: _write_time, writer_id: _writer_id } => {
-                    // For read requests, we don't need to do anything as they don't modify the store
-                    // But we should update the request with the result
-                    if let Some(_value_ref) = value {
-                        // The request already has a value, no need to re-read
-                        continue;
-                    }
-                    
-                    match self.store.read(*entity_id, field_types) {
-                        Ok((_read_value, _timestamp, _writer)) => {
-                            // Note: We can't modify the request here because Requests uses Arc<RwLock>
-                            // The read result would need to be stored somewhere else
-                            // For now, we'll just log that we processed the read
-                            debug!("Processed read request for entity {:?}, field {:?}", entity_id, field_types);
-                        }
-                        Err(e) => {
-                            warn!("Failed to process read request: {}", e);
-                        }
-                    }
-                }
-                qlib_rs::Request::Write { entity_id, field_types, value, push_condition, adjust_behavior, write_time, writer_id, write_processed: _write_processed } => {
-                    match self.store.write(*entity_id, field_types, value.clone().unwrap_or(Value::String("".to_string())), *writer_id, *write_time, Some(push_condition.clone()), Some(adjust_behavior.clone())) {
-                        Ok(_) => {
-                            debug!("Processed write request for entity {:?}, field {:?}", entity_id, field_types);
-                        }
-                        Err(e) => {
-                            warn!("Failed to process write request: {}", e);
-                        }
-                    }
-                }
-                qlib_rs::Request::Create { entity_type, parent_id, name, created_entity_id: _created_entity_id, timestamp: _timestamp } => {
-                    match self.store.create_entity(*entity_type, *parent_id, name) {
-                        Ok(entity_id) => {
-                            debug!("Processed create request, created entity {:?}", entity_id);
-                        }
-                        Err(e) => {
-                            warn!("Failed to process create request: {}", e);
-                        }
-                    }
-                }
-                qlib_rs::Request::Delete { entity_id, timestamp: _timestamp } => {
-                    match self.store.delete_entity(*entity_id) {
-                        Ok(_) => {
-                            debug!("Processed delete request for entity {:?}", entity_id);
-                        }
-                        Err(e) => {
-                            warn!("Failed to process delete request: {}", e);
-                        }
-                    }
-                }
-                qlib_rs::Request::SchemaUpdate { schema, timestamp: _timestamp } => {
-                    match self.store.update_schema(schema.clone()) {
-                        Ok(_) => {
-                            debug!("Processed schema update request");
-                        }
-                        Err(e) => {
-                            warn!("Failed to process schema update request: {}", e);
-                        }
-                    }
-                }
-                qlib_rs::Request::Snapshot { snapshot_counter: _snapshot_counter, timestamp: _timestamp } => {
-                    // Snapshot requests don't modify the store, they're just markers
-                    debug!("Processed snapshot marker request");
-                }
-                qlib_rs::Request::GetEntityType { name: _name, entity_type: _entity_type } => {
-                    // These are read-only operations, no store modification needed
-                    debug!("Processed get entity type request");
-                }
-                qlib_rs::Request::ResolveEntityType { entity_type: _entity_type, name: _name } => {
-                    debug!("Processed resolve entity type request");
-                }
-                qlib_rs::Request::GetFieldType { name: _name, field_type: _field_type } => {
-                    debug!("Processed get field type request");
-                }
-                qlib_rs::Request::ResolveFieldType { field_type: _field_type, name: _name } => {
-                    debug!("Processed resolve field type request");
-                }
-                qlib_rs::Request::GetEntitySchema { entity_type: _entity_type, schema: _schema } => {
-                    debug!("Processed get entity schema request");
-                }
-                qlib_rs::Request::GetCompleteEntitySchema { entity_type: _entity_type, schema: _schema } => {
-                    debug!("Processed get complete entity schema request");
-                }
-                qlib_rs::Request::GetFieldSchema { entity_type: _entity_type, field_type: _field_type, schema: _schema } => {
-                    debug!("Processed get field schema request");
-                }
-                qlib_rs::Request::EntityExists { entity_id: _entity_id, exists: _exists } => {
-                    debug!("Processed entity exists request");
-                }
-                qlib_rs::Request::FieldExists { entity_type: _entity_type, field_type: _field_type, exists: _exists } => {
-                    debug!("Processed field exists request");
-                }
-                qlib_rs::Request::FindEntities { entity_type: _entity_type, page_opts: _page_opts, filter: _filter, result: _result } => {
-                    debug!("Processed find entities request");
-                }
-                qlib_rs::Request::FindEntitiesExact { entity_type: _entity_type, page_opts: _page_opts, filter: _filter, result: _result } => {
-                    debug!("Processed find entities exact request");
-                }
-                qlib_rs::Request::GetEntityTypes { page_opts: _page_opts, result: _result } => {
-                    debug!("Processed get entity types request");
-                }
-            }
-        }
-    }
 
-    
     /// Remove a connection and clean up resources
     fn remove_connection(&mut self, token: Token) {
         if let Some(connection) = self.connections.remove(&token) {
@@ -2006,9 +1912,36 @@ impl CoreService {
                     error!("Failed to send peers response: {}", e);
                 }
             }
-            CoreCommand::PerformRequests { requests } => {
-                debug!("Handling perform requests command with {} requests", requests.len());
-                self.perform_requests(requests);
+            CoreCommand::Replay { writes } => {
+                debug!("Replaying {} WAL writes", writes.len());
+                for write_info in writes {
+                    match write_info {
+                        WriteInfo::CreateEntity { entity_type, parent_id, name, created_entity_id, timestamp } => {
+                            if let Err(e) = self.store.create_entity(entity_type, parent_id, &name, Some(created_entity_id), Some(timestamp)) {
+                                warn!("Failed to replay CreateEntity for {}: {}", name, e);
+                            }
+                        }
+                        WriteInfo::DeleteEntity { entity_id, timestamp } => {
+                            if let Err(e) = self.store.delete_entity(entity_id, Some(timestamp)) {
+                                warn!("Failed to replay DeleteEntity for {:?}: {}", entity_id, e);
+                            }
+                        }
+                        WriteInfo::FieldUpdate { entity_id, field_type, value, timestamp } => {
+                            if let Err(e) = self.store.write(entity_id, &[field_type], value, None, None, None, Some(timestamp)) {
+                                warn!("Failed to replay FieldUpdate for {:?}: {}", entity_id, e);
+                            }
+                        }
+                        WriteInfo::SchemaUpdate { schema, timestamp } => {
+                            if let Err(e) = self.store.update_schema(&schema, Some(timestamp)) {
+                                warn!("Failed to replay SchemaUpdate: {}", e);
+                            }
+                        }
+                        WriteInfo::Snapshot { snapshot_counter, timestamp } => {
+                            warn!("Skipping replay of Snapshot write (counter {})", snapshot_counter);
+                        }
+                    }
+                }
+                info!("WAL replay completed");
             }
         }
     }

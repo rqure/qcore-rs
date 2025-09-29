@@ -37,7 +37,7 @@ pub trait WalTrait {
     fn log_write(&mut self, requests: &WriteInfo) -> Result<()>;
 
     /// Replay WAL files to restore store state
-    fn replay(&self) -> Result<WriteInfo>;
+    fn replay(&self) -> Result<Vec<WriteInfo>>;
 
     /// Initialize WAL counter from existing files
     fn initialize_counter(&mut self) -> Result<()>;
@@ -165,7 +165,7 @@ impl WalService {
                     WalCommand::Replay => {
                         if let Some(core_handle) = &service.core_handle {
                             match service.replay() {
-                                Ok(requests) => core_handle.perform(requests),
+                                Ok(writes) => core_handle.replay(writes),
                                 Err(e) => {
                                     error!(error = %e, "Failed to replay WAL files");
                                 }
@@ -222,49 +222,30 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
 
 impl<F: FileManagerTrait> WalTrait for WalManagerTrait<F> {
     /// Write a request to WAL with file rotation and snapshot handling
-    fn log_write(&mut self, requests: &WriteInfo) -> Result<()> {
-        for request in requests.read().iter() {
-            if let qlib_rs::Request::Read { .. } = request {
-                continue;
-            } else if let qlib_rs::Request::GetEntityType { .. } = request {
-                continue;
-            } else if let qlib_rs::Request::GetFieldType { .. } = request {
-                continue;
-            } else if let qlib_rs::Request::ResolveEntityType { .. } = request {
-                continue;
-            } else if let qlib_rs::Request::ResolveFieldType { .. } = request {
-                continue;
-            } else if let qlib_rs::Request::Write { write_processed, .. } = request {
-                // Only append Write requests that were actually processed and changed the store
-                if !write_processed {
-                    continue;
-                }
-            }
+    fn log_write(&mut self, write_info: &WriteInfo) -> Result<()> {
+        // Skip read requests and unprocessed write requests
+        let serialized = bincode::serialize(write_info)?;
 
-            // Skip read requests and unprocessed write requests
-            let serialized = bincode::serialize(request)?;
-
-            // Check if we need to rotate the file
-            if self.current_wal_size + serialized.len() + 4 > self.wal_config.max_file_size {
-                self.rotate_file()?;
-            }
-
-            // Write the entry
-            self.write_entry(&serialized)?;
+        // Check if we need to rotate the file
+        if self.current_wal_size + serialized.len() + 4 > self.wal_config.max_file_size {
+            self.rotate_file()?;
         }
+
+        // Write the entry
+        self.write_entry(&serialized)?;
 
         Ok(())
     }
 
     /// Replay WAL files to restore store state
-    fn replay(&self) -> Result<Requests> {
+    fn replay(&self) -> Result<Vec<WriteInfo>> {
         let wal_files = self
             .file_manager
             .scan_files(&self.wal_config.wal_dir, &self.file_config)?;
 
         if wal_files.is_empty() {
             info!("No WAL files found");
-            return Ok(Requests::new(vec![]));
+            return Ok(vec![]);
         }
 
         // Find the most recent snapshot marker
@@ -382,7 +363,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             if let Ok(Some((offset, request))) = self.find_snapshot_marker_in_file(&file_info.path)
             {
                 match request {
-                    qlib_rs::Request::Snapshot {
+                    WriteInfo::Snapshot {
                         snapshot_counter, ..
                     } => {
                         latest_snapshot = Some((file_info.path.clone(), snapshot_counter, offset));
@@ -400,20 +381,20 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     fn find_snapshot_marker_in_file(
         &self,
         wal_path: &PathBuf,
-    ) -> Result<Option<(usize, qlib_rs::Request)>> {
+    ) -> Result<Option<(usize, WriteInfo)>> {
         let mut file = File::open(wal_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
         let mut reader = WalEntryReader::new(buffer);
-        let mut last_snapshot: Option<(usize, qlib_rs::Request)> = None;
+        let mut last_snapshot: Option<(usize, WriteInfo)> = None;
 
         while let Some(result) = reader.next_entry() {
             match result {
                 Ok((entry_data, offset)) => {
-                    match bincode::deserialize::<qlib_rs::Request>(&entry_data) {
+                    match bincode::deserialize::<WriteInfo>(&entry_data) {
                         Ok(request) => match &request {
-                            qlib_rs::Request::Snapshot { .. } => {
+                            WriteInfo::Snapshot { .. } => {
                                 last_snapshot = Some((offset, request));
                             }
                             _ => {}
@@ -433,8 +414,8 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
         &self,
         wal_files: &[FileInfo],
         most_recent_snapshot: Option<(PathBuf, u64, usize)>,
-    ) -> Result<Requests> {
-        let requests = Requests::new(vec![]);
+    ) -> Result<Vec<WriteInfo>> {
+        let mut writes = Vec::new();
 
         match most_recent_snapshot {
             Some((snapshot_file, snapshot_counter, offset)) => {
@@ -448,12 +429,12 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 // Find the file in our list and replay from the offset
                 if let Some(file_info) = wal_files.iter().find(|f| f.path == snapshot_file) {
                     let file_requests = self.replay_file_from_offset(&file_info.path, offset)?;
-                    requests.extend(file_requests);
+                    writes.extend(file_requests);
 
                     // Replay all subsequent files completely
                     for file_info in wal_files.iter().filter(|f| f.counter > file_info.counter) {
                         let file_requests = self.replay_file_from_offset(&file_info.path, 0)?;
-                        requests.extend(file_requests);
+                        writes.extend(file_requests);
                     }
                 }
             }
@@ -463,24 +444,24 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 // Replay all files from the beginning
                 for file_info in wal_files {
                     let file_requests = self.replay_file_from_offset(&file_info.path, 0)?;
-                    requests.extend(file_requests);
+                    writes.extend(file_requests);
                 }
             }
         }
 
-        info!(request_count = requests.len(), "WAL replay completed");
-        Ok(requests)
+        info!(request_count = writes.len(), "WAL replay completed");
+        Ok(writes)
     }
 
     /// Replay a single WAL file from a specific offset
-    fn replay_file_from_offset(&self, wal_path: &PathBuf, start_offset: usize) -> Result<Requests> {
+    fn replay_file_from_offset(&self, wal_path: &PathBuf, start_offset: usize) -> Result<Vec<WriteInfo>> {
         let mut file = File::open(wal_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
         let adjusted_offset = self.validate_start_offset(&buffer, start_offset, wal_path)?;
         let mut reader = WalEntryReader::from_offset(buffer, adjusted_offset);
-        let requests = Requests::new(vec![]);
+        let mut writes = Vec::new();
 
         info!(
             wal_file = %wal_path.display(),
@@ -493,7 +474,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 Ok((entry_data, _)) => {
                     match self.apply_wal_entry(&entry_data) {
                         Ok(Some(request)) => {
-                            requests.push(request);
+                            writes.push(request);
                         }
                         Ok(None) => {
                             // Entry processed but no request to return (e.g., snapshot marker)
@@ -516,11 +497,11 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
 
         debug!(
             wal_file = %wal_path.display(),
-            request_count = requests.len(),
+            request_count = writes.len(),
             "Completed WAL file replay"
         );
 
-        Ok(requests)
+        Ok(writes)
     }
 
     /// Validate and adjust start offset to entry boundary
@@ -562,11 +543,11 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
     }
 
     /// Apply a single WAL entry during replay
-    fn apply_wal_entry(&self, entry_data: &[u8]) -> Result<Option<qlib_rs::Request>> {
-        match bincode::deserialize::<qlib_rs::Request>(entry_data) {
+    fn apply_wal_entry(&self, entry_data: &[u8]) -> Result<Option<WriteInfo>> {
+        match bincode::deserialize::<WriteInfo>(entry_data) {
             Ok(request) => {
                 match &request {
-                    qlib_rs::Request::Snapshot { .. } => {
+                    WriteInfo::Snapshot { .. } => {
                         debug!("Found snapshot marker in WAL");
                         Ok(None) // Don't return snapshot markers as requests to apply
                     }
