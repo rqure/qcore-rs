@@ -12,9 +12,9 @@ use std::thread;
 use serde_json;
 
 use qlib_rs::{
-    EntityId, NotificationQueue, NotifyConfig, Store, Snapshot, PushCondition, StoreTrait,
-    EntityType, FieldType, Value, Timestamp, AdjustBehavior, EntitySchema, Single, FieldSchema,
-    PageOpts, PageResult, Requests
+    EntityId, NotificationQueue, NotifyConfig, Store, Snapshot, StoreTrait,
+    EntityType, FieldType, Value,
+    PageOpts, Requests
 };
 use qlib_rs::data::resp::{
     RespValue, RespCommand, RespEncode, RespDecode,
@@ -22,6 +22,7 @@ use qlib_rs::data::resp::{
     ReadResponse, PaginatedEntityResponse, PaginatedEntityTypeResponse,
     EntityListResponse, EntityTypeListResponse, BooleanResponse, IntegerResponse,
     StringResponse, CreateEntityResponse,
+    UpdateSchemaCommand, SetFieldSchemaCommand,
     // Peer protocol RESP commands
     PeerHandshakeCommand, FullSyncRequestCommand, FullSyncResponseCommand,
     SyncWriteCommand, NotificationCommand,
@@ -443,71 +444,170 @@ impl CoreService {
     fn handle_connection_read(&mut self, token: Token) -> Result<()> {
         let mut buffer = [0u8; 8192];
         
-        // Read data from the connection
-        let connection = self.connections.get_mut(&token)
-            .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
-        
         loop {
-            match connection.stream.read(&mut buffer) {
-                Ok(0) => {
-                    // Connection closed by peer
-                    return Err(anyhow::anyhow!("Connection closed by peer"));
+            let (bytes_read, should_continue) = {
+                let connection = self.connections.get_mut(&token)
+                    .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+                
+                match connection.stream.read(&mut buffer) {
+                    Ok(0) => {
+                        // Connection closed by peer
+                        return Err(anyhow::anyhow!("Connection closed by peer"));
+                    }
+                    Ok(n) => {
+                        // Append new data to the read buffer
+                        connection.read_buffer.extend_from_slice(&buffer[0..n]);
+                        (n, true)
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No more data available right now
+                        (0, false)
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Read error: {}", e));
+                    }
                 }
-                Ok(n) => {
-                    // Append new data to the read buffer
-                    connection.read_buffer.extend_from_slice(&buffer[0..n]);
+            };
+
+            // Process any complete commands after reading new data
+            if bytes_read > 0 {
+                let mut commands = Vec::new();
+                let mut total_consumed = 0;
+                
+                // Parse all complete commands from the buffer
+                {
+                    let connection = self.connections.get(&token)
+                        .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
                     
-                    // Try to parse and handle RESP commands from the buffer
-                    let mut processed_bytes = 0;
-                    
-                    // Create a separate scope to avoid borrowing issues
-                    let buffer_to_process = connection.read_buffer.clone();
-                    
-                    while processed_bytes < buffer_to_process.len() {
-                        match RespValue::decode(&buffer_to_process[processed_bytes..]) {
-                            Ok((resp_value, consumed)) => {
-                                let consumed_bytes = consumed.len();
-                                if consumed_bytes == 0 {
-                                    // Avoid infinite loop - if no bytes were consumed, break
-                                    break;
+                    let mut offset = 0;
+                    while offset < connection.read_buffer.len() {
+                        match RespValue::decode(&connection.read_buffer[offset..]) {
+                            Ok((resp_value, remaining)) => {
+                                let consumed = connection.read_buffer.len() - offset - remaining.len();
+                                if consumed == 0 {
+                                    break; // No progress, wait for more data
                                 }
-                                processed_bytes += consumed_bytes;
                                 
-                                // Handle the RESP command
-                                if let Err(e) = self.handle_resp_command(token, resp_value) {
-                                    error!("Error handling RESP command: {}", e);
-                                    // Send error response
-                                    let error_str = format!("Error: {}", e);
-                                    let error_response = RespValue::Error(&error_str);
-                                    self.send_resp_response(token, error_response)?;
-                                }
+                                // Convert to owned to avoid lifetime issues
+                                commands.push(resp_value.to_owned());
+                                offset += consumed;
+                                total_consumed += consumed;
                             }
-                            Err(_) => {
-                                // Incomplete message, wait for more data
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // Remove processed data from the buffer
-                    if processed_bytes > 0 {
-                        if let Some(conn) = self.connections.get_mut(&token) {
-                            conn.read_buffer.drain(0..processed_bytes);
+                            Err(_) => break, // Incomplete command
                         }
                     }
                 }
+                
+                // Remove processed data from the buffer
+                if total_consumed > 0 {
+                    if let Some(connection) = self.connections.get_mut(&token) {
+                        connection.read_buffer.drain(0..total_consumed);
+                    }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No more data available right now
-                    break;
+                
+                // Process all commands
+                for owned_command in commands {
+                    let resp_value = owned_command.to_borrowed();
+                    if let Err(e) = self.handle_resp_command(token, resp_value) {
+                        error!("Error handling RESP command: {}", e);
+                        let error_str = format!("Error: {}", e);
+                        let error_response = RespValue::Error(&error_str);
+                        self.send_resp_response(token, error_response)?;
+                    }
                 }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Read error: {}", e));
-                }
+            }
+            
+            if !should_continue {
+                break;
             }
         }
         
         Ok(())
+    }
+    
+    /// Process any complete commands in the connection buffer
+    fn process_buffered_commands(&mut self, token: Token) -> Result<()> {
+        loop {
+            // Check if we have a complete command and get it
+            let command_data = {
+                let connection = self.connections.get(&token)
+                    .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+                    
+                if connection.read_buffer.is_empty() {
+                    return Ok(());
+                }
+                
+                // Try to parse the command, but clone the buffer portion we need
+                match RespValue::decode(&connection.read_buffer) {
+                    Ok((resp_value, remaining)) => {
+                        let consumed = connection.read_buffer.len() - remaining.len();
+                        if consumed == 0 {
+                            return Ok(()); // No progress, wait for more data
+                        }
+                        
+                        // Convert to owned version to avoid lifetime issues
+                        let owned_command = match resp_value {
+                            RespValue::SimpleString(s) => qlib_rs::data::resp::OwnedRespValue::SimpleString(s.to_string()),
+                            RespValue::Error(s) => qlib_rs::data::resp::OwnedRespValue::Error(s.to_string()),
+                            RespValue::Integer(i) => qlib_rs::data::resp::OwnedRespValue::Integer(i),
+                            RespValue::BulkString(b) => qlib_rs::data::resp::OwnedRespValue::BulkString(b.to_vec()),
+                            RespValue::Array(arr) => {
+                                let owned_arr: Vec<qlib_rs::data::resp::OwnedRespValue> = arr.into_iter().map(|v| match v {
+                                    RespValue::SimpleString(s) => qlib_rs::data::resp::OwnedRespValue::SimpleString(s.to_string()),
+                                    RespValue::Error(s) => qlib_rs::data::resp::OwnedRespValue::Error(s.to_string()),
+                                    RespValue::Integer(i) => qlib_rs::data::resp::OwnedRespValue::Integer(i),
+                                    RespValue::BulkString(b) => qlib_rs::data::resp::OwnedRespValue::BulkString(b.to_vec()),
+                                    RespValue::Null => qlib_rs::data::resp::OwnedRespValue::Null,
+                                    _ => qlib_rs::data::resp::OwnedRespValue::SimpleString("".to_string()),
+                                }).collect();
+                                qlib_rs::data::resp::OwnedRespValue::Array(owned_arr)
+                            },
+                            RespValue::Null => qlib_rs::data::resp::OwnedRespValue::Null,
+                        };
+                        
+                        Some((owned_command, consumed))
+                    }
+                    Err(_) => None, // Incomplete command, wait for more data
+                }
+            };
+            
+            if let Some((owned_command, consumed_bytes)) = command_data {
+                // Remove consumed bytes from buffer
+                if let Some(connection) = self.connections.get_mut(&token) {
+                    connection.read_buffer.drain(0..consumed_bytes);
+                }
+                
+                // Convert back to borrowed form for processing
+                let resp_value = match &owned_command {
+                    qlib_rs::data::resp::OwnedRespValue::SimpleString(s) => RespValue::SimpleString(s),
+                    qlib_rs::data::resp::OwnedRespValue::Error(s) => RespValue::Error(s),
+                    qlib_rs::data::resp::OwnedRespValue::Integer(i) => RespValue::Integer(*i),
+                    qlib_rs::data::resp::OwnedRespValue::BulkString(b) => RespValue::BulkString(b),
+                    qlib_rs::data::resp::OwnedRespValue::Array(arr) => {
+                        let borrowed_arr: Vec<RespValue> = arr.iter().map(|v| match v {
+                            qlib_rs::data::resp::OwnedRespValue::SimpleString(s) => RespValue::SimpleString(s),
+                            qlib_rs::data::resp::OwnedRespValue::Error(s) => RespValue::Error(s),
+                            qlib_rs::data::resp::OwnedRespValue::Integer(i) => RespValue::Integer(*i),
+                            qlib_rs::data::resp::OwnedRespValue::BulkString(b) => RespValue::BulkString(b),
+                            qlib_rs::data::resp::OwnedRespValue::Array(_) => RespValue::Array(vec![]), // Nested arrays simplified
+                            qlib_rs::data::resp::OwnedRespValue::Null => RespValue::Null,
+                        }).collect();
+                        RespValue::Array(borrowed_arr)
+                    },
+                    qlib_rs::data::resp::OwnedRespValue::Null => RespValue::Null,
+                };
+                
+                // Process the command
+                if let Err(e) = self.handle_resp_command(token, resp_value) {
+                    error!("Error handling RESP command: {}", e);
+                    let error_str = format!("Error: {}", e);
+                    let error_response = RespValue::Error(&error_str);
+                    self.send_resp_response(token, error_response)?;
+                }
+            } else {
+                return Ok(()); // No complete command available
+            }
+        }
     }
 
     /// Handle a RESP command
@@ -907,20 +1007,16 @@ impl CoreService {
 
     /// Handle UPDATE_SCHEMA command
     fn handle_update_schema_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
-        if args.is_empty() {
-            return Err(anyhow::anyhow!("UPDATE_SCHEMA requires schema"));
-        }
-        
-        // Parse schema
-        let schema_bytes = match &args[0] {
-            RespValue::BulkString(s) => s,
-            _ => return Err(anyhow::anyhow!("Invalid schema format")),
-        };
-        let schema = EntitySchema::<Single, String, String>::decode(schema_bytes)
-            .map_err(|_| anyhow::anyhow!("Invalid schema encoding"))?;
+        // Decode the command using the UpdateSchemaCommand struct
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = UpdateSchemaCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode UPDATE_SCHEMA command: {}", e))?;
+
+        // Convert EntitySchemaResp back to EntitySchema<Single, String, String>
+        let schema_string = command.schema.to_entity_schema(&self.store)?;
         
         // Execute update schema
-        match self.store.update_schema(schema) {
+        match self.store.update_schema(schema_string) {
             Ok(_) => {
                 self.send_resp_response(token, RespValue::SimpleString("OK"))?;
             }
@@ -978,40 +1074,17 @@ impl CoreService {
 
     /// Handle SET_FIELD_SCHEMA command
     fn handle_set_field_schema_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
-        if args.len() < 3 {
-            return Err(anyhow::anyhow!("SET_FIELD_SCHEMA requires entity_type, field_type, and schema"));
-        }
-        
-        // Parse entity_type
-        let entity_type_str = match &args[0] {
-            RespValue::BulkString(s) => std::str::from_utf8(s)?,
-            RespValue::SimpleString(s) => s,
-            RespValue::Integer(i) => &i.to_string(),
-            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
-        };
-        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
-            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
-            
-        // Parse field_type
-        let field_type_str = match &args[1] {
-            RespValue::BulkString(s) => std::str::from_utf8(s)?,
-            RespValue::SimpleString(s) => s,
-            RespValue::Integer(i) => &i.to_string(),
-            _ => return Err(anyhow::anyhow!("Invalid field_type format")),
-        };
-        let field_type: FieldType = FieldType(field_type_str.parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("Invalid field_type"))?);
-            
-        // Parse field_schema
-        let schema_bytes = match &args[2] {
-            RespValue::BulkString(s) => s,
-            _ => return Err(anyhow::anyhow!("Invalid schema format")),
-        };
-        let field_schema = FieldSchema::decode(schema_bytes)
-            .map_err(|_| anyhow::anyhow!("Invalid field schema encoding"))?;
+        // Decode the command using the SetFieldSchemaCommand struct
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = SetFieldSchemaCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode SET_FIELD_SCHEMA command: {}", e))?;
+
+        // Convert FieldSchemaResp back to FieldSchema
+        let field_schema_string = command.schema.to_field_schema();
+        let field_schema = qlib_rs::FieldSchema::from_string_schema(field_schema_string, &self.store);
         
         // Execute set field schema
-        match self.store.set_field_schema(entity_type, field_type, field_schema) {
+        match self.store.set_field_schema(command.entity_type, command.field_type, field_schema) {
             Ok(_) => {
                 self.send_resp_response(token, RespValue::SimpleString("OK"))?;
             }
@@ -1546,7 +1619,7 @@ impl CoreService {
     }
 
     /// Handle notification RESP command (from other nodes)
-    fn handle_notification_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+    fn handle_notification_command(&mut self, _token: Token, args: &[RespValue]) -> Result<()> {
         let encoded = RespValue::Array(args.to_vec()).encode();
         let (command, _) = NotificationCommand::decode(&encoded)
             .map_err(|e| anyhow::anyhow!("Failed to decode NOTIFICATION command: {}", e))?;
@@ -1899,16 +1972,16 @@ impl CoreService {
     fn perform_requests(&mut self, requests: qlib_rs::Requests) {
         for request in requests.read().iter() {
             match request {
-                qlib_rs::Request::Read { entity_id, field_types, value, write_time, writer_id } => {
+                qlib_rs::Request::Read { entity_id, field_types, value, write_time: _write_time, writer_id: _writer_id } => {
                     // For read requests, we don't need to do anything as they don't modify the store
                     // But we should update the request with the result
-                    if let Some(value_ref) = value {
+                    if let Some(_value_ref) = value {
                         // The request already has a value, no need to re-read
                         continue;
                     }
                     
                     match self.store.read(*entity_id, field_types) {
-                        Ok((read_value, timestamp, writer)) => {
+                        Ok((_read_value, _timestamp, _writer)) => {
                             // Note: We can't modify the request here because Requests uses Arc<RwLock>
                             // The read result would need to be stored somewhere else
                             // For now, we'll just log that we processed the read
@@ -1919,8 +1992,8 @@ impl CoreService {
                         }
                     }
                 }
-                qlib_rs::Request::Write { entity_id, field_types, value, push_condition, adjust_behavior, write_time, writer_id, write_processed } => {
-                    match self.store.write(*entity_id, field_types, value.clone(), *writer_id, *write_time, *push_condition, *adjust_behavior) {
+                qlib_rs::Request::Write { entity_id, field_types, value, push_condition, adjust_behavior, write_time, writer_id, write_processed: _write_processed } => {
+                    match self.store.write(*entity_id, field_types, value.clone().unwrap_or(Value::String("".to_string())), *writer_id, *write_time, Some(push_condition.clone()), Some(adjust_behavior.clone())) {
                         Ok(_) => {
                             debug!("Processed write request for entity {:?}, field {:?}", entity_id, field_types);
                         }
@@ -1929,7 +2002,7 @@ impl CoreService {
                         }
                     }
                 }
-                qlib_rs::Request::Create { entity_type, parent_id, name, created_entity_id, timestamp } => {
+                qlib_rs::Request::Create { entity_type, parent_id, name, created_entity_id: _created_entity_id, timestamp: _timestamp } => {
                     match self.store.create_entity(*entity_type, *parent_id, name) {
                         Ok(entity_id) => {
                             debug!("Processed create request, created entity {:?}", entity_id);
@@ -1939,7 +2012,7 @@ impl CoreService {
                         }
                     }
                 }
-                qlib_rs::Request::Delete { entity_id, timestamp } => {
+                qlib_rs::Request::Delete { entity_id, timestamp: _timestamp } => {
                     match self.store.delete_entity(*entity_id) {
                         Ok(_) => {
                             debug!("Processed delete request for entity {:?}", entity_id);
@@ -1949,7 +2022,7 @@ impl CoreService {
                         }
                     }
                 }
-                qlib_rs::Request::SchemaUpdate { schema, timestamp } => {
+                qlib_rs::Request::SchemaUpdate { schema, timestamp: _timestamp } => {
                     match self.store.update_schema(schema.clone()) {
                         Ok(_) => {
                             debug!("Processed schema update request");
@@ -1959,45 +2032,45 @@ impl CoreService {
                         }
                     }
                 }
-                qlib_rs::Request::Snapshot { snapshot_counter, timestamp } => {
+                qlib_rs::Request::Snapshot { snapshot_counter: _snapshot_counter, timestamp: _timestamp } => {
                     // Snapshot requests don't modify the store, they're just markers
                     debug!("Processed snapshot marker request");
                 }
-                qlib_rs::Request::GetEntityType { name, entity_type } => {
+                qlib_rs::Request::GetEntityType { name: _name, entity_type: _entity_type } => {
                     // These are read-only operations, no store modification needed
                     debug!("Processed get entity type request");
                 }
-                qlib_rs::Request::ResolveEntityType { entity_type, name } => {
+                qlib_rs::Request::ResolveEntityType { entity_type: _entity_type, name: _name } => {
                     debug!("Processed resolve entity type request");
                 }
-                qlib_rs::Request::GetFieldType { name, field_type } => {
+                qlib_rs::Request::GetFieldType { name: _name, field_type: _field_type } => {
                     debug!("Processed get field type request");
                 }
-                qlib_rs::Request::ResolveFieldType { field_type, name } => {
+                qlib_rs::Request::ResolveFieldType { field_type: _field_type, name: _name } => {
                     debug!("Processed resolve field type request");
                 }
-                qlib_rs::Request::GetEntitySchema { entity_type, schema } => {
+                qlib_rs::Request::GetEntitySchema { entity_type: _entity_type, schema: _schema } => {
                     debug!("Processed get entity schema request");
                 }
-                qlib_rs::Request::GetCompleteEntitySchema { entity_type, schema } => {
+                qlib_rs::Request::GetCompleteEntitySchema { entity_type: _entity_type, schema: _schema } => {
                     debug!("Processed get complete entity schema request");
                 }
-                qlib_rs::Request::GetFieldSchema { entity_type, field_type, schema } => {
+                qlib_rs::Request::GetFieldSchema { entity_type: _entity_type, field_type: _field_type, schema: _schema } => {
                     debug!("Processed get field schema request");
                 }
-                qlib_rs::Request::EntityExists { entity_id, exists } => {
+                qlib_rs::Request::EntityExists { entity_id: _entity_id, exists: _exists } => {
                     debug!("Processed entity exists request");
                 }
-                qlib_rs::Request::FieldExists { entity_type, field_type, exists } => {
+                qlib_rs::Request::FieldExists { entity_type: _entity_type, field_type: _field_type, exists: _exists } => {
                     debug!("Processed field exists request");
                 }
-                qlib_rs::Request::FindEntities { entity_type, page_opts, filter, result } => {
+                qlib_rs::Request::FindEntities { entity_type: _entity_type, page_opts: _page_opts, filter: _filter, result: _result } => {
                     debug!("Processed find entities request");
                 }
-                qlib_rs::Request::FindEntitiesExact { entity_type, page_opts, filter, result } => {
+                qlib_rs::Request::FindEntitiesExact { entity_type: _entity_type, page_opts: _page_opts, filter: _filter, result: _result } => {
                     debug!("Processed find entities exact request");
                 }
-                qlib_rs::Request::GetEntityTypes { page_opts, result } => {
+                qlib_rs::Request::GetEntityTypes { page_opts: _page_opts, result: _result } => {
                     debug!("Processed get entity types request");
                 }
             }
@@ -2147,31 +2220,20 @@ impl CoreService {
     
     /// Process notifications for all connections
     fn process_notifications(&mut self) {
-        let mut tokens_to_remove = Vec::new();
-        let mut messages_to_send = Vec::new();
+        let mut notifications_to_send = Vec::new();
         
-        // Collect notifications and prepare messages for sending
+        // Collect notifications that need to be sent
         for (token, connection) in &mut self.connections {
-            // Send notifications immediately as they arrive
             while let Some(notification) = connection.notification_queue.pop() {
-                let notification_msg = StoreMessage::Notification { notification };
-                messages_to_send.push((*token, notification_msg));
+                notifications_to_send.push((*token, notification, connection.addr_string.clone()));
             }
         }
         
-        // Send all notifications
-        for (token, notification_msg) in messages_to_send {
-            if let Err(e) = self.send_response(token, notification_msg) {
-                if let Some(connection) = self.connections.get(&token) {
-                    error!("Failed to send notification to {}: {}", connection.addr_string, e);
-                }
-                tokens_to_remove.push(token);
+        // Send all collected notifications
+        for (token, notification, addr_string) in notifications_to_send {
+            if let Err(e) = self.send_notification(token, &notification) {
+                error!("Failed to send notification to {}: {}", addr_string, e);
             }
-        }
-        
-        // Remove connections that failed to receive notifications
-        for token in tokens_to_remove {
-            self.remove_connection(token);
         }
     }
 
