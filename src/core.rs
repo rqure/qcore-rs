@@ -5,16 +5,28 @@ use ahash::AHashMap;
 use crossbeam::channel::Sender;
 use mio::{Poll, Interest, Token, Events, event::Event};
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use qlib_rs::{schoice, sfield, sreq, sread, swrite, Requests, PushCondition};
 use rustc_hash::FxHashMap;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 use std::thread;
+use serde_json;
+
 use qlib_rs::{
-    StoreMessage, EntityId, NotificationQueue, NotifyConfig,
-    Store, Snapshot
+    EntityId, NotificationQueue, NotifyConfig, Store, Snapshot, PushCondition, StoreTrait,
+    EntityType, FieldType, Value, Timestamp, AdjustBehavior, EntitySchema, Single, FieldSchema,
+    PageOpts, PageResult, Requests
 };
-use qlib_rs::protocol::{ProtocolMessage, ProtocolCodec, MessageBuffer, PeerMessage};
+use qlib_rs::data::resp::{
+    RespValue, RespCommand, RespEncode, RespDecode,
+    ReadCommand, WriteCommand, CreateEntityCommand, DeleteEntityCommand,
+    ReadResponse, PaginatedEntityResponse, PaginatedEntityTypeResponse,
+    EntityListResponse, EntityTypeListResponse, BooleanResponse, IntegerResponse,
+    StringResponse, CreateEntityResponse,
+    // Peer protocol RESP commands
+    PeerHandshakeCommand, FullSyncRequestCommand, FullSyncResponseCommand,
+    SyncWriteCommand, NotificationCommand,
+};
+use qlib_rs::data::entity_schema::{EntitySchemaResp, FieldSchemaResp};
 
 use crate::snapshot::SnapshotHandle;
 use crate::wal::WalHandle;
@@ -48,9 +60,6 @@ impl From<&crate::Config> for CoreConfig {
 /// Core service request types
 #[derive(Debug)]
 pub enum CoreCommand {
-    Perform {
-        requests: Requests,
-    },
     TakeSnapshot,
     RestoreSnapshot {
         snapshot: Snapshot,
@@ -68,6 +77,9 @@ pub enum CoreCommand {
     GetPeers {
         respond_to: Sender<AHashMap<String, (Option<Token>, Option<EntityId>)>>,
     },
+    PerformRequests {
+        requests: qlib_rs::Requests,
+    },
 }
 
 /// Handle for communicating with core service
@@ -77,10 +89,6 @@ pub struct CoreHandle {
 }
 
 impl CoreHandle {
-    pub fn perform(&self, requests: Requests) {
-        self.sender.send(CoreCommand::Perform { requests }).unwrap();
-    }
-
     pub fn take_snapshot(&self) {
         self.sender.send(CoreCommand::TakeSnapshot).unwrap();
     }
@@ -105,6 +113,10 @@ impl CoreHandle {
         let (resp_sender, resp_receiver) = crossbeam::channel::bounded(1);
         self.sender.send(CoreCommand::GetPeers { respond_to: resp_sender }).unwrap();
         resp_receiver.recv().unwrap_or_default()
+    }
+
+    pub fn perform(&self, requests: qlib_rs::Requests) {
+        self.sender.send(CoreCommand::PerformRequests { requests }).unwrap();
     }
 }
 
@@ -135,7 +147,7 @@ struct Connection {
     notification_queue: NotificationQueue,
     notification_configs: HashSet<NotifyConfig>,
     outbound_messages: VecDeque<Vec<u8>>,
-    message_buffer: MessageBuffer,
+    read_buffer: Vec<u8>,
 }
 
 /// Core service that handles both client and peer connections
@@ -271,52 +283,11 @@ impl CoreService {
                 // Process pending notifications for all connections
                 service.process_notifications();
 
-                // Drain the write queue from the store
-                while let Some(requests) = service.store.write_queue.pop_front() {
-                    debug!("Processing write queue with {} requests", requests.len());
-                    // Set the originator to our candidate entity ID only if it wasn't already set
-                    let we_are_originator = if requests.originator().is_none() {
-                        requests.set_originator(service.candidate_entity_id);
-                        true
-                    } else {
-                        // Check if we are the originator
-                        requests.originator() == service.candidate_entity_id
-                    };
-                    
-                    // Send to WAL
-                    if let Some(wal_handle) = &service.wal_handle {
-                        wal_handle.append_requests(requests.clone());
-                    }
-                    
-                    // Only send SyncWrite message to peers if we are the originator
-                    if we_are_originator {
-                        let sync_write_msg = qlib_rs::protocol::ProtocolMessage::Peer(
-                            qlib_rs::protocol::PeerMessage::SyncWrite { 
-                                requests: requests.clone() 
-                            }
-                        );
-                        
-                        // Send to all peer connections
-                        // Collect peer tokens first to avoid borrowing issues
-                        let peer_tokens: Vec<_> = service.peers.values()
-                            .filter_map(|peer_info| peer_info.token)
-                            .collect();
-                        
-                        let mut tokens_to_remove = Vec::new();
-                        for token in peer_tokens {
-                            if let Err(e) = service.send_protocol_message(token, sync_write_msg.clone()) {
-                                warn!("Failed to send SyncWrite to peer: {}", e);
-                                tokens_to_remove.push(token);
-                            }
-                        }
-                        
-                        // Remove failed peer connections
-                        for token in tokens_to_remove {
-                            service.remove_connection(token);
-                        }
-                    } else {
-                        debug!("Not sending SyncWrite to peers as we are not the originator");
-                    }
+                // Drain the write queue from the store (WriteInfo items for internal tracking)
+                while let Some(_write_info) = service.store.write_queue.pop_front() {
+                    // WriteInfo items are internal store operations for tracking changes
+                    // They don't need peer sync as that happens at the request level
+                    // The actual peer synchronization is handled when requests are processed
                 }
             }
         });
@@ -408,7 +379,7 @@ impl CoreService {
                     notification_queue: NotificationQueue::new(),
                     notification_configs: HashSet::new(),
                     outbound_messages: VecDeque::new(),
-                    message_buffer: MessageBuffer::new(),
+                    read_buffer: Vec::with_capacity(8192),
                 };                    self.connections.insert(token, connection);
                     debug!("Connection {} registered with token {:?}", addr, token);
                 }
@@ -471,42 +442,1123 @@ impl CoreService {
     /// Handle reading data from a connection
     fn handle_connection_read(&mut self, token: Token) -> Result<()> {
         let mut buffer = [0u8; 8192];
-        let mut messages_to_process = Vec::new();
         
-        // First, read data and decode messages
-        {
-            let connection = self.connections.get_mut(&token)
-                .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
-            
-            loop {
-                match connection.stream.read(&mut buffer) {
-                    Ok(0) => {
-                        // Connection closed by peer
-                        return Err(anyhow::anyhow!("Connection closed by peer"));
-                    }
-                    Ok(n) => {
-                        connection.message_buffer.add_data(&buffer[0..n]);
-                        
-                        // Try to decode messages
-                        while let Some(message) = connection.message_buffer.try_decode()? {
-                            messages_to_process.push(message);
+        // Read data from the connection
+        let connection = self.connections.get_mut(&token)
+            .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+        
+        loop {
+            match connection.stream.read(&mut buffer) {
+                Ok(0) => {
+                    // Connection closed by peer
+                    return Err(anyhow::anyhow!("Connection closed by peer"));
+                }
+                Ok(n) => {
+                    // Append new data to the read buffer
+                    connection.read_buffer.extend_from_slice(&buffer[0..n]);
+                    
+                    // Try to parse and handle RESP commands from the buffer
+                    let mut processed_bytes = 0;
+                    
+                    // Create a separate scope to avoid borrowing issues
+                    let buffer_to_process = connection.read_buffer.clone();
+                    
+                    while processed_bytes < buffer_to_process.len() {
+                        match RespValue::decode(&buffer_to_process[processed_bytes..]) {
+                            Ok((resp_value, consumed)) => {
+                                let consumed_bytes = consumed.len();
+                                if consumed_bytes == 0 {
+                                    // Avoid infinite loop - if no bytes were consumed, break
+                                    break;
+                                }
+                                processed_bytes += consumed_bytes;
+                                
+                                // Handle the RESP command
+                                if let Err(e) = self.handle_resp_command(token, resp_value) {
+                                    error!("Error handling RESP command: {}", e);
+                                    // Send error response
+                                    let error_str = format!("Error: {}", e);
+                                    let error_response = RespValue::Error(&error_str);
+                                    self.send_resp_response(token, error_response)?;
+                                }
+                            }
+                            Err(_) => {
+                                // Incomplete message, wait for more data
+                                break;
+                            }
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No more data available right now
-                        break;
+                    
+                    // Remove processed data from the buffer
+                    if processed_bytes > 0 {
+                        if let Some(conn) = self.connections.get_mut(&token) {
+                            conn.read_buffer.drain(0..processed_bytes);
+                        }
                     }
-                    Err(e) => {
-                        return Err(anyhow::anyhow!("Read error: {}", e));
-                    }
+                }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No more data available right now
+                    break;
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Read error: {}", e));
                 }
             }
         }
         
-        // Now process all decoded messages
-        for message in messages_to_process {
-            self.handle_protocol_message(token, message)?;
+        Ok(())
+    }
+
+    /// Handle a RESP command
+    fn handle_resp_command(&mut self, token: Token, resp_value: RespValue) -> Result<()> {
+        // Expect an array representing a command
+        if let RespValue::Array(args) = resp_value {
+            if args.is_empty() {
+                return Err(anyhow::anyhow!("Empty command"));
+            }
+            
+            // First element should be the command name
+            let cmd_name = match &args[0] {
+                RespValue::BulkString(name) => std::str::from_utf8(name)?,
+                RespValue::SimpleString(name) => name,
+                _ => return Err(anyhow::anyhow!("Command name must be a string")),
+            };
+            
+            // Handle different commands
+            match cmd_name.to_uppercase().as_str() {
+                "READ" => self.handle_read_command(token, &args[1..])?,
+                "WRITE" => self.handle_write_command(token, &args[1..])?,
+                "CREATE_ENTITY" => self.handle_create_entity_command(token, &args[1..])?,
+                "DELETE_ENTITY" => self.handle_delete_entity_command(token, &args[1..])?,
+                "GET_ENTITY_TYPE" => self.handle_get_entity_type_command(token, &args[1..])?,
+                "RESOLVE_ENTITY_TYPE" => self.handle_resolve_entity_type_command(token, &args[1..])?,
+                "GET_FIELD_TYPE" => self.handle_get_field_type_command(token, &args[1..])?,
+                "RESOLVE_FIELD_TYPE" => self.handle_resolve_field_type_command(token, &args[1..])?,
+                "GET_ENTITY_SCHEMA" => self.handle_get_entity_schema_command(token, &args[1..])?,
+                "UPDATE_SCHEMA" => self.handle_update_schema_command(token, &args[1..])?,
+                "GET_FIELD_SCHEMA" => self.handle_get_field_schema_command(token, &args[1..])?,
+                "SET_FIELD_SCHEMA" => self.handle_set_field_schema_command(token, &args[1..])?,
+                "FIND_ENTITIES" => self.handle_find_entities_command(token, &args[1..])?,
+                "FIND_ENTITIES_EXACT" => self.handle_find_entities_exact_command(token, &args[1..])?,
+                "FIND_ENTITIES_PAGINATED" => self.handle_find_entities_paginated_command(token, &args[1..])?,
+                "GET_ENTITY_TYPES" => self.handle_get_entity_types_command(token, &args[1..])?,
+                "GET_ENTITY_TYPES_PAGINATED" => self.handle_get_entity_types_paginated_command(token, &args[1..])?,
+                "ENTITY_EXISTS" => self.handle_entity_exists_command(token, &args[1..])?,
+                "FIELD_EXISTS" => self.handle_field_exists_command(token, &args[1..])?,
+                "RESOLVE_INDIRECTION" => self.handle_resolve_indirection_command(token, &args[1..])?,
+                "TAKE_SNAPSHOT" => self.handle_take_snapshot_command(token, &args[1..])?,
+                "REGISTER_NOTIFICATION" => self.handle_register_notification_command(token, &args[1..])?,
+                "UNREGISTER_NOTIFICATION" => self.handle_unregister_notification_command(token, &args[1..])?,
+                // Peer protocol commands
+                "PEER_HANDSHAKE" => self.handle_peer_handshake_command(token, &args[1..])?,
+                "FULL_SYNC_REQUEST" => self.handle_peer_full_sync_request_command(token, &args[1..])?,
+                "FULL_SYNC_RESPONSE" => self.handle_peer_full_sync_response_command(token, &args[1..])?,
+                "SYNC_WRITE" => self.handle_peer_sync_write_command(token, &args[1..])?,
+                "NOTIFICATION" => self.handle_notification_command(token, &args[1..])?,
+                _ => {
+                    let error_str = format!("Unknown command: {}", cmd_name);
+                    self.send_resp_response(token, RespValue::Error(&error_str))?;
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Expected array for command"));
         }
+        
+        Ok(())
+    }
+    
+    
+    /// Send a RESP command to a peer connection
+    fn send_peer_command<T: RespCommand<'static>>(&mut self, token: Token, command: &T) -> Result<()> {
+        let encoded = command.encode();
+        
+        if let Some(connection) = self.connections.get_mut(&token) {
+            connection.outbound_messages.push_back(encoded);
+            
+            // Register for write events if we have messages to send
+            self.poll.registry().reregister(
+                &mut connection.stream,
+                token,
+                Interest::READABLE | Interest::WRITABLE
+            )?;
+        }
+        
+        Ok(())
+    }
+
+    /// Send a response message to a client connection
+    fn send_response<T: RespEncode>(&mut self, token: Token, response: &T) -> Result<()> {
+        let encoded = response.encode();
+        
+        if let Some(connection) = self.connections.get_mut(&token) {
+            connection.outbound_messages.push_back(encoded);
+            
+            // Register for write events if we have messages to send
+            self.poll.registry().reregister(
+                &mut connection.stream,
+                token,
+                Interest::READABLE | Interest::WRITABLE
+            )?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Send a notification message to a client connection
+    fn send_notification(&mut self, token: Token, notification: &qlib_rs::Notification) -> Result<()> {
+        let notification_json = serde_json::to_string(notification)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize notification: {}", e))?;
+        
+        let command = NotificationCommand {
+            notification_data: notification_json,
+            _marker: std::marker::PhantomData,
+        };
+        
+        self.send_response(token, &command)
+    }
+    
+    /// Send a raw RESP response to a connection
+    fn send_resp_response(&mut self, token: Token, response: RespValue) -> Result<()> {
+        let encoded = response.encode();
+        
+        if let Some(connection) = self.connections.get_mut(&token) {
+            connection.outbound_messages.push_back(encoded);
+            
+            // Register for write events if we have messages to send
+            self.poll.registry().reregister(
+                &mut connection.stream,
+                token,
+                Interest::READABLE | Interest::WRITABLE
+            )?;
+        }
+        
+        Ok(())
+    }
+
+    /// Handle READ command
+    fn handle_read_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        // Decode the command using the ReadCommand struct
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = ReadCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode READ command: {}", e))?;
+
+        // Execute read
+        match self.store.read(command.entity_id, &command.field_path) {
+            Ok((value, timestamp, writer_id)) => {
+                let response_struct = ReadResponse {
+                    value,
+                    timestamp,
+                    writer_id,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Read error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle WRITE command  
+    fn handle_write_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        // Decode the command using the WriteCommand struct
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = WriteCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode WRITE command: {}", e))?;
+
+        // Execute write
+        match self.store.write(command.entity_id, &command.field_path, command.value, command.writer_id, command.write_time, command.push_condition, command.adjust_behavior) {
+            Ok(_) => {
+                self.send_resp_response(token, RespValue::SimpleString("OK"))?;
+            }
+            Err(e) => {
+                let error_str = format!("Write error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle CREATE_ENTITY command
+    fn handle_create_entity_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        // Decode the command using the CreateEntityCommand struct
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = CreateEntityCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode CREATE_ENTITY command: {}", e))?;
+
+        // Execute create entity
+        match self.store.create_entity(command.entity_type, command.parent_id, &command.name) {
+            Ok(entity_id) => {
+                let response_struct = CreateEntityResponse {
+                    entity_id,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Create entity error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle DELETE_ENTITY command
+    fn handle_delete_entity_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        // Decode the command using the DeleteEntityCommand struct
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = DeleteEntityCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode DELETE_ENTITY command: {}", e))?;
+
+        // Execute delete entity
+        match self.store.delete_entity(command.entity_id) {
+            Ok(_) => {
+                self.send_resp_response(token, RespValue::SimpleString("OK"))?;
+            }
+            Err(e) => {
+                let error_str = format!("Delete entity error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle GET_ENTITY_TYPE command
+    fn handle_get_entity_type_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("GET_ENTITY_TYPE requires name"));
+        }
+        
+        // Parse name
+        let name = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid name format")),
+        };
+        
+        // Execute get entity type
+        match self.store.get_entity_type(name) {
+            Ok(entity_type) => {
+                let response_struct = IntegerResponse {
+                    value: entity_type.0 as i64,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Get entity type error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle RESOLVE_ENTITY_TYPE command
+    fn handle_resolve_entity_type_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("RESOLVE_ENTITY_TYPE requires entity_type"));
+        }
+        
+        // Parse entity_type
+        let entity_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+        };
+        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+        
+        // Execute resolve entity type
+        match self.store.resolve_entity_type(entity_type) {
+            Ok(name) => {
+                let response_struct = StringResponse {
+                    value: name,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Resolve entity type error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle GET_FIELD_TYPE command
+    fn handle_get_field_type_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("GET_FIELD_TYPE requires name"));
+        }
+        
+        // Parse name
+        let name = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid name format")),
+        };
+        
+        // Execute get field type
+        match self.store.get_field_type(name) {
+            Ok(field_type) => {
+                let response_struct = IntegerResponse {
+                    value: field_type.0 as i64,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Get field type error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle RESOLVE_FIELD_TYPE command
+    fn handle_resolve_field_type_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("RESOLVE_FIELD_TYPE requires field_type"));
+        }
+        
+        // Parse field_type
+        let field_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid field_type format")),
+        };
+        let field_type: FieldType = FieldType(field_type_str.parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("Invalid field_type"))?);
+        
+        // Execute resolve field type
+        match self.store.resolve_field_type(field_type) {
+            Ok(name) => {
+                let response_struct = StringResponse {
+                    value: name,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Resolve field type error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle GET_ENTITY_SCHEMA command
+    fn handle_get_entity_schema_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("GET_ENTITY_SCHEMA requires entity_type"));
+        }
+        
+        // Parse entity_type
+        let entity_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+        };
+        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+        
+        // Execute get entity schema
+        match self.store.get_entity_schema(entity_type) {
+            Ok(schema) => {
+                let schema_resp = EntitySchemaResp::from_entity_schema(&schema, &self.store);
+                let encoded_schema = schema_resp.encode();
+                let response = RespValue::BulkString(&encoded_schema);
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Get entity schema error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle UPDATE_SCHEMA command
+    fn handle_update_schema_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("UPDATE_SCHEMA requires schema"));
+        }
+        
+        // Parse schema
+        let schema_bytes = match &args[0] {
+            RespValue::BulkString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid schema format")),
+        };
+        let schema = EntitySchema::<Single, String, String>::decode(schema_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid schema encoding"))?;
+        
+        // Execute update schema
+        match self.store.update_schema(schema) {
+            Ok(_) => {
+                self.send_resp_response(token, RespValue::SimpleString("OK"))?;
+            }
+            Err(e) => {
+                let error_str = format!("Update schema error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle GET_FIELD_SCHEMA command
+    fn handle_get_field_schema_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.len() < 2 {
+            return Err(anyhow::anyhow!("GET_FIELD_SCHEMA requires entity_type and field_type"));
+        }
+        
+        // Parse entity_type
+        let entity_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+        };
+        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+            
+        // Parse field_type
+        let field_type_str = match &args[1] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid field_type format")),
+        };
+        let field_type: FieldType = FieldType(field_type_str.parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("Invalid field_type"))?);
+        
+        // Execute get field schema
+        match self.store.get_field_schema(entity_type, field_type) {
+            Ok(field_schema) => {
+                let field_schema_resp = FieldSchemaResp::from_field_schema(&field_schema, &self.store);
+                let encoded_schema = field_schema_resp.encode();
+                let response = RespValue::BulkString(&encoded_schema);
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Get field schema error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle SET_FIELD_SCHEMA command
+    fn handle_set_field_schema_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.len() < 3 {
+            return Err(anyhow::anyhow!("SET_FIELD_SCHEMA requires entity_type, field_type, and schema"));
+        }
+        
+        // Parse entity_type
+        let entity_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+        };
+        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+            
+        // Parse field_type
+        let field_type_str = match &args[1] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid field_type format")),
+        };
+        let field_type: FieldType = FieldType(field_type_str.parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("Invalid field_type"))?);
+            
+        // Parse field_schema
+        let schema_bytes = match &args[2] {
+            RespValue::BulkString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid schema format")),
+        };
+        let field_schema = FieldSchema::decode(schema_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid field schema encoding"))?;
+        
+        // Execute set field schema
+        match self.store.set_field_schema(entity_type, field_type, field_schema) {
+            Ok(_) => {
+                self.send_resp_response(token, RespValue::SimpleString("OK"))?;
+            }
+            Err(e) => {
+                let error_str = format!("Set field schema error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle RESOLVE_INDIRECTION command
+    fn handle_resolve_indirection_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.len() < 2 {
+            return Err(anyhow::anyhow!("RESOLVE_INDIRECTION requires entity_id and field_path"));
+        }
+        
+        // Parse entity_id
+        let entity_id_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid entity_id format")),
+        };
+        let entity_id: EntityId = EntityId(entity_id_str.parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_id"))?);
+            
+        // Parse field_path
+        let field_path_str = match &args[1] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid field_path format")),
+        };
+        
+        let field_path: Vec<FieldType> = if field_path_str.is_empty() {
+            vec![]
+        } else {
+            field_path_str.split(',')
+                .map(|s| s.trim().parse::<u64>().map(|v| FieldType(v)))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| anyhow::anyhow!("Invalid field_path"))?
+        };
+        
+        // Execute resolve indirection
+        match self.store.resolve_indirection(entity_id, &field_path) {
+            Ok((resolved_entity_id, resolved_field_type)) => {
+                let entity_id_bytes = format!("{}", resolved_entity_id.0).into_bytes();
+                let response = RespValue::Array(vec![
+                    RespValue::BulkString(&entity_id_bytes),
+                    RespValue::Integer(resolved_field_type.0 as i64),
+                ]);
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Resolve indirection error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle FIELD_EXISTS command
+    fn handle_field_exists_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.len() < 2 {
+            return Err(anyhow::anyhow!("FIELD_EXISTS requires entity_type and field_type"));
+        }
+        
+        // Parse entity_type
+        let entity_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+        };
+        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+            
+        // Parse field_type
+        let field_type_str = match &args[1] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid field_type format")),
+        };
+        let field_type: FieldType = FieldType(field_type_str.parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("Invalid field_type"))?);
+        
+        // Execute field exists check
+        let exists = self.store.field_exists(entity_type, field_type);
+        let response_struct = BooleanResponse {
+            result: exists,
+        };
+        let response_bytes = response_struct.encode();
+        let (response, _) = RespValue::decode(&response_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+        self.send_resp_response(token, response)?;
+        
+        Ok(())
+    }
+
+    /// Handle FIND_ENTITIES_EXACT command
+    fn handle_find_entities_exact_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("FIND_ENTITIES_EXACT requires entity_type"));
+        }
+        
+        // Parse entity_type
+        let entity_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+        };
+        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+        
+        // Parse optional pagination options and filter
+        let page_opts = if args.len() > 1 {
+            match &args[1] {
+                RespValue::BulkString(s) => {
+                    let opts_str = std::str::from_utf8(s)?;
+                    if opts_str == "null" || opts_str.is_empty() {
+                        None
+                    } else {
+                        // Simple format: "limit,cursor" or just "limit"
+                        let parts: Vec<&str> = opts_str.split(',').collect();
+                        let limit = parts[0].parse::<usize>().unwrap_or(100);
+                        let cursor = if parts.len() > 1 { 
+                            Some(parts[1].parse::<usize>().unwrap_or(0))
+                        } else {
+                            None
+                        };
+                        Some(PageOpts::new(limit, cursor))
+                    }
+                }
+                RespValue::Null => None,
+                _ => return Err(anyhow::anyhow!("Invalid page_opts format")),
+            }
+        } else {
+            None
+        };
+        
+        let filter = if args.len() > 2 {
+            match &args[2] {
+                RespValue::BulkString(s) => {
+                    let filter_str = std::str::from_utf8(s)?;
+                    if filter_str == "null" || filter_str.is_empty() {
+                        None
+                    } else {
+                        Some(filter_str)
+                    }
+                }
+                RespValue::Null => None,
+                _ => return Err(anyhow::anyhow!("Invalid filter format")),
+            }
+        } else {
+            None
+        };
+        
+        // Execute find entities exact
+        match self.store.find_entities_exact(entity_type, page_opts.as_ref(), filter) {
+            Ok(page_result) => {
+                let response_struct = PaginatedEntityResponse {
+                    items: page_result.items,
+                    total: page_result.total,
+                    next_cursor: page_result.next_cursor,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Find entities exact error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle GET_ENTITY_TYPES command
+    fn handle_get_entity_types_command(&mut self, token: Token, _args: &[RespValue]) -> Result<()> {
+        // Execute get entity types
+        match self.store.get_entity_types() {
+            Ok(entity_types) => {
+                let response_struct = EntityTypeListResponse {
+                    entity_types,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Get entity types error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle GET_ENTITY_TYPES_PAGINATED command
+    fn handle_get_entity_types_paginated_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        // Parse optional pagination options
+        let page_opts = if !args.is_empty() {
+            match &args[0] {
+                RespValue::BulkString(s) => {
+                    let opts_str = std::str::from_utf8(s)?;
+                    if opts_str == "null" || opts_str.is_empty() {
+                        None
+                    } else {
+                        // Simple format: "limit,cursor" or just "limit"
+                        let parts: Vec<&str> = opts_str.split(',').collect();
+                        let limit = parts[0].parse::<usize>().unwrap_or(100);
+                        let cursor = if parts.len() > 1 { 
+                            Some(parts[1].parse::<usize>().unwrap_or(0))
+                        } else {
+                            None
+                        };
+                        Some(PageOpts::new(limit, cursor))
+                    }
+                }
+                RespValue::Null => None,
+                _ => return Err(anyhow::anyhow!("Invalid page_opts format")),
+            }
+        } else {
+            None
+        };
+        
+        // Execute get entity types paginated
+        match self.store.get_entity_types_paginated(page_opts.as_ref()) {
+            Ok(page_result) => {
+                let response_struct = PaginatedEntityTypeResponse {
+                    items: page_result.items,
+                    total: page_result.total,
+                    next_cursor: page_result.next_cursor,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Get entity types paginated error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle FIND_ENTITIES command
+    fn handle_find_entities_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("FIND_ENTITIES requires entity_type"));
+        }
+        
+        // Parse entity_type
+        let entity_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+        };
+        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+        
+        // Parse optional filter
+        let filter = if args.len() > 1 {
+            match &args[1] {
+                RespValue::BulkString(s) => {
+                    let filter_str = std::str::from_utf8(s)?;
+                    if filter_str == "null" || filter_str.is_empty() {
+                        None
+                    } else {
+                        Some(filter_str)
+                    }
+                }
+                RespValue::Null => None,
+                _ => return Err(anyhow::anyhow!("Invalid filter format")),
+            }
+        } else {
+            None
+        };
+        
+        // Execute find entities
+        match self.store.find_entities(entity_type, filter) {
+            Ok(entities) => {
+                let response_struct = EntityListResponse {
+                    entities,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Find entities error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle FIND_ENTITIES_PAGINATED command
+    fn handle_find_entities_paginated_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("FIND_ENTITIES_PAGINATED requires entity_type"));
+        }
+        
+        // Parse entity_type
+        let entity_type_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            RespValue::Integer(i) => &i.to_string(),
+            _ => return Err(anyhow::anyhow!("Invalid entity_type format")),
+        };
+        let entity_type: EntityType = EntityType(entity_type_str.parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_type"))?);
+        
+        // Parse optional pagination options and filter
+        let page_opts = if args.len() > 1 {
+            match &args[1] {
+                RespValue::BulkString(s) => {
+                    let opts_str = std::str::from_utf8(s)?;
+                    if opts_str == "null" || opts_str.is_empty() {
+                        None
+                    } else {
+                        // Simple format: "limit,cursor" or just "limit"
+                        let parts: Vec<&str> = opts_str.split(',').collect();
+                        let limit = parts[0].parse::<usize>().unwrap_or(100);
+                        let cursor = if parts.len() > 1 { 
+                            Some(parts[1].parse::<usize>().unwrap_or(0))
+                        } else {
+                            None
+                        };
+                        Some(qlib_rs::PageOpts::new(limit, cursor))
+                    }
+                }
+                RespValue::Null => None,
+                _ => return Err(anyhow::anyhow!("Invalid page_opts format")),
+            }
+        } else {
+            None
+        };
+        
+        let filter = if args.len() > 2 {
+            match &args[2] {
+                RespValue::BulkString(s) => {
+                    let filter_str = std::str::from_utf8(s)?;
+                    if filter_str == "null" || filter_str.is_empty() {
+                        None
+                    } else {
+                        Some(filter_str)
+                    }
+                }
+                RespValue::Null => None,
+                _ => return Err(anyhow::anyhow!("Invalid filter format")),
+            }
+        } else {
+            None
+        };
+        
+        // Execute find entities paginated
+        match self.store.find_entities_paginated(entity_type, page_opts.as_ref(), filter) {
+            Ok(page_result) => {
+                let response_struct = PaginatedEntityResponse {
+                    items: page_result.items,
+                    total: page_result.total,
+                    next_cursor: page_result.next_cursor,
+                };
+                let response_bytes = response_struct.encode();
+                let (response, _) = RespValue::decode(&response_bytes)
+                    .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+                self.send_resp_response(token, response)?;
+            }
+            Err(e) => {
+                let error_str = format!("Find entities paginated error: {}", e);
+                self.send_resp_response(token, RespValue::Error(&error_str))?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle ENTITY_EXISTS command
+    fn handle_entity_exists_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("ENTITY_EXISTS requires entity_id"));
+        }
+        
+        // Parse entity_id
+        let entity_id_str = match &args[0] {
+            RespValue::BulkString(s) => std::str::from_utf8(s)?,
+            RespValue::SimpleString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid entity_id format")),
+        };
+        let entity_id: EntityId = EntityId(entity_id_str.parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("Invalid entity_id"))?);
+        
+        // Execute entity exists check
+        let exists = self.store.entity_exists(entity_id);
+        let response_struct = BooleanResponse {
+            result: exists,
+        };
+        let response_bytes = response_struct.encode();
+        let (response, _) = RespValue::decode(&response_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
+        self.send_resp_response(token, response)?;
+        
+        Ok(())
+    }
+
+    /// Handle TAKE_SNAPSHOT command
+    fn handle_take_snapshot_command(&mut self, token: Token, _args: &[RespValue]) -> Result<()> {
+        // Execute take snapshot
+        let snapshot = self.store.take_snapshot();
+        let encoded_snapshot = serde_json::to_vec(&snapshot)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize snapshot: {}", e))?;
+        let response = RespValue::BulkString(&encoded_snapshot);
+        self.send_resp_response(token, response)?;
+        
+        Ok(())
+    }
+
+    /// Handle REGISTER_NOTIFICATION command
+    fn handle_register_notification_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("REGISTER_NOTIFICATION requires config"));
+        }
+        
+        // Parse notification config
+        let config_bytes = match &args[0] {
+            RespValue::BulkString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid config format")),
+        };
+        let (config, _) = NotifyConfig::decode(config_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid config encoding"))?;
+        
+        // Get the connection's notification queue
+        if let Some(connection) = self.connections.get_mut(&token) {
+            connection.notification_configs.insert(config.clone());
+            
+            match self.store.register_notification(config.clone(), connection.notification_queue.clone()) {
+                Ok(_) => {
+                    self.send_resp_response(token, RespValue::SimpleString("OK"))?;
+                }
+                Err(e) => {
+                    let error_str = format!("Register notification error: {}", e);
+                    self.send_resp_response(token, RespValue::Error(&error_str))?;
+                }
+            }
+        } else {
+            self.send_resp_response(token, RespValue::Error("Connection not found"))?;
+        }
+        
+        Ok(())
+    }
+
+    /// Handle UNREGISTER_NOTIFICATION command
+    fn handle_unregister_notification_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        if args.is_empty() {
+            return Err(anyhow::anyhow!("UNREGISTER_NOTIFICATION requires config"));
+        }
+        
+        // Parse notification config
+        let config_bytes = match &args[0] {
+            RespValue::BulkString(s) => s,
+            _ => return Err(anyhow::anyhow!("Invalid config format")),
+        };
+        let (config, _) = NotifyConfig::decode(config_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid config encoding"))?;
+        
+        // Get the connection's notification queue
+        if let Some(connection) = self.connections.get_mut(&token) {
+            connection.notification_configs.remove(&config);
+            
+            let removed = self.store.unregister_notification(&config, &connection.notification_queue);
+            let response = RespValue::Integer(if removed { 1 } else { 0 });
+            self.send_resp_response(token, response)?;
+        } else {
+            self.send_resp_response(token, RespValue::Error("Connection not found"))?;
+        }
+        
+        Ok(())
+    }
+    
+    
+    /// Handle peer handshake RESP command
+    fn handle_peer_handshake_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = PeerHandshakeCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode PEER_HANDSHAKE command: {}", e))?;
+
+        self.handle_peer_handshake(token, command.start_time, command.is_response, command.machine_id)?;
+        
+        // Send OK response
+        let ok_response = RespValue::SimpleString("OK");
+        self.send_resp_response(token, ok_response)?;
+        
+        Ok(())
+    }
+
+    /// Handle full sync request RESP command
+    fn handle_peer_full_sync_request_command(&mut self, token: Token, _args: &[RespValue]) -> Result<()> {
+        self.handle_peer_full_sync_request(token)?;
+        Ok(())
+    }
+
+    /// Handle full sync response RESP command  
+    fn handle_peer_full_sync_response_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = FullSyncResponseCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode FULL_SYNC_RESPONSE command: {}", e))?;
+
+        self.handle_peer_full_sync_response(token, command.snapshot_data)?;
+        Ok(())
+    }
+
+    /// Handle sync write RESP command
+    fn handle_peer_sync_write_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = SyncWriteCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode SYNC_WRITE command: {}", e))?;
+
+        self.handle_peer_sync_write(token, command.requests_data)?;
+        Ok(())
+    }
+
+    /// Handle notification RESP command (from other nodes)
+    fn handle_notification_command(&mut self, token: Token, args: &[RespValue]) -> Result<()> {
+        let encoded = RespValue::Array(args.to_vec()).encode();
+        let (command, _) = NotificationCommand::decode(&encoded)
+            .map_err(|e| anyhow::anyhow!("Failed to decode NOTIFICATION command: {}", e))?;
+
+        // Deserialize the notification
+        let notification: qlib_rs::Notification = serde_json::from_str(&command.notification_data)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize notification: {}", e))?;
+        
+        debug!("Received notification from peer: {:?}", notification);
+        
+        // Forward the notification to local clients if needed
+        // This might require additional logic based on your notification system
         
         Ok(())
     }
@@ -669,13 +1721,14 @@ impl CoreService {
         
         // Only send a response if this was a request, not a response
         if !is_response {
-            let handshake_response = ProtocolMessage::Peer(PeerMessage::Handshake {
+            let handshake_response = PeerHandshakeCommand {
                 start_time: self.start_time,
                 is_response: true,
                 machine_id: self.config.machine.clone(),
-            });
+                _marker: std::marker::PhantomData,
+            };
             
-            if let Err(e) = self.send_protocol_message(token, handshake_response) {
+            if let Err(e) = self.send_peer_command(token, &handshake_response) {
                 error!("Failed to send handshake response to peer {}: {}", peer_machine_id, e);
             } else {
                 debug!("Sent handshake response to peer {} with our start time {}", peer_machine_id, self.start_time);
@@ -757,9 +1810,11 @@ impl CoreService {
             // Find the token for this peer
             if let Some(peer_info) = self.peers.get(&oldest_machine_id) {
                 if let Some(peer_token) = peer_info.token {
-                    let sync_request = ProtocolMessage::Peer(PeerMessage::FullSyncRequest);
+                    let sync_request = FullSyncRequestCommand {
+                        _marker: std::marker::PhantomData,
+                    };
                     
-                    if let Err(e) = self.send_protocol_message(peer_token, sync_request) {
+                    if let Err(e) = self.send_peer_command(peer_token, &sync_request) {
                         error!("Failed to send full sync request to older peer {}: {}", oldest_machine_id, e);
                     } else {
                         info!("Requested full sync from older peer {}", oldest_machine_id);
@@ -791,12 +1846,15 @@ impl CoreService {
         
         // Take a snapshot of our current store
         let snapshot = self.store.take_snapshot();
+        let snapshot_json = serde_json::to_string(&snapshot)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize snapshot: {}", e))?;
         
-        let sync_response = ProtocolMessage::Peer(PeerMessage::FullSyncResponse {
-            snapshot,
-        });
+        let sync_response = FullSyncResponseCommand {
+            snapshot_data: snapshot_json,
+            _marker: std::marker::PhantomData,
+        };
         
-        if let Err(e) = self.send_protocol_message(token, sync_response) {
+        if let Err(e) = self.send_peer_command(token, &sync_response) {
             error!("Failed to send full sync response to peer {}: {}", requesting_machine_id, e);
         } else {
             info!("Sent full sync response to peer {}", requesting_machine_id);
@@ -806,8 +1864,12 @@ impl CoreService {
     }
     
     /// Handle peer full sync response
-    fn handle_peer_full_sync_response(&mut self, _token: Token, snapshot: Snapshot) -> Result<()> {
+    fn handle_peer_full_sync_response(&mut self, _token: Token, snapshot_json: String) -> Result<()> {
         debug!("Received full sync response, restoring snapshot");
+        
+        // Deserialize snapshot from JSON
+        let snapshot: Snapshot = serde_json::from_str(&snapshot_json)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize snapshot: {}", e))?;
         
         // Handle complete snapshot restoration
         self.handle_snapshot_restoration(snapshot);
@@ -818,170 +1880,130 @@ impl CoreService {
     }
     
     /// Handle peer sync write message
-    fn handle_peer_sync_write(&mut self, token: Token, requests: Requests) -> Result<()> {
-        // Find the machine ID for this peer connection
-        let peer_machine_id = self.peers.iter()
-            .find(|(_, peer_info)| peer_info.token.map_or(false, |t| t == token))
-            .map(|(machine_id, _)| machine_id.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-            
-        debug!("Received sync write from peer {} with {} requests", peer_machine_id, requests.len());
+    fn handle_peer_sync_write(&mut self, _token: Token, requests_json: String) -> Result<()> {
+        debug!("Received sync write from peer");
         
-        // Apply the requests to our store if they didn't originate from us
-        if requests.originator() != self.candidate_entity_id {
-            debug!("Applying {} sync write requests from peer {}", requests.len(), peer_machine_id);
-            if let Err(e) = self.store.perform_mut(requests) {
-                warn!("Failed to apply sync write from peer {}: {}", peer_machine_id, e);
-            } else {
-                debug!("Successfully applied sync write from peer {}", peer_machine_id);
-            }
-        } else {
-            debug!("Ignoring sync write from peer {} as it originated from us", peer_machine_id);
-        }
+        // Deserialize requests from JSON
+        let requests: Requests = serde_json::from_str(&requests_json)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize requests: {}", e))?;
+        
+        debug!("Applying {} requests from peer", requests.len());
+        
+        // Apply the requests to our store
+        self.perform_requests(requests);
         
         Ok(())
     }
     
-    /// Handle a decoded protocol message
-    fn handle_protocol_message(&mut self, token: Token, message: ProtocolMessage) -> Result<()> {
-        match message {
-            ProtocolMessage::Store(store_message) => {
-                self.handle_store_message(token, store_message)
-            }
-            ProtocolMessage::Peer(peer_message) => {
-                match peer_message {
-                    PeerMessage::Handshake { start_time, is_response, machine_id } => {
-                        self.handle_peer_handshake(token, start_time, is_response, machine_id)
+    /// Apply a batch of requests to the store
+    fn perform_requests(&mut self, requests: qlib_rs::Requests) {
+        for request in requests.read().iter() {
+            match request {
+                qlib_rs::Request::Read { entity_id, field_types, value, write_time, writer_id } => {
+                    // For read requests, we don't need to do anything as they don't modify the store
+                    // But we should update the request with the result
+                    if let Some(value_ref) = value {
+                        // The request already has a value, no need to re-read
+                        continue;
                     }
-                    PeerMessage::FullSyncRequest => {
-                        self.handle_peer_full_sync_request(token)
-                    }
-                    PeerMessage::FullSyncResponse { snapshot } => {
-                        self.handle_peer_full_sync_response(token, snapshot)
-                    }
-                    PeerMessage::SyncWrite { requests } => {
-                        self.handle_peer_sync_write(token, requests)
-                    }
-                }
-            }
-            _ => {
-                warn!("Received unsupported protocol message from client");
-                Ok(())
-            }
-        }
-    }
-    
-    /// Handle a store message from a client
-    fn handle_store_message(&mut self, token: Token, message: StoreMessage) -> Result<()> {
-        // Since authentication is removed, handle all messages directly
-        let response = self.handle_authenticated_message(token, message)?;
-        
-        self.send_response(token, response)?;
-        Ok(())
-    }
-    
-    /// Handle messages from clients (no authentication required)
-    fn handle_authenticated_message(&mut self, token: Token, message: StoreMessage) -> Result<StoreMessage> {
-        match message {
-            StoreMessage::Perform { id, requests } => {
-                // Since authentication is removed, process all requests without authorization checks
-                debug!("Performing {} requests", requests.len());
-                match self.store.perform_mut(requests) {
-                    Ok(results) => Ok(StoreMessage::PerformResponse {
-                        id,
-                        response: Ok(results),
-                    }),
-                    Err(e) => Ok(StoreMessage::PerformResponse {
-                        id,
-                        response: Err(format!("{:?}", e)),
-                    }),
-                }
-            }
-            
-            StoreMessage::RegisterNotification { id, config } => {
-                if let Some(connection) = self.connections.get_mut(&token) {
-                    connection.notification_configs.insert(config.clone());
                     
-                    match self.store.register_notification(config.clone(), connection.notification_queue.clone()) {
-                        Ok(_) => Ok(StoreMessage::RegisterNotificationResponse {
-                            id,
-                            response: Ok(()),
-                        }),
-                        Err(e) => Ok(StoreMessage::RegisterNotificationResponse {
-                            id,
-                            response: Err(format!("{:?}", e)),
-                        }),
+                    match self.store.read(*entity_id, field_types) {
+                        Ok((read_value, timestamp, writer)) => {
+                            // Note: We can't modify the request here because Requests uses Arc<RwLock>
+                            // The read result would need to be stored somewhere else
+                            // For now, we'll just log that we processed the read
+                            debug!("Processed read request for entity {:?}, field {:?}", entity_id, field_types);
+                        }
+                        Err(e) => {
+                            warn!("Failed to process read request: {}", e);
+                        }
                     }
-                } else {
-                    Ok(StoreMessage::RegisterNotificationResponse {
-                        id,
-                        response: Err("Connection not found".to_string()),
-                    })
+                }
+                qlib_rs::Request::Write { entity_id, field_types, value, push_condition, adjust_behavior, write_time, writer_id, write_processed } => {
+                    match self.store.write(*entity_id, field_types, value.clone(), *writer_id, *write_time, *push_condition, *adjust_behavior) {
+                        Ok(_) => {
+                            debug!("Processed write request for entity {:?}, field {:?}", entity_id, field_types);
+                        }
+                        Err(e) => {
+                            warn!("Failed to process write request: {}", e);
+                        }
+                    }
+                }
+                qlib_rs::Request::Create { entity_type, parent_id, name, created_entity_id, timestamp } => {
+                    match self.store.create_entity(*entity_type, *parent_id, name) {
+                        Ok(entity_id) => {
+                            debug!("Processed create request, created entity {:?}", entity_id);
+                        }
+                        Err(e) => {
+                            warn!("Failed to process create request: {}", e);
+                        }
+                    }
+                }
+                qlib_rs::Request::Delete { entity_id, timestamp } => {
+                    match self.store.delete_entity(*entity_id) {
+                        Ok(_) => {
+                            debug!("Processed delete request for entity {:?}", entity_id);
+                        }
+                        Err(e) => {
+                            warn!("Failed to process delete request: {}", e);
+                        }
+                    }
+                }
+                qlib_rs::Request::SchemaUpdate { schema, timestamp } => {
+                    match self.store.update_schema(schema.clone()) {
+                        Ok(_) => {
+                            debug!("Processed schema update request");
+                        }
+                        Err(e) => {
+                            warn!("Failed to process schema update request: {}", e);
+                        }
+                    }
+                }
+                qlib_rs::Request::Snapshot { snapshot_counter, timestamp } => {
+                    // Snapshot requests don't modify the store, they're just markers
+                    debug!("Processed snapshot marker request");
+                }
+                qlib_rs::Request::GetEntityType { name, entity_type } => {
+                    // These are read-only operations, no store modification needed
+                    debug!("Processed get entity type request");
+                }
+                qlib_rs::Request::ResolveEntityType { entity_type, name } => {
+                    debug!("Processed resolve entity type request");
+                }
+                qlib_rs::Request::GetFieldType { name, field_type } => {
+                    debug!("Processed get field type request");
+                }
+                qlib_rs::Request::ResolveFieldType { field_type, name } => {
+                    debug!("Processed resolve field type request");
+                }
+                qlib_rs::Request::GetEntitySchema { entity_type, schema } => {
+                    debug!("Processed get entity schema request");
+                }
+                qlib_rs::Request::GetCompleteEntitySchema { entity_type, schema } => {
+                    debug!("Processed get complete entity schema request");
+                }
+                qlib_rs::Request::GetFieldSchema { entity_type, field_type, schema } => {
+                    debug!("Processed get field schema request");
+                }
+                qlib_rs::Request::EntityExists { entity_id, exists } => {
+                    debug!("Processed entity exists request");
+                }
+                qlib_rs::Request::FieldExists { entity_type, field_type, exists } => {
+                    debug!("Processed field exists request");
+                }
+                qlib_rs::Request::FindEntities { entity_type, page_opts, filter, result } => {
+                    debug!("Processed find entities request");
+                }
+                qlib_rs::Request::FindEntitiesExact { entity_type, page_opts, filter, result } => {
+                    debug!("Processed find entities exact request");
+                }
+                qlib_rs::Request::GetEntityTypes { page_opts, result } => {
+                    debug!("Processed get entity types request");
                 }
             }
-            
-            StoreMessage::UnregisterNotification { id, config } => {
-                if let Some(connection) = self.connections.get_mut(&token) {
-                    connection.notification_configs.remove(&config);
-                    
-                    let removed = self.store.unregister_notification(&config, &connection.notification_queue);
-                    Ok(StoreMessage::UnregisterNotificationResponse {
-                        id,
-                        response: removed,
-                    })
-                } else {
-                    Ok(StoreMessage::UnregisterNotificationResponse {
-                        id,
-                        response: false,
-                    })
-                }
-            }
-            
-            _ => {
-                Ok(StoreMessage::Error {
-                    id: self.extract_message_id(&message).unwrap_or(0),
-                    error: "Unsupported message type".to_string(),
-                })
-            }
         }
     }
-    
-    /// Send a protocol message to a connection
-    fn send_protocol_message(&mut self, token: Token, message: ProtocolMessage) -> Result<()> {
-        let encoded = ProtocolCodec::encode(&message)?;
-        
-        if let Some(connection) = self.connections.get_mut(&token) {
-            connection.outbound_messages.push_back(encoded);
-            
-            // Register for write events if we have messages to send
-            self.poll.registry().reregister(
-                &mut connection.stream,
-                token,
-                Interest::READABLE | Interest::WRITABLE
-            )?;
-        }
-        
-        Ok(())
-    }
-    
-    /// Send a response message to a client
-    fn send_response(&mut self, token: Token, response: StoreMessage) -> Result<()> {
-        let protocol_message = ProtocolMessage::Store(response);
-        let encoded = ProtocolCodec::encode(&protocol_message)?;
-        
-        if let Some(connection) = self.connections.get_mut(&token) {
-            connection.outbound_messages.push_back(encoded);
-            
-            // Register for write events if we have messages to send
-            self.poll.registry().reregister(
-                &mut connection.stream,
-                token,
-                Interest::READABLE | Interest::WRITABLE
-            )?;
-        }
-        
-        Ok(())
-    }
+
     
     /// Remove a connection and clean up resources
     fn remove_connection(&mut self, token: Token) {
@@ -1018,12 +2040,6 @@ impl CoreService {
     /// Handle commands from other actors
     fn handle_command(&mut self, command: CoreCommand) {
         match command {
-            CoreCommand::Perform { requests } => {
-                debug!("Handling perform command with {} requests", requests.len());
-                if let Err(e) = self.store.perform_mut(requests) {
-                    error!("Error performing requests: {}", e);
-                }
-            }
             CoreCommand::TakeSnapshot => {
                 debug!("Handling take snapshot command");
                 if let Some(snapshot_handle) = &self.snapshot_handle {
@@ -1091,22 +2107,24 @@ impl CoreService {
                     notification_queue: NotificationQueue::new(),
                     notification_configs: HashSet::new(),
                     outbound_messages: VecDeque::new(),
-                    message_buffer: MessageBuffer::new()
+                    read_buffer: Vec::with_capacity(8192),
                 };
                 
                 self.connections.insert(token, connection);
                 info!("Peer {} connected with token {:?}", machine_id, token);
                 
-                // Send handshake message directly to the peer
-                let handshake_message = ProtocolMessage::Peer(PeerMessage::Handshake {
+                // Send initial handshake with RESP protocol
+                let handshake = PeerHandshakeCommand {
                     start_time: self.start_time,
                     is_response: false,
                     machine_id: self.config.machine.clone(),
-                });
+                    _marker: std::marker::PhantomData,
+                };
                 
-                if let Err(e) = self.send_protocol_message(token, handshake_message) {
+                if let Err(e) = self.send_peer_command(token, &handshake) {
                     error!("Failed to send handshake to peer {}: {}", machine_id, e);
-                    self.remove_connection(token);
+                } else {
+                    debug!("Sent handshake to peer {} with our start time {}", machine_id, self.start_time);
                 }
             }
             CoreCommand::GetPeers { respond_to } => {
@@ -1120,12 +2138,11 @@ impl CoreService {
                     error!("Failed to send peers response: {}", e);
                 }
             }
+            CoreCommand::PerformRequests { requests } => {
+                debug!("Handling perform requests command with {} requests", requests.len());
+                self.perform_requests(requests);
+            }
         }
-    }
-    
-    /// Extract message ID from a store message
-    fn extract_message_id(&self, message: &StoreMessage) -> Option<u64> {
-        qlib_rs::data::extract_message_id(message)
     }
     
     /// Process notifications for all connections
@@ -1219,11 +2236,12 @@ impl CoreService {
 
         if let Some(candidate) = candidates.first() {
             debug!("Writing heartbeat fields for candidate {:?}", candidate);
-            if let Err(e) = self.store.perform_mut(sreq![
-                swrite!(*candidate, sfield![ft_heartbeat], schoice!(0)),
-                swrite!(*candidate, sfield![ft_make_me], schoice!(1), PushCondition::Changes)
-            ]) {
-                warn!("Failed to write heartbeat fields: {}", e);
+            // Update heartbeat fields using direct Store API calls
+            if let Err(e) = self.store.write(*candidate, &[ft_heartbeat], Value::Choice(0), None, None, None, None) {
+                warn!("Failed to write heartbeat field: {}", e);
+            }
+            if let Err(e) = self.store.write(*candidate, &[ft_make_me], Value::Choice(1), None, None, Some(qlib_rs::PushCondition::Changes), None) {
+                warn!("Failed to write make_me field: {}", e);
             }
         }
     }
@@ -1349,52 +2367,87 @@ impl CoreService {
         let now = qlib_rs::data::now();
 
         for ft_entity_id in fault_tolerances {
-            // Read fault tolerance fields
-            let ft_read_requests = sreq![
-                sread!(ft_entity_id, sfield![ft_candidate_list]),
-                sread!(ft_entity_id, sfield![ft_available_list]),
-                sread!(ft_entity_id, sfield![ft_current_leader])
-            ];
+            // Read fault tolerance fields using direct Store API calls
+            let candidate_list_result = self.store.read(ft_entity_id, &[ft_candidate_list]);
+            let available_list_result = self.store.read(ft_entity_id, &[ft_available_list]);
+            let current_leader_result = self.store.read(ft_entity_id, &[ft_current_leader]);
 
-            let ft_results = match self.store.perform(ft_read_requests) {
-                Ok(results) => results,
+            let candidates = match candidate_list_result {
+                Ok((value, _, _)) => {
+                    if let Value::EntityList(list) = value {
+                        list
+                    } else {
+                        warn!("Invalid candidate list format");
+                        continue;
+                    }
+                }
                 Err(e) => {
-                    warn!("Failed to read fault tolerance fields: {}", e);
+                    warn!("Failed to read candidate list: {}", e);
                     continue;
                 }
             };
 
-            let candidates = ft_results.extract_entity_list(0).unwrap_or_default();
             if candidates.is_empty() {
                 warn!("Failed to get candidate list");
                 continue;
             }
 
-            let current_leader = ft_results.extract_entity_reference(2);
+            let current_available = match available_list_result {
+                Ok((value, _, _)) => {
+                    if let Value::EntityList(list) = value {
+                        list
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(_) => Vec::new(),
+            };
+
+            let current_leader = match current_leader_result {
+                Ok((value, _, _)) => {
+                    if let Value::EntityReference(Some(id)) = value {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
 
             // Check availability of each candidate
             let mut available = Vec::new();
             for candidate_id in &candidates {
-                let candidate_read_requests = sreq![
-                    sread!(*candidate_id, sfield![ft_make_me]),
-                    sread!(*candidate_id, sfield![ft_heartbeat]),
-                    sread!(*candidate_id, sfield![ft_death_detection_timeout])
-                ];
+                // Read candidate fields using direct Store API calls
+                let make_me_result = self.store.read(*candidate_id, &[ft_make_me]);
+                let heartbeat_result = self.store.read(*candidate_id, &[ft_heartbeat]);
+                let timeout_result = self.store.read(*candidate_id, &[ft_death_detection_timeout]);
 
-                let candidate_results = match self.store.perform(candidate_read_requests) {
-                    Ok(results) => results,
-                    Err(e) => {
-                        warn!("Failed to read candidate fields for {:?}: {}", candidate_id, e);
-                        continue;
+                let make_me = match make_me_result {
+                    Ok((value, _, _)) => {
+                        if let Value::Choice(choice) = value {
+                            choice
+                        } else {
+                            0
+                        }
                     }
+                    Err(_) => 0,
                 };
 
-                let make_me = candidate_results.extract_choice(0).unwrap_or(0);
+                let heartbeat_time = match heartbeat_result {
+                    Ok((_, timestamp, _)) => timestamp,
+                    Err(_) => qlib_rs::data::epoch(),
+                };
 
-                let heartbeat_time = candidate_results.extract_write_time(1)
-                    .unwrap_or_else(qlib_rs::data::epoch);
-
-                let death_detection_timeout_millis = candidate_results.extract_int(2).unwrap_or(5000);
+                let death_detection_timeout_millis = match timeout_result {
+                    Ok((value, _, _)) => {
+                        if let Value::Int(timeout) = value {
+                            timeout
+                        } else {
+                            5000
+                        }
+                    }
+                    Err(_) => 5000,
+                };
 
                 // Check if candidate wants to be available and has recent heartbeat
                 let death_detection_timeout = time::Duration::milliseconds(death_detection_timeout_millis);
@@ -1404,12 +2457,9 @@ impl CoreService {
             }
 
             // Update available list only if it has changed
-            let current_available = ft_results.extract_entity_list(1).unwrap_or_default();
             if current_available != available {
                 debug!("Updating available list for fault tolerance entity {:?}: {:?}", ft_entity_id, available);
-                if let Err(e) = self.store.perform_mut(sreq![
-                    swrite!(ft_entity_id, sfield![ft_available_list], Some(qlib_rs::Value::EntityList(available.clone())))
-                ]) {
+                if let Err(e) = self.store.write(ft_entity_id, &[ft_available_list], Value::EntityList(available.clone()), None, None, None, None) {
                     warn!("Failed to update available list: {}", e);
                     continue;
                 }
@@ -1425,9 +2475,7 @@ impl CoreService {
                     // Only write if the current leader is different
                     if current_leader != Some(*me_as_candidate) {
                         debug!("Setting current leader to {:?} for fault tolerance entity {:?}", me_as_candidate, ft_entity_id);
-                        if let Err(e) = self.store.perform_mut(sreq![
-                            swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(Some(*me_as_candidate))))
-                        ]) {
+                        if let Err(e) = self.store.write(ft_entity_id, &[ft_current_leader], Value::EntityReference(Some(*me_as_candidate)), None, None, None, None) {
                             warn!("Failed to set current leader: {}", e);
                         }
                     }
@@ -1441,9 +2489,7 @@ impl CoreService {
                     let new_leader = available.first().cloned();
                     if new_leader.is_some() {
                         debug!("Setting new leader {:?} for fault tolerance entity {:?} (no current leader)", new_leader, ft_entity_id);
-                        if let Err(e) = self.store.perform_mut(sreq![
-                            swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(new_leader)))
-                        ]) {
+                        if let Err(e) = self.store.write(ft_entity_id, &[ft_current_leader], Value::EntityReference(new_leader), None, None, None, None) {
                             warn!("Failed to set new leader: {}", e);
                         }
                     }
@@ -1481,9 +2527,7 @@ impl CoreService {
                         // Only write if the leader actually changes
                         if current_leader != next_leader {
                             debug!("Updating leader from {:?} to {:?} for fault tolerance entity {:?} (current leader unavailable)", current_leader, next_leader, ft_entity_id);
-                            if let Err(e) = self.store.perform_mut(sreq![
-                                swrite!(ft_entity_id, sfield![ft_current_leader], Some(qlib_rs::Value::EntityReference(next_leader)))
-                            ]) {
+                            if let Err(e) = self.store.write(ft_entity_id, &[ft_current_leader], Value::EntityReference(next_leader), None, None, None, None) {
                                 warn!("Failed to update leader: {}", e);
                             }
                         }
