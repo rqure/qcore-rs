@@ -14,31 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use qlib_rs::data::entity_schema::{EntitySchemaResp, FieldSchemaResp};
 use qlib_rs::data::resp::{
-    BooleanResponse,
-    CreateEntityCommand,
-    CreateEntityResponse,
-    DeleteEntityCommand,
-    EntityListResponse,
-    EntityTypeListResponse,
-    FullSyncRequestCommand,
-    FullSyncResponseCommand,
-    IntegerResponse,
-    NotificationCommand,
-    PaginatedEntityResponse,
-    PaginatedEntityTypeResponse,
-    // Peer protocol RESP commands
-    PeerHandshakeCommand,
-    ReadCommand,
-    ReadResponse,
-    RespCommand,
-    RespDecode,
-    RespEncode,
-    RespValue,
-    SetFieldSchemaCommand,
-    StringResponse,
-    SyncWriteCommand,
-    UpdateSchemaCommand,
-    WriteCommand,
+    BooleanResponse, CreateEntityCommand, CreateEntityResponse, DeleteEntityCommand, EntityExistsCommand, EntityListResponse, EntityTypeListResponse, FieldExistsCommand, FieldSchemaResponse, FindEntitiesCommand, FindEntitiesExactCommand, FindEntitiesPaginatedCommand, FullSyncRequestCommand, FullSyncResponseCommand, GetEntitySchemaCommand, GetEntityTypeCommand, GetEntityTypesCommand, GetEntityTypesPaginatedCommand, GetFieldSchemaCommand, GetFieldTypeCommand, IntegerResponse, NotificationCommand, PaginatedEntityResponse, PaginatedEntityTypeResponse, PeerHandshakeCommand, ReadCommand, ReadResponse, RegisterNotificationCommand, ResolveEntityTypeCommand, ResolveFieldTypeCommand, ResolveIndirectionCommand, ResolveIndirectionResponse, RespCommand, RespDecode, RespEncode, RespValue, SetFieldSchemaCommand, SnapshotResponse, StringResponse, SyncWriteCommand, TakeSnapshotCommand, UnregisterNotificationCommand, UpdateSchemaCommand, WriteCommand
 };
 use qlib_rs::{
     EntityId, EntityType, FieldType, NotificationQueue, NotifyConfig, PageOpts, Snapshot, Store,
@@ -550,9 +526,11 @@ impl CoreService {
                         break;
                     }
 
+                    let mut consumed = 0;
+                    
                     if let Some(connection) = self.connections.get(&token) {
                         if let Ok((command, next_remaining)) = ReadCommand::decode(&remaining) {
-                            remaining = next_remaining;
+                            consumed = remaining.len() - next_remaining.len();
 
                             match self.store.read(
                                 command.entity_id,
@@ -564,14 +542,14 @@ impl CoreService {
                                         timestamp,
                                         writer_id,
                                     };
-                                    self.send_resp_response(token, response.encode())?;
+                                    self.send_response(token, &response)?;
                                 }
                                 Err(e) => {
                                     self.send_resp_response(token, RespValue::Error(format!("Read error: {}", e).as_str()).encode())?;
                                 }
                             }
                         } else if let Ok((command, next_remaining)) = WriteCommand::decode(&remaining) {
-                            remaining = next_remaining;
+                            consumed = remaining.len() - next_remaining.len();
 
                             match self.store.write(
                                 command.entity_id,
@@ -585,1563 +563,343 @@ impl CoreService {
                                 Ok(_) => {
                                     self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
                                 }
-                                    Err(e) => {
-                                        self.send_resp_response(token, RespValue::Error(format!("Write error: {}", e).as_str()).encode())?;
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Write error: {}", e).as_str()).encode())?;
                                 }
-                            }                        
-                        } else {
-                            break; // Incomplete command, wait for more data
-                        }
-                    } else {
-                        return Err(anyhow::anyhow!("Connection not found"));
-                    }
-
-                    match decode_result {
-                        Ok((resp_value, remaining)) => {
-                            let buffer_len = {
-                                if let Some(connection) = self.connections.get(&token) {
-                                    connection.read_buffer.len()
-                                } else {
-                                    return Err(anyhow::anyhow!("Connection not found"));
-                                }
-                            };
-
-                            let consumed = buffer_len - total_consumed - remaining.len();
-                            if consumed == 0 {
-                                break; // No progress, wait for more data
                             }
+                        } else if let Ok((command, next_remaining)) = CreateEntityCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                            let resp_command_result = match resp_value {
-                                // Expect an array representing a command
-                                RespValue::Array(args) => {
-                                    if args.is_empty() {
-                                        Err(anyhow::anyhow!("Empty command"))
-                                    } else {
-                                        // First element should be the command name
-                                        let cmd_name = match &args[0] {
-                                            RespValue::BulkString(name) => {
-                                                std::str::from_utf8(name).map_err(|e| {
-                                                    anyhow::anyhow!(
-                                                        "Invalid UTF-8 in command name: {}",
-                                                        e
-                                                    )
-                                                })
-                                            }
-                                            RespValue::SimpleString(name) => Ok(name.as_ref()),
-                                            _ => Err(anyhow::anyhow!(
-                                                "Command name must be a string"
-                                            )),
-                                        };
+                            match self.store.create_entity(
+                                command.entity_type,
+                                command.parent_id,
+                                &command.name,
+                            ) {
+                                Ok(entity_id) => {
+                                    let response = CreateEntityResponse { entity_id };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Create entity error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = DeleteEntityCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                                        // Handle different commands
-                                        if let Ok(cmd_name) = cmd_name {
-                                            match cmd_name.to_uppercase().as_str() {
-                                                "READ" => {
-                                                    // Decode the command using the ReadCommand struct
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = ReadCommand::decode(
-                                                        &encoded,
-                                                    )
-                                                    .map_err(|e| {
-                                                        anyhow::anyhow!(
-                                                            "Failed to decode READ command: {}",
-                                                            e
-                                                        )
-                                                    })?;
+                            match self.store.delete_entity(command.entity_id) {
+                                Ok(_) => {
+                                    self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Delete entity error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = GetEntityTypeCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                                                    // Execute read
-                                                    match self.store.read(
-                                                        command.entity_id,
-                                                        &command.field_path,
-                                                    ) {
-                                                        Ok((value, timestamp, writer_id)) => {
-                                                            let response_struct = ReadResponse {
-                                                                value,
-                                                                timestamp,
-                                                                writer_id,
-                                                            };
-                                                            let response_bytes =
-                                                                response_struct.encode();
-                                                            let (response, _) = RespValue::decode(
-                                                                &response_bytes,
-                                                            )
-                                                            .map_err(|e| {
-                                                                anyhow::anyhow!(
-                                                                    "Failed to encode response: {}",
-                                                                    e
-                                                                )
-                                                            })?;
-                                                            self.send_resp_response(token, response)
-                                                        }
-                                                        Err(e) => {
-                                                            let error_str =
-                                                                format!("Read error: {}", e);
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(&error_str),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "WRITE" => {
-                                                    // Decode the command using the WriteCommand struct
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = WriteCommand::decode(
-                                                        &encoded,
-                                                    )
-                                                    .map_err(|e| {
-                                                        anyhow::anyhow!(
-                                                            "Failed to decode WRITE command: {}",
-                                                            e
-                                                        )
-                                                    })?;
+                            match self.store.get_entity_type(&command.name) {
+                                Ok(entity_type) => {
+                                    let response = IntegerResponse { value: entity_type.0 as i64 };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Get entity type error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = ResolveEntityTypeCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                                                    // Execute write
-                                                    match self.store.write(
-                                                        command.entity_id,
-                                                        &command.field_path,
-                                                        command.value,
-                                                        command.writer_id,
-                                                        command.write_time,
-                                                        command.push_condition,
-                                                        command.adjust_behavior,
-                                                    ) {
-                                                        Ok(_) => self.send_resp_response(
-                                                            token,
-                                                            RespValue::SimpleString("OK"),
-                                                        ),
-                                                        Err(e) => {
-                                                            let error_str =
-                                                                format!("Write error: {}", e);
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(&error_str),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "CREATE_ENTITY" => {
-                                                    // Decode the command using the CreateEntityCommand struct
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = CreateEntityCommand::decode(&encoded)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to decode CREATE_ENTITY command: {}", e))?;
+                            match self.store.resolve_entity_type(command.entity_type) {
+                                Ok(name) => {
+                                    let response = StringResponse { value: name };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Resolve entity type error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = GetFieldTypeCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                                                    // Execute create entity
-                                                    match self.store.create_entity(
-                                                        command.entity_type,
-                                                        command.parent_id,
-                                                        &command.name,
-                                                    ) {
-                                                        Ok(entity_id) => {
-                                                            let response_struct =
-                                                                CreateEntityResponse { entity_id };
-                                                            let response_bytes =
-                                                                response_struct.encode();
-                                                            let (response, _) = RespValue::decode(
-                                                                &response_bytes,
-                                                            )
-                                                            .map_err(|e| {
-                                                                anyhow::anyhow!(
-                                                                    "Failed to encode response: {}",
-                                                                    e
-                                                                )
-                                                            })?;
-                                                            self.send_resp_response(token, response)
-                                                        }
-                                                        Err(e) => {
-                                                            let error_str = format!(
-                                                                "Create entity error: {}",
-                                                                e
-                                                            );
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(&error_str),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "DELETE_ENTITY" => {
-                                                    // Decode the command using the DeleteEntityCommand struct
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = DeleteEntityCommand::decode(&encoded)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to decode DELETE_ENTITY command: {}", e))?;
+                            match self.store.get_field_type(&command.name) {
+                                Ok(field_type) => {
+                                    let response = IntegerResponse { value: field_type.0 as i64 };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Get field type error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = ResolveFieldTypeCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                                                    // Execute delete entity
-                                                    match self
-                                                        .store
-                                                        .delete_entity(command.entity_id)
-                                                    {
-                                                        Ok(_) => self.send_resp_response(
-                                                            token,
-                                                            RespValue::SimpleString("OK"),
-                                                        ),
-                                                        Err(e) => {
-                                                            let error_str = format!(
-                                                                "Delete entity error: {}",
-                                                                e
-                                                            );
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(&error_str),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "GET_ENTITY_TYPE" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "GET_ENTITY_TYPE requires name"
-                                                        ))
-                                                    } else {
-                                                        // Parse name
-                                                        let name = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?)
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.as_ref())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid name format"
-                                                            )),
-                                                        }?;
+                            match self.store.resolve_field_type(command.field_type) {
+                                Ok(name) => {
+                                    let response = StringResponse { value: name };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Resolve field type error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = GetEntitySchemaCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                                                        // Execute get entity type
-                                                        match self.store.get_entity_type(name) {
-                                                            Ok(entity_type) => {
-                                                                let response_struct =
-                                                                    IntegerResponse {
-                                                                        value: entity_type.0 as i64,
-                                                                    };
-                                                                let response_bytes =
-                                                                    response_struct.encode();
-                                                                let (response, _) = RespValue::decode(&response_bytes)
-                                                                .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Get entity type error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "RESOLVE_ENTITY_TYPE" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "RESOLVE_ENTITY_TYPE requires entity_type"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_type
-                                                        let entity_type_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_type format"
-                                                            )),
-                                                        }?;
-                                                        let entity_type: EntityType = EntityType(
-                                                            entity_type_str
-                                                                .parse::<u32>()
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_type"
-                                                                    )
-                                                                })?,
-                                                        );
+                            match self.store.get_entity_schema(command.entity_type) {
+                                Ok(schema) => {
+                                    let response = EntitySchemaResp::from_entity_schema(&schema, &self.store);
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Get entity schema error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = UpdateSchemaCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                                                        // Execute resolve entity type
-                                                        match self
-                                                            .store
-                                                            .resolve_entity_type(entity_type)
-                                                        {
-                                                            Ok(name) => {
-                                                                let response_struct =
-                                                                    StringResponse { value: name };
-                                                                let response_bytes =
-                                                                    response_struct.encode();
-                                                                let (response, _) = RespValue::decode(&response_bytes)
-                                                                .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Resolve entity type error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "GET_FIELD_TYPE" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "GET_FIELD_TYPE requires name"
-                                                        ))
-                                                    } else {
-                                                        // Parse name
-                                                        let name = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?)
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.as_ref())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid name format"
-                                                            )),
-                                                        }?;
-
-                                                        // Execute get field type
-                                                        match self.store.get_field_type(name) {
-                                                            Ok(field_type) => {
-                                                                let response_struct =
-                                                                    IntegerResponse {
-                                                                        value: field_type.0 as i64,
-                                                                    };
-                                                                let response_bytes =
-                                                                    response_struct.encode();
-                                                                let (response, _) = RespValue::decode(&response_bytes)
-                                                                .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Get field type error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "RESOLVE_FIELD_TYPE" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "RESOLVE_FIELD_TYPE requires field_type"
-                                                        ))
-                                                    } else {
-                                                        // Parse field_type
-                                                        let field_type_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid field_type format"
-                                                            )),
-                                                        }?;
-                                                        let field_type: FieldType = FieldType(
-                                                            field_type_str.parse::<u64>().map_err(
-                                                                |_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid field_type"
-                                                                    )
-                                                                },
-                                                            )?,
-                                                        );
-
-                                                        // Execute resolve field type
-                                                        match self
-                                                            .store
-                                                            .resolve_field_type(field_type)
-                                                        {
-                                                            Ok(name) => {
-                                                                let response_struct =
-                                                                    StringResponse { value: name };
-                                                                let response_bytes =
-                                                                    response_struct.encode();
-                                                                let (response, _) = RespValue::decode(&response_bytes)
-                                                                .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Resolve field type error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "GET_ENTITY_SCHEMA" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "GET_ENTITY_SCHEMA requires entity_type"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_type
-                                                        let entity_type_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_type format"
-                                                            )),
-                                                        }?;
-                                                        let entity_type: EntityType = EntityType(
-                                                            entity_type_str
-                                                                .parse::<u32>()
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_type"
-                                                                    )
-                                                                })?,
-                                                        );
-
-                                                        // Execute get entity schema
-                                                        match self
-                                                            .store
-                                                            .get_entity_schema(entity_type)
-                                                        {
-                                                            Ok(schema) => {
-                                                                let schema_resp = EntitySchemaResp::from_entity_schema(&schema, &self.store);
-                                                                let encoded_schema =
-                                                                    schema_resp.encode();
-                                                                let response =
-                                                                    RespValue::BulkString(
-                                                                        &encoded_schema,
-                                                                    );
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Get entity schema error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "UPDATE_SCHEMA" => {
-                                                    // Decode the command using the UpdateSchemaCommand struct
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = UpdateSchemaCommand::decode(&encoded)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to decode UPDATE_SCHEMA command: {}", e))?;
-
-                                                    // Convert EntitySchemaResp back to EntitySchema<Single, String, String>
-                                                    let schema_string = command
-                                                        .schema
-                                                        .to_entity_schema(&self.store)?;
-
-                                                    // Execute update schema
-                                                    match self.store.update_schema(schema_string) {
-                                                        Ok(_) => self.send_resp_response(
-                                                            token,
-                                                            RespValue::SimpleString("OK"),
-                                                        ),
-                                                        Err(e) => {
-                                                            let error_str = format!(
-                                                                "Update schema error: {}",
-                                                                e
-                                                            );
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(&error_str),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "GET_FIELD_SCHEMA" => {
-                                                    if args.len() < 3 {
-                                                        Err(anyhow::anyhow!(
-                                                            "GET_FIELD_SCHEMA requires entity_type and field_type"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_type
-                                                        let entity_type_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_type format"
-                                                            )),
-                                                        }?;
-                                                        let entity_type: EntityType = EntityType(
-                                                            entity_type_str
-                                                                .parse::<u32>()
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_type"
-                                                                    )
-                                                                })?,
-                                                        );
-
-                                                        // Parse field_type
-                                                        let field_type_str = match &args[2] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid field_type format"
-                                                            )),
-                                                        }?;
-                                                        let field_type: FieldType = FieldType(
-                                                            field_type_str.parse::<u64>().map_err(
-                                                                |_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid field_type"
-                                                                    )
-                                                                },
-                                                            )?,
-                                                        );
-
-                                                        // Execute get field schema
-                                                        match self.store.get_field_schema(
-                                                            entity_type,
-                                                            field_type,
-                                                        ) {
-                                                            Ok(field_schema) => {
-                                                                let field_schema_resp = FieldSchemaResp::from_field_schema(&field_schema, &self.store);
-                                                                let encoded_schema =
-                                                                    field_schema_resp.encode();
-                                                                let response =
-                                                                    RespValue::BulkString(
-                                                                        &encoded_schema,
-                                                                    );
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Get field schema error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "SET_FIELD_SCHEMA" => {
-                                                    // Decode the command using the SetFieldSchemaCommand struct
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = SetFieldSchemaCommand::decode(&encoded)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to decode SET_FIELD_SCHEMA command: {}", e))?;
-
-                                                    // Convert FieldSchemaResp back to FieldSchema
-                                                    let field_schema_string =
-                                                        command.schema.to_field_schema();
-                                                    let field_schema =
-                                                        qlib_rs::FieldSchema::from_string_schema(
-                                                            field_schema_string,
-                                                            &self.store,
-                                                        );
-
-                                                    // Execute set field schema
-                                                    match self.store.set_field_schema(
-                                                        command.entity_type,
-                                                        command.field_type,
-                                                        field_schema,
-                                                    ) {
-                                                        Ok(_) => self.send_resp_response(
-                                                            token,
-                                                            RespValue::SimpleString("OK"),
-                                                        ),
-                                                        Err(e) => {
-                                                            let error_str = format!(
-                                                                "Set field schema error: {}",
-                                                                e
-                                                            );
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(&error_str),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "FIND_ENTITIES" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "FIND_ENTITIES requires entity_type"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_type
-                                                        let entity_type_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_type format"
-                                                            )),
-                                                        }?;
-                                                        let entity_type: EntityType = EntityType(
-                                                            entity_type_str
-                                                                .parse::<u32>()
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_type"
-                                                                    )
-                                                                })?,
-                                                        );
-
-                                                        // Parse optional filter
-                                                        let filter = if args.len() > 2 {
-                                                            match &args[2] {
-                                                                RespValue::BulkString(s) => {
-                                                                    let filter_str =
-                                                                        std::str::from_utf8(s)?;
-                                                                    if filter_str == "null"
-                                                                        || filter_str.is_empty()
-                                                                    {
-                                                                        Ok(None)
-                                                                    } else {
-                                                                        Ok(Some(filter_str))
-                                                                    }
-                                                                }
-                                                                RespValue::Null => Ok(None),
-                                                                _ => Err(anyhow::anyhow!(
-                                                                    "Invalid filter format"
-                                                                )),
-                                                            }
-                                                        } else {
-                                                            Ok(None)
-                                                        }?;
-
-                                                        // Execute find entities
-                                                        match self
-                                                            .store
-                                                            .find_entities(entity_type, filter)
-                                                        {
-                                                            Ok(entities) => {
-                                                                let response_struct =
-                                                                    EntityListResponse { entities };
-                                                                let response_bytes =
-                                                                    response_struct.encode();
-                                                                let (response, _) = RespValue::decode(&response_bytes)
-                                                                .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Find entities error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "FIND_ENTITIES_EXACT" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "FIND_ENTITIES_EXACT requires entity_type"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_type
-                                                        let entity_type_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_type format"
-                                                            )),
-                                                        }?;
-                                                        let entity_type: EntityType = EntityType(
-                                                            entity_type_str
-                                                                .parse::<u32>()
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_type"
-                                                                    )
-                                                                })?,
-                                                        );
-
-                                                        // Parse optional pagination options and filter
-                                                        let page_opts = if args.len() > 2 {
-                                                            match &args[2] {
-                                                                RespValue::BulkString(s) => {
-                                                                    let opts_str =
-                                                                        std::str::from_utf8(s)?;
-                                                                    if opts_str == "null"
-                                                                        || opts_str.is_empty()
-                                                                    {
-                                                                        Ok(None)
-                                                                    } else {
-                                                                        // Simple format: "limit,cursor" or just "limit"
-                                                                        let parts: Vec<&str> =
-                                                                            opts_str
-                                                                                .split(',')
-                                                                                .collect();
-                                                                        let limit = parts[0]
-                                                                            .parse::<usize>()
-                                                                            .unwrap_or(100);
-                                                                        let cursor = if parts.len()
-                                                                            > 1
-                                                                        {
-                                                                            Some(
-                                                                                parts[1]
-                                                                                    .parse::<usize>(
-                                                                                    )
-                                                                                    .unwrap_or(0),
-                                                                            )
-                                                                        } else {
-                                                                            None
-                                                                        };
-                                                                        Ok(Some(PageOpts::new(
-                                                                            limit, cursor,
-                                                                        )))
-                                                                    }
-                                                                }
-                                                                RespValue::Null => Ok(None),
-                                                                _ => Err(anyhow::anyhow!(
-                                                                    "Invalid page_opts format"
-                                                                )),
-                                                            }
-                                                        } else {
-                                                            Ok(None)
-                                                        }?;
-
-                                                        let filter = if args.len() > 3 {
-                                                            match &args[3] {
-                                                                RespValue::BulkString(s) => {
-                                                                    let filter_str =
-                                                                        std::str::from_utf8(s)?;
-                                                                    if filter_str == "null"
-                                                                        || filter_str.is_empty()
-                                                                    {
-                                                                        Ok(None)
-                                                                    } else {
-                                                                        Ok(Some(filter_str))
-                                                                    }
-                                                                }
-                                                                RespValue::Null => Ok(None),
-                                                                _ => Err(anyhow::anyhow!(
-                                                                    "Invalid filter format"
-                                                                )),
-                                                            }
-                                                        } else {
-                                                            Ok(None)
-                                                        }?;
-
-                                                        // Execute find entities exact
-                                                        match self.store.find_entities_exact(
-                                                            entity_type,
-                                                            page_opts.as_ref(),
-                                                            filter,
-                                                        ) {
-                                                            Ok(page_result) => {
-                                                                let response_struct =
-                                                                    PaginatedEntityResponse {
-                                                                        items: page_result.items,
-                                                                        total: page_result.total,
-                                                                        next_cursor: page_result
-                                                                            .next_cursor,
-                                                                    };
-                                                                let response_bytes =
-                                                                    response_struct.encode();
-                                                                let (response, _) = RespValue::decode(&response_bytes)
-                                                                .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Find entities exact error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "FIND_ENTITIES_PAGINATED" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "FIND_ENTITIES_PAGINATED requires entity_type"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_type
-                                                        let entity_type_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_type format"
-                                                            )),
-                                                        }?;
-                                                        let entity_type: EntityType = EntityType(
-                                                            entity_type_str
-                                                                .parse::<u32>()
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_type"
-                                                                    )
-                                                                })?,
-                                                        );
-
-                                                        // Parse optional pagination options and filter
-                                                        let page_opts = if args.len() > 2 {
-                                                            match &args[2] {
-                                                                RespValue::BulkString(s) => {
-                                                                    let opts_str =
-                                                                        std::str::from_utf8(s)?;
-                                                                    if opts_str == "null"
-                                                                        || opts_str.is_empty()
-                                                                    {
-                                                                        Ok(None)
-                                                                    } else {
-                                                                        // Simple format: "limit,cursor" or just "limit"
-                                                                        let parts: Vec<&str> =
-                                                                            opts_str
-                                                                                .split(',')
-                                                                                .collect();
-                                                                        let limit = parts[0]
-                                                                            .parse::<usize>()
-                                                                            .unwrap_or(100);
-                                                                        let cursor = if parts.len()
-                                                                            > 1
-                                                                        {
-                                                                            Some(
-                                                                                parts[1]
-                                                                                    .parse::<usize>(
-                                                                                    )
-                                                                                    .unwrap_or(0),
-                                                                            )
-                                                                        } else {
-                                                                            None
-                                                                        };
-                                                                        Ok(Some(
-                                                                            qlib_rs::PageOpts::new(
-                                                                                limit, cursor,
-                                                                            ),
-                                                                        ))
-                                                                    }
-                                                                }
-                                                                RespValue::Null => Ok(None),
-                                                                _ => Err(anyhow::anyhow!(
-                                                                    "Invalid page_opts format"
-                                                                )),
-                                                            }
-                                                        } else {
-                                                            Ok(None)
-                                                        }?;
-
-                                                        let filter = if args.len() > 3 {
-                                                            match &args[3] {
-                                                                RespValue::BulkString(s) => {
-                                                                    let filter_str =
-                                                                        std::str::from_utf8(s)?;
-                                                                    if filter_str == "null"
-                                                                        || filter_str.is_empty()
-                                                                    {
-                                                                        Ok(None)
-                                                                    } else {
-                                                                        Ok(Some(filter_str))
-                                                                    }
-                                                                }
-                                                                RespValue::Null => Ok(None),
-                                                                _ => Err(anyhow::anyhow!(
-                                                                    "Invalid filter format"
-                                                                )),
-                                                            }
-                                                        } else {
-                                                            Ok(None)
-                                                        }?;
-
-                                                        // Execute find entities paginated
-                                                        match self.store.find_entities_paginated(
-                                                            entity_type,
-                                                            page_opts.as_ref(),
-                                                            filter,
-                                                        ) {
-                                                            Ok(page_result) => {
-                                                                let response_struct =
-                                                                    PaginatedEntityResponse {
-                                                                        items: page_result.items,
-                                                                        total: page_result.total,
-                                                                        next_cursor: page_result
-                                                                            .next_cursor,
-                                                                    };
-                                                                let response_bytes =
-                                                                    response_struct.encode();
-                                                                let (response, _) = RespValue::decode(&response_bytes)
-                                                                .map_err(|e| anyhow::anyhow!("Failed to encode response: {}", e))?;
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Find entities paginated error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "GET_ENTITY_TYPES" => {
-                                                    // Execute get entity types
-                                                    match self.store.get_entity_types() {
-                                                        Ok(entity_types) => {
-                                                            let response_struct =
-                                                                EntityTypeListResponse {
-                                                                    entity_types,
-                                                                };
-                                                            let response_bytes =
-                                                                response_struct.encode();
-                                                            let (response, _) = RespValue::decode(
-                                                                &response_bytes,
-                                                            )
-                                                            .map_err(|e| {
-                                                                anyhow::anyhow!(
-                                                                    "Failed to encode response: {}",
-                                                                    e
-                                                                )
-                                                            })?;
-                                                            self.send_resp_response(token, response)
-                                                        }
-                                                        Err(e) => {
-                                                            let error_str = format!(
-                                                                "Get entity types error: {}",
-                                                                e
-                                                            );
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(&error_str),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "GET_ENTITY_TYPES_PAGINATED" => {
-                                                    // Parse optional pagination options
-                                                    let page_opts = if args.len() > 1 {
-                                                        match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                let opts_str =
-                                                                    std::str::from_utf8(s)?;
-                                                                if opts_str == "null"
-                                                                    || opts_str.is_empty()
-                                                                {
-                                                                    Ok(None)
-                                                                } else {
-                                                                    // Simple format: "limit,cursor" or just "limit"
-                                                                    let parts: Vec<&str> = opts_str
-                                                                        .split(',')
-                                                                        .collect();
-                                                                    let limit = parts[0]
-                                                                        .parse::<usize>()
-                                                                        .unwrap_or(100);
-                                                                    let cursor = if parts.len() > 1
-                                                                    {
-                                                                        Some(
-                                                                            parts[1]
-                                                                                .parse::<usize>()
-                                                                                .unwrap_or(0),
-                                                                        )
-                                                                    } else {
-                                                                        None
-                                                                    };
-                                                                    Ok(Some(PageOpts::new(
-                                                                        limit, cursor,
-                                                                    )))
-                                                                }
-                                                            }
-                                                            RespValue::Null => Ok(None),
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid page_opts format"
-                                                            )),
-                                                        }
-                                                    } else {
-                                                        Ok(None)
-                                                    }?;
-
-                                                    // Execute get entity types paginated
-                                                    match self.store.get_entity_types_paginated(
-                                                        page_opts.as_ref(),
-                                                    ) {
-                                                        Ok(page_result) => {
-                                                            let response_struct =
-                                                                PaginatedEntityTypeResponse {
-                                                                    items: page_result.items,
-                                                                    total: page_result.total,
-                                                                    next_cursor: page_result
-                                                                        .next_cursor,
-                                                                };
-                                                            let response_bytes =
-                                                                response_struct.encode();
-                                                            let (response, _) = RespValue::decode(
-                                                                &response_bytes,
-                                                            )
-                                                            .map_err(|e| {
-                                                                anyhow::anyhow!(
-                                                                    "Failed to encode response: {}",
-                                                                    e
-                                                                )
-                                                            })?;
-                                                            self.send_resp_response(token, response)
-                                                        }
-                                                        Err(e) => {
-                                                            let error_str = format!(
-                                                                "Get entity types paginated error: {}",
-                                                                e
-                                                            );
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(&error_str),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "ENTITY_EXISTS" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "ENTITY_EXISTS requires entity_id"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_id
-                                                        let entity_id_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?)
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.as_ref())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_id format"
-                                                            )),
-                                                        }?;
-                                                        let entity_id: EntityId = EntityId(
-                                                            entity_id_str.parse::<u64>().map_err(
-                                                                |_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_id"
-                                                                    )
-                                                                },
-                                                            )?,
-                                                        );
-
-                                                        // Execute entity exists check
-                                                        let exists =
-                                                            self.store.entity_exists(entity_id);
-                                                        let response_struct =
-                                                            BooleanResponse { result: exists };
-                                                        let response_bytes =
-                                                            response_struct.encode();
-                                                        let (response, _) = RespValue::decode(
-                                                            &response_bytes,
-                                                        )
-                                                        .map_err(|e| {
-                                                            anyhow::anyhow!(
-                                                                "Failed to encode response: {}",
-                                                                e
-                                                            )
-                                                        })?;
-                                                        self.send_resp_response(token, response)
-                                                    }
-                                                }
-                                                "FIELD_EXISTS" => {
-                                                    if args.len() < 3 {
-                                                        Err(anyhow::anyhow!(
-                                                            "FIELD_EXISTS requires entity_type and field_type"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_type
-                                                        let entity_type_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_type format"
-                                                            )),
-                                                        }?;
-                                                        let entity_type: EntityType = EntityType(
-                                                            entity_type_str
-                                                                .parse::<u32>()
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_type"
-                                                                    )
-                                                                })?,
-                                                        );
-
-                                                        // Parse field_type
-                                                        let field_type_str = match &args[2] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?
-                                                                    .to_string())
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.to_string())
-                                                            }
-                                                            RespValue::Integer(i) => {
-                                                                Ok(i.to_string())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid field_type format"
-                                                            )),
-                                                        }?;
-                                                        let field_type: FieldType = FieldType(
-                                                            field_type_str.parse::<u64>().map_err(
-                                                                |_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid field_type"
-                                                                    )
-                                                                },
-                                                            )?,
-                                                        );
-
-                                                        // Execute field exists check
-                                                        let exists = self
-                                                            .store
-                                                            .field_exists(entity_type, field_type);
-                                                        let response_struct =
-                                                            BooleanResponse { result: exists };
-                                                        let response_bytes =
-                                                            response_struct.encode();
-                                                        let (response, _) = RespValue::decode(
-                                                            &response_bytes,
-                                                        )
-                                                        .map_err(|e| {
-                                                            anyhow::anyhow!(
-                                                                "Failed to encode response: {}",
-                                                                e
-                                                            )
-                                                        })?;
-                                                        self.send_resp_response(token, response)
-                                                    }
-                                                }
-                                                "RESOLVE_INDIRECTION" => {
-                                                    if args.len() < 3 {
-                                                        Err(anyhow::anyhow!(
-                                                            "RESOLVE_INDIRECTION requires entity_id and field_path"
-                                                        ))
-                                                    } else {
-                                                        // Parse entity_id
-                                                        let entity_id_str = match &args[1] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?)
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.as_ref())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid entity_id format"
-                                                            )),
-                                                        }?;
-                                                        let entity_id: EntityId = EntityId(
-                                                            entity_id_str.parse::<u64>().map_err(
-                                                                |_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid entity_id"
-                                                                    )
-                                                                },
-                                                            )?,
-                                                        );
-
-                                                        // Parse field_path
-                                                        let field_path_str = match &args[2] {
-                                                            RespValue::BulkString(s) => {
-                                                                Ok(std::str::from_utf8(s)?)
-                                                            }
-                                                            RespValue::SimpleString(s) => {
-                                                                Ok(s.as_ref())
-                                                            }
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid field_path format"
-                                                            )),
-                                                        }?;
-
-                                                        let field_path: Vec<FieldType> =
-                                                            if field_path_str.is_empty() {
-                                                                vec![]
-                                                            } else {
-                                                                field_path_str.split(',')
-                                                            .map(|s| s.trim().parse::<u64>().map(|v| FieldType(v)))
-                                                            .collect::<std::result::Result<Vec<_>, _>>()
-                                                            .map_err(|_| anyhow::anyhow!("Invalid field_path"))?
-                                                            };
-
-                                                        // Execute resolve indirection
-                                                        match self.store.resolve_indirection(
-                                                            entity_id,
-                                                            &field_path,
-                                                        ) {
-                                                            Ok((
-                                                                resolved_entity_id,
-                                                                resolved_field_type,
-                                                            )) => {
-                                                                let entity_id_bytes = format!(
-                                                                    "{}",
-                                                                    resolved_entity_id.0
-                                                                )
-                                                                .into_bytes();
-                                                                let response =
-                                                                    RespValue::Array(vec![
-                                                                        RespValue::BulkString(
-                                                                            &entity_id_bytes,
-                                                                        ),
-                                                                        RespValue::Integer(
-                                                                            resolved_field_type.0
-                                                                                as i64,
-                                                                        ),
-                                                                    ]);
-                                                                self.send_resp_response(
-                                                                    token, response,
-                                                                )
-                                                            }
-                                                            Err(e) => {
-                                                                let error_str = format!(
-                                                                    "Resolve indirection error: {}",
-                                                                    e
-                                                                );
-                                                                self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::Error(&error_str),
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                "TAKE_SNAPSHOT" => {
-                                                    // Execute take snapshot
-                                                    let snapshot = self.store.take_snapshot();
-                                                    let encoded_snapshot = serde_json::to_vec(
-                                                        &snapshot,
-                                                    )
-                                                    .map_err(|e| {
-                                                        anyhow::anyhow!(
-                                                            "Failed to serialize snapshot: {}",
-                                                            e
-                                                        )
-                                                    })?;
-                                                    let response =
-                                                        RespValue::BulkString(&encoded_snapshot);
-                                                    self.send_resp_response(token, response)
-                                                }
-                                                "REGISTER_NOTIFICATION" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "REGISTER_NOTIFICATION requires config"
-                                                        ))
-                                                    } else {
-                                                        // Parse notification config
-                                                        let config_bytes = match &args[1] {
-                                                            RespValue::BulkString(s) => Ok(s),
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid config format"
-                                                            )),
-                                                        }?;
-                                                        let (config, _) =
-                                                            NotifyConfig::decode(config_bytes)
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid config encoding"
-                                                                    )
-                                                                })?;
-
-                                                        // Get the connection's notification queue
-                                                        if let Some(connection) =
-                                                            self.connections.get_mut(&token)
-                                                        {
-                                                            connection
-                                                                .notification_configs
-                                                                .insert(config.clone());
-
-                                                            match self.store.register_notification(
-                                                                config.clone(),
-                                                                connection
-                                                                    .notification_queue
-                                                                    .clone(),
-                                                            ) {
-                                                                Ok(_) => self.send_resp_response(
-                                                                    token,
-                                                                    RespValue::SimpleString("OK"),
-                                                                ),
-                                                                Err(e) => {
-                                                                    let error_str = format!(
-                                                                        "Register notification error: {}",
-                                                                        e
-                                                                    );
-                                                                    self.send_resp_response(
-                                                                        token,
-                                                                        RespValue::Error(
-                                                                            &error_str,
-                                                                        ),
-                                                                    )
-                                                                }
-                                                            }
-                                                        } else {
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(
-                                                                    "Connection not found",
-                                                                ),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                "UNREGISTER_NOTIFICATION" => {
-                                                    if args.len() <= 1 {
-                                                        Err(anyhow::anyhow!(
-                                                            "UNREGISTER_NOTIFICATION requires config"
-                                                        ))
-                                                    } else {
-                                                        // Parse notification config
-                                                        let config_bytes = match &args[1] {
-                                                            RespValue::BulkString(s) => Ok(s),
-                                                            _ => Err(anyhow::anyhow!(
-                                                                "Invalid config format"
-                                                            )),
-                                                        }?;
-                                                        let (config, _) =
-                                                            NotifyConfig::decode(config_bytes)
-                                                                .map_err(|_| {
-                                                                    anyhow::anyhow!(
-                                                                        "Invalid config encoding"
-                                                                    )
-                                                                })?;
-
-                                                        // Get the connection's notification queue
-                                                        if let Some(connection) =
-                                                            self.connections.get_mut(&token)
-                                                        {
-                                                            connection
-                                                                .notification_configs
-                                                                .remove(&config);
-
-                                                            let removed =
-                                                                self.store.unregister_notification(
-                                                                    &config,
-                                                                    &connection.notification_queue,
-                                                                );
-                                                            let response =
-                                                                RespValue::Integer(if removed {
-                                                                    1
-                                                                } else {
-                                                                    0
-                                                                });
-                                                            self.send_resp_response(token, response)
-                                                        } else {
-                                                            self.send_resp_response(
-                                                                token,
-                                                                RespValue::Error(
-                                                                    "Connection not found",
-                                                                ),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                // Peer protocol commands
-                                                "PEER_HANDSHAKE" => {
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = PeerHandshakeCommand::decode(&encoded)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to decode PEER_HANDSHAKE command: {}", e))?;
-
-                                                    self.handle_peer_handshake(
-                                                        token,
-                                                        command.start_time,
-                                                        command.is_response,
-                                                        command.machine_id,
-                                                    )?;
-
-                                                    // Send OK response
-                                                    let ok_response = RespValue::SimpleString("OK");
-                                                    self.send_resp_response(token, ok_response)
-                                                }
-                                                "FULL_SYNC_REQUEST" => {
-                                                    self.handle_peer_full_sync_request(token)
-                                                }
-                                                "FULL_SYNC_RESPONSE" => {
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = FullSyncResponseCommand::decode(&encoded)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to decode FULL_SYNC_RESPONSE command: {}", e))?;
-
-                                                    self.handle_peer_full_sync_response(
-                                                        token,
-                                                        command.snapshot_data,
-                                                    )
-                                                }
-                                                "SYNC_WRITE" => {
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = SyncWriteCommand::decode(&encoded)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to decode SYNC_WRITE command: {}", e))?;
-
-                                                    self.handle_peer_sync_write(
-                                                        token,
-                                                        command.requests_data,
-                                                    )
-                                                }
-                                                "NOTIFICATION" => {
-                                                    let encoded =
-                                                        RespValue::Array(args[1..].to_vec())
-                                                            .encode();
-                                                    let (command, _) = NotificationCommand::decode(&encoded)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to decode NOTIFICATION command: {}", e))?;
-
-                                                    // Deserialize the notification
-                                                    let notification: qlib_rs::Notification = serde_json::from_str(&command.notification_data)
-                                                    .map_err(|e| anyhow::anyhow!("Failed to deserialize notification: {}", e))?;
-
-                                                    debug!(
-                                                        "Received notification from peer: {:?}",
-                                                        notification
-                                                    );
-
-                                                    // Forward the notification to local clients if needed
-                                                    // This might require additional logic based on your notification system
-
-                                                    Ok(())
-                                                }
-                                                cmd_name => Err(anyhow::anyhow!(
-                                                    "Unknown command: {}",
-                                                    cmd_name
-                                                )),
-                                            }
-                                        } else {
-                                            let error_str = "Invalid command name";
-                                            self.send_resp_response(
-                                                token,
-                                                RespValue::Error(error_str),
-                                            )
+                            match command.schema.to_entity_schema(&self.store) {
+                                Ok(schema_string) => {
+                                    match self.store.update_schema(schema_string) {
+                                        Ok(_) => {
+                                            self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
+                                        }
+                                        Err(e) => {
+                                            self.send_resp_response(token, RespValue::Error(format!("Update schema error: {}", e).as_str()).encode())?;
                                         }
                                     }
                                 }
-                                other => {
-                                    warn!(
-                                        "Ignoring unsolicited RESP value from {:?}: {:?}",
-                                        token, other
-                                    );
-                                    Ok(())
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Schema conversion error: {}", e).as_str()).encode())?;
                                 }
-                            };
-                        }
-                        Err(_) => break, // Incomplete command
-                    }
-                }
+                            }
+                        } else if let Ok((command, next_remaining)) = GetFieldSchemaCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
 
-                // Remove processed data from the buffer
-                if total_consumed > 0 {
-                    if let Some(connection) = self.connections.get_mut(&token) {
-                        connection.read_buffer.drain(0..total_consumed);
+                            match self.store.get_field_schema(command.entity_type, command.field_type) {
+                                Ok(schema) => {
+                                    let response = FieldSchemaResponse::from_field_schema(&schema);
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Get field schema error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = SetFieldSchemaCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            let field_schema = qlib_rs::FieldSchema::from_string_schema(&command.schema.to_field_schema());
+                            match self.store.set_field_schema(command.entity_type, command.field_type, field_schema) {
+                                Ok(_) => {
+                                    self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Set field schema error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = FindEntitiesCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            match self.store.find_entities(command.entity_type, command.filter.as_deref()) {
+                                Ok(entities) => {
+                                    let response = EntityListResponse { entities };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Find entities error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = FindEntitiesExactCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            match self.store.find_entities_exact(command.entity_type, command.filter.as_deref()) {
+                                Ok(entities) => {
+                                    let response = EntityListResponse { entities };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Find entities exact error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = FindEntitiesPaginatedCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            match self.store.find_entities_paginated(command.entity_type, command.filter.as_deref(), &command.page_opts) {
+                                Ok(result) => {
+                                    let response = PaginatedEntityResponse { 
+                                        entities: result.items,
+                                        has_more: result.has_more,
+                                        total_count: result.total_count,
+                                        next_cursor: result.next_cursor,
+                                    };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Find entities paginated error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = GetEntityTypesCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            match self.store.get_entity_types() {
+                                Ok(entity_types) => {
+                                    let response = EntityTypeListResponse { entity_types };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Get entity types error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = GetEntityTypesPaginatedCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            match self.store.get_entity_types_paginated(&command.page_opts) {
+                                Ok(result) => {
+                                    let response = PaginatedEntityTypeResponse { 
+                                        entity_types: result.items,
+                                        has_more: result.has_more,
+                                        total_count: result.total_count,
+                                        next_cursor: result.next_cursor,
+                                    };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Get entity types paginated error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = EntityExistsCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            match self.store.entity_exists(command.entity_id) {
+                                Ok(exists) => {
+                                    let response = BooleanResponse { value: exists };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Entity exists error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = FieldExistsCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            match self.store.field_exists(command.entity_type, command.field_type) {
+                                Ok(exists) => {
+                                    let response = BooleanResponse { value: exists };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Field exists error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((command, next_remaining)) = ResolveIndirectionCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            match self.store.resolve_indirection(command.entity_id, &command.fields) {
+                                Ok((entity_ids, reason)) => {
+                                    let response = ResolveIndirectionResponse { entity_ids, reason };
+                                    self.send_response(token, &response)?;
+                                }
+                                Err(e) => {
+                                    self.send_resp_response(token, RespValue::Error(format!("Resolve indirection error: {}", e).as_str()).encode())?;
+                                }
+                            }
+                        } else if let Ok((_command, next_remaining)) = TakeSnapshotCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            let snapshot = self.store.take_snapshot();
+                            if let Some(snapshot_handle) = &self.snapshot_handle {
+                                snapshot_handle.save(snapshot.clone());
+                            }
+                            let response = SnapshotResponse::from_snapshot(&snapshot);
+                            self.send_response(token, &response)?;
+                        } else if let Ok((command, next_remaining)) = RegisterNotificationCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            // Parse notification config
+                            let config = command.config;
+
+                            // Get the connection's notification queue
+                            if let Some(connection) = self.connections.get_mut(&token) {
+                                connection.notification_configs.insert(config.clone());
+
+                                match self.store.register_notification(
+                                    config.clone(),
+                                    connection.notification_queue.clone(),
+                                ) {
+                                    Ok(_) => self.send_resp_response(
+                                        token,
+                                        RespValue::SimpleString("OK").encode(),
+                                    )?,
+                                    Err(e) => {
+                                        let error_str = format!("Register notification error: {}", e);
+                                        self.send_resp_response(
+                                            token,
+                                            RespValue::Error(&error_str).encode(),
+                                        )?
+                                    }
+                                }
+                            } else {
+                                self.send_resp_response(
+                                    token,
+                                    RespValue::Error("Connection not found").encode(),
+                                )?
+                            }
+                        } else if let Ok((command, next_remaining)) = UnregisterNotificationCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+
+                            // Get the connection's notification queue
+                            if let Some(connection) = self.connections.get_mut(&token) {
+                                connection.notification_configs.remove(&command.config);
+                                let removed = self.store.unregister_notification(
+                                    &command.config,
+                                    &connection.notification_queue,
+                                );
+                                let response = RespValue::Integer(if removed { 1 } else { 0 });
+                                self.send_resp_response(token, response.encode())?
+                            } else {
+                                self.send_resp_response(
+                                    token,
+                                    RespValue::Error("Connection not found").encode(),
+                                )?
+                            }
+                        } else if let Ok((command, next_remaining)) = PeerHandshakeCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+                            self.handle_peer_handshake(
+                                token,
+                                command.start_time,
+                                command.is_response,
+                                command.machine_id,
+                            )?;
+                            // Send OK response
+                            let ok_response = RespValue::SimpleString("OK");
+                            self.send_resp_response(token, ok_response.encode())?;
+                        } else if let Ok((_, next_remaining)) = FullSyncRequestCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+                            self.handle_peer_full_sync_request(token)?;
+                        } else if let Ok((command, next_remaining)) = FullSyncResponseCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+                            self.handle_peer_full_sync_response(
+                                token,
+                                command.snapshot_data,
+                            )?;
+                        } else if let Ok((command, next_remaining)) = SyncWriteCommand::decode(&remaining) {
+                            consumed = remaining.len() - next_remaining.len();
+                            self.handle_peer_sync_write(
+                                token,
+                                command.requests_data,
+                            )?;
+                        } else {
+                            // No complete command could be parsed
+                            break;
+                        }
+
+                        // Update the buffer to remove consumed data
+                        if consumed > 0 {
+                            if let Some(connection) = self.connections.get_mut(&token) {
+                                connection.read_buffer.drain(0..consumed);
+                            }
+                        }
+                    } else {
+                        return Err(anyhow::anyhow!("Connection not found"));
                     }
                 }
             }
