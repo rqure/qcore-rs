@@ -1755,20 +1755,23 @@ impl CoreService {
         
         // Apply the write to our store
         match write_info {
-            WriteInfo::CreateEntity { entity_type, parent_id, name, created_entity_id, timestamp } => {
-                self.store.create_entity(entity_type, parent_id, &name, Some(created_entity_id), Some(timestamp))
+            WriteInfo::CreateEntity { entity_type, parent_id, name, created_entity_id, .. } => {
+                let _result_id = self.store.create_entity_with_id(entity_type, parent_id, &mut Some(created_entity_id), name.as_str())
                     .map_err(|e| anyhow::anyhow!("Failed to apply CreateEntity from peer: {}", e))?;
             }
-            WriteInfo::DeleteEntity { entity_id, timestamp } => {
-                self.store.delete_entity(entity_id, Some(timestamp))
+            WriteInfo::DeleteEntity { entity_id, .. } => {
+                self.store.delete_entity(entity_id)
                     .map_err(|e| anyhow::anyhow!("Failed to apply DeleteEntity from peer: {}", e))?;
             }
             WriteInfo::FieldUpdate { entity_id, field_type, value, push_condition, adjust_behavior, write_time, writer_id } => {
-                self.store.write(entity_id, field_type, &value, push_condition, adjust_behavior, Some(write_time), writer_id)
-                    .map_err(|e| anyhow::anyhow!("Failed to apply FieldUpdate from peer: {}", e))?;
+                if let Some(value) = value {
+                    self.store.write(entity_id, &[field_type], value, writer_id, write_time, Some(push_condition), Some(adjust_behavior))
+                        .map_err(|e| anyhow::anyhow!("Failed to apply FieldUpdate from peer: {}", e))?;
+                }
             }
-            WriteInfo::SchemaUpdate { schema, timestamp } => {
-                self.store.update_schema(&schema, Some(timestamp))
+            WriteInfo::SchemaUpdate { schema, .. } => {
+                let string_schema = schema.to_string_schema(&self.store);
+                self.store.update_schema(string_schema)
                     .map_err(|e| anyhow::anyhow!("Failed to apply SchemaUpdate from peer: {}", e))?;
             }
             WriteInfo::Snapshot { .. } => {
@@ -1916,27 +1919,30 @@ impl CoreService {
                 debug!("Replaying {} WAL writes", writes.len());
                 for write_info in writes {
                     match write_info {
-                        WriteInfo::CreateEntity { entity_type, parent_id, name, created_entity_id, timestamp } => {
-                            if let Err(e) = self.store.create_entity(entity_type, parent_id, &name, Some(created_entity_id), Some(timestamp)) {
+                        WriteInfo::CreateEntity { entity_type, parent_id, name, created_entity_id: _, timestamp: _ } => {
+                            if let Err(e) = self.store.create_entity(entity_type, parent_id, &name) {
                                 warn!("Failed to replay CreateEntity for {}: {}", name, e);
                             }
                         }
-                        WriteInfo::DeleteEntity { entity_id, timestamp } => {
-                            if let Err(e) = self.store.delete_entity(entity_id, Some(timestamp)) {
+                        WriteInfo::DeleteEntity { entity_id, timestamp: _ } => {
+                            if let Err(e) = self.store.delete_entity(entity_id) {
                                 warn!("Failed to replay DeleteEntity for {:?}: {}", entity_id, e);
                             }
                         }
-                        WriteInfo::FieldUpdate { entity_id, field_type, value, timestamp } => {
-                            if let Err(e) = self.store.write(entity_id, &[field_type], value, None, None, None, Some(timestamp)) {
-                                warn!("Failed to replay FieldUpdate for {:?}: {}", entity_id, e);
+                        WriteInfo::FieldUpdate { entity_id, field_type, value, push_condition, adjust_behavior, write_time, writer_id } => {
+                            if let Some(value) = value {
+                                if let Err(e) = self.store.write(entity_id, &[field_type], value, writer_id, write_time, Some(push_condition), Some(adjust_behavior)) {
+                                    warn!("Failed to replay FieldUpdate for {:?}: {}", entity_id, e);
+                                }
                             }
                         }
-                        WriteInfo::SchemaUpdate { schema, timestamp } => {
-                            if let Err(e) = self.store.update_schema(&schema, Some(timestamp)) {
+                        WriteInfo::SchemaUpdate { schema, timestamp: _ } => {
+                            let string_schema = schema.to_string_schema(&self.store);
+                            if let Err(e) = self.store.update_schema(string_schema) {
                                 warn!("Failed to replay SchemaUpdate: {}", e);
                             }
                         }
-                        WriteInfo::Snapshot { snapshot_counter, timestamp } => {
+                        WriteInfo::Snapshot { snapshot_counter, timestamp: _ } => {
                             warn!("Skipping replay of Snapshot write (counter {})", snapshot_counter);
                         }
                     }

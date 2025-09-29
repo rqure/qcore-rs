@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{sread, EntityId, EntityType, IndirectFieldType, PageOpts, PageResult, Requests, StoreProxy, Value};
+use qlib_rs::{EntityId, EntityType, FieldType, PageOpts, PageResult, StoreProxy, Value};
 use std::collections::HashMap;
 use tracing::{info, debug};
 use serde_json;
@@ -292,8 +292,6 @@ fn main() -> Result<()> {
         "Starting select tool"
     );
 
-
-
     // Mark end of initialization
     metrics.initialization_time = total_start.elapsed();
 
@@ -301,7 +299,7 @@ fn main() -> Result<()> {
     
     // Connect to the Core service
     let connection_start = Instant::now();
-    let mut store = StoreProxy::connect(&config.core_url)
+    let store = StoreProxy::connect(&config.core_url)
         .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
     metrics.connection_time = connection_start.elapsed();
 
@@ -313,7 +311,7 @@ fn main() -> Result<()> {
 
     // Execute the query
     let query_start = Instant::now();
-    let (results, pages_fetched) = execute_query(&mut store, entity_type, config.filter.as_deref(), config.exact, config.limit, config.page_size)
+    let (results, pages_fetched) = execute_query(&store, entity_type, config.filter.as_deref(), config.exact, config.limit, config.page_size)
         .context("Failed to execute query")?;
     metrics.query_time = query_start.elapsed();
     metrics.entities_found = results.len();
@@ -322,12 +320,12 @@ fn main() -> Result<()> {
     info!("Found {} matching entities", results.len());
 
     // Parse fields to display
-    let fields_to_display = parse_fields(&mut store, &config.fields)
+    let fields_to_display = parse_fields(&store, &config.fields)
         .context("Failed to parse field types")?;
 
     // Fetch field values for the results
     let field_fetch_start = Instant::now();
-    let (entities_with_data, fields_fetched) = fetch_entity_data(&mut store, &results, &fields_to_display)
+    let (entities_with_data, fields_fetched) = fetch_entity_data(&store, &results, &fields_to_display)
         .context("Failed to fetch entity data")?;
     metrics.field_fetch_time = field_fetch_start.elapsed();
     metrics.fields_fetched = fields_fetched;
@@ -360,7 +358,7 @@ fn main() -> Result<()> {
 
 /// Execute the query against the store
 fn execute_query(
-    store: &mut StoreProxy,
+    store: &StoreProxy,
     entity_type: EntityType,
     filter: Option<&str>,
     exact: bool,
@@ -380,11 +378,7 @@ fn execute_query(
     );
 
     loop {
-        let page_result: PageResult<EntityId> = if exact {
-            store.find_entities_exact(entity_type, page_opts.as_ref(), filter.as_deref())?
-        } else {
-            store.find_entities_paginated(entity_type, page_opts.as_ref(), filter.as_deref())?
-        };
+        let page_result: PageResult<EntityId> = store.find_entities_paginated(entity_type, page_opts.as_ref(), filter)?;
 
         pages_fetched += 1;
 
@@ -416,7 +410,7 @@ fn execute_query(
 }
 
 /// Parse the fields parameter into a list of field paths (Vec<FieldType> for each field)
-fn parse_fields(store: &mut StoreProxy, fields: &Option<String>) -> Result<Vec<(String, IndirectFieldType)>> {
+fn parse_fields(store: &StoreProxy, fields: &Option<String>) -> Result<Vec<(String, Vec<FieldType>)>> {
     let field_names = match fields {
         Some(fields_str) => fields_str
             .split(',')
@@ -430,7 +424,7 @@ fn parse_fields(store: &mut StoreProxy, fields: &Option<String>) -> Result<Vec<(
     for field_name in field_names {
         // Parse field indirection syntax (e.g., "Parent->Name")
         let field_parts: Vec<&str> = field_name.split("->").collect();
-        let mut field_types = IndirectFieldType::new();
+        let mut field_types = Vec::new();
         
         for part in field_parts {
             let field_type = store.get_field_type(part)
@@ -446,44 +440,35 @@ fn parse_fields(store: &mut StoreProxy, fields: &Option<String>) -> Result<Vec<(
 
 /// Fetch field data for the given entities
 fn fetch_entity_data(
-    store: &mut StoreProxy,
+    store: &StoreProxy,
     entity_ids: &[EntityId],
-    fields: &[(String, IndirectFieldType)],
+    fields: &[(String, Vec<FieldType>)],
 ) -> Result<(Vec<EntityDisplay>, usize)> {
     let mut results = Vec::new();
     let mut fields_fetched = 0;
 
-
     for entity_id in entity_ids {
         debug!("Fetching data for entity: {:?}", entity_id);
-        let reqs = Requests::new(vec![]);
-
-        for (_, field_types) in fields {
-            reqs.push(sread!(*entity_id, field_types.clone()));
-        }
-
-        match store.perform(reqs) {
-            Ok(res) => {
-                fields_fetched += fields.len();
-                results.push(EntityDisplay {
-                    entity_id: *entity_id,
-                    entity_type: store.resolve_entity_type(entity_id.extract_type())
-                        .unwrap_or_else(|_| format!("Unknown({})", entity_id.extract_type().0)),
-                    fields: res
-                        .read()
-                        .iter().enumerate().map(|(i, r)| {
-                        let field_name = fields[i].0.clone();
-                        let display_value = r.value()
-                            .map(|v| DisplayValue::from_value(Some(&v)))
-                            .unwrap_or(DisplayValue::None);
-                        (field_name, display_value)
-                    }).collect(),
-                });
-            },
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to fetch fields: {}", e));
+        let mut entity_fields = std::collections::HashMap::new();
+        
+        for (field_name, field_types) in fields {
+            match store.read(*entity_id, field_types) {
+                Ok((value, _, _)) => {
+                    entity_fields.insert(field_name.clone(), DisplayValue::from_value(Some(&value)));
+                    fields_fetched += 1;
+                }
+                Err(_) => {
+                    entity_fields.insert(field_name.clone(), DisplayValue::None);
+                }
             }
         }
+
+        results.push(EntityDisplay {
+            entity_id: *entity_id,
+            entity_type: store.resolve_entity_type(entity_id.extract_type())
+                .unwrap_or_else(|_| format!("Unknown({})", entity_id.extract_type().0)),
+            fields: entity_fields,
+        });
     }
 
     Ok((results, fields_fetched))

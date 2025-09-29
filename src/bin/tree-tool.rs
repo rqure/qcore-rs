@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{ft, sfield, sread, sreq, EntityId, EntityType, StoreProxy, Value};
+use qlib_rs::{ft, EntityId, EntityType, StoreProxy, Value};
 use tracing::{info, warn};
 
 /// Command-line tool for displaying the tree structure of the QCore data store
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
     info!(core_url = %config.core_url, "Connecting to QCore service");
     
     // Connect to the Core service
-    let mut store = StoreProxy::connect(&config.core_url)
+    let store = StoreProxy::connect(&config.core_url)
         .with_context(|| format!("Failed to connect to Core service at {}", config.core_url))?;
 
     info!("Connected successfully, building tree structure");
@@ -88,12 +88,12 @@ fn main() -> Result<()> {
         EntityId::new(EntityType(type_id), entity_id)
     } else {
         // Find the Root entity
-        find_root_entity(&mut store)
+        find_root_entity(&store)
             .context("Failed to find Root entity")?
     };
 
     // Build the tree structure
-    let tree = build_tree(&mut store, root_entity_id, config.max_depth, 0)
+    let tree = build_tree(&store, root_entity_id, config.max_depth, 0)
         .context("Failed to build tree structure")?;
 
     // Print the tree
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
 }
 
 /// Find the Root entity in the data store
-fn find_root_entity(store: &mut StoreProxy) -> Result<EntityId> {
+fn find_root_entity(store: &StoreProxy) -> Result<EntityId> {
     // Look for entities of type "Root"
     let root_type = store.get_entity_type("Root")
         .context("Failed to get Root entity type")?;
@@ -120,12 +120,12 @@ fn find_root_entity(store: &mut StoreProxy) -> Result<EntityId> {
         warn!("Multiple Root entities found, using the first one");
     }
 
-    Ok(entities[0].clone())
+    Ok(entities[0])
 }
 
 /// Build the tree structure recursively
 fn build_tree(
-    store: &mut StoreProxy, 
+    store: &StoreProxy, 
     entity_id: EntityId, 
     max_depth: usize, 
     current_depth: usize
@@ -133,7 +133,7 @@ fn build_tree(
     // Check depth limit
     if max_depth > 0 && current_depth >= max_depth {
         return Ok(TreeNode {
-            entity_id: entity_id,
+            entity_id,
             entity_type: "...".to_string(),
             name: "...".to_string(),
             children: vec![],
@@ -178,7 +178,7 @@ fn build_tree(
 }
 
 /// Get the entity type for a given entity ID
-fn get_entity_type(store: &mut StoreProxy, entity_id: EntityId) -> Result<String> {
+fn get_entity_type(store: &StoreProxy, entity_id: EntityId) -> Result<String> {
     // Extract the entity type from the entity ID and resolve it to a string
     let entity_type = entity_id.extract_type();
     store.resolve_entity_type(entity_type)
@@ -186,33 +186,25 @@ fn get_entity_type(store: &mut StoreProxy, entity_id: EntityId) -> Result<String
 }
 
 /// Get the name of an entity
-fn get_entity_name(store: &mut StoreProxy, entity_id: EntityId) -> Result<String> {
+fn get_entity_name(store: &StoreProxy, entity_id: EntityId) -> Result<String> {
     let name_ft = store.get_field_type(ft::NAME)
         .context("Failed to get Name field type")?;
-    let results = store.perform(sreq![sread!(entity_id, sfield![name_ft])])?;
     
-    if let Some(request) = results.first() {
-        if let Some(Value::String(name)) = request.value() {
-            return Ok(name.as_str().into());
-        }
+    match store.read(entity_id, &[name_ft]) {
+        Ok((Value::String(name), _, _)) => Ok(name),
+        _ => Ok("Unnamed".to_string()),
     }
-    
-    Ok("Unnamed".to_string())
 }
 
 /// Get the children of an entity
-fn get_entity_children(store: &mut StoreProxy, entity_id: EntityId) -> Result<Vec<EntityId>> {
+fn get_entity_children(store: &StoreProxy, entity_id: EntityId) -> Result<Vec<EntityId>> {
     let children_ft = store.get_field_type(ft::CHILDREN)
         .context("Failed to get Children field type")?;
-    let results = store.perform(sreq![sread!(entity_id, sfield![children_ft])])?;
-
-    if let Some(request) = results.first() {
-        if let Some(Value::EntityList(children)) = request.value() {
-            return Ok(children.clone());
-        }
-    }
     
-    Ok(vec![])
+    match store.read(entity_id, &[children_ft]) {
+        Ok((Value::EntityList(children), _, _)) => Ok(children),
+        _ => Ok(vec![]),
+    }
 }
 
 /// Print the tree structure using ASCII tree characters

@@ -8,6 +8,14 @@ name = "qcore-rs"
 path = "src/main.rs"
 
 [[bin]]
+name = "benchmark-tool"
+path = "src/bin/benchmark-tool.rs"
+
+[[bin]]
+name = "select-tool"
+path = "src/bin/select-tool.rs"
+
+[[bin]]
 name = "snapshot-tool"
 path = "src/bin/snapshot-tool.rs"
 
@@ -19,13 +27,22 @@ path = "src/bin/tree-tool.rs"
 name = "wal-tool"
 path = "src/bin/wal-tool.rs"
 
-[[bin]]
-name = "select-tool"
-path = "src/bin/select-tool.rs"
+# TODO: Fix these tools - they use deprecated APIs
+# [[bin]]
+# name = "tree-tool"
+# path = "src/bin/tree-tool.rs"
 
-[[bin]]
-name = "benchmark-tool"
-path = "src/bin/benchmark-tool.rs"
+# [[bin]]
+# name = "wal-tool"
+# path = "src/bin/wal-tool.rs"
+
+# [[bin]]
+# name = "select-tool"
+# path = "src/bin/select-tool.rs"
+
+# [[bin]]
+# name = "benchmark-tool"
+# path = "src/bin/benchmark-tool.rs"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

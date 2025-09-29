@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use futures::future;
-use qlib_rs::{sfield, sstr, swrite, sread, EntityId, PageOpts, Requests, AsyncStoreProxy};
-use std::sync::Arc;
+use qlib_rs::{EntityId, PageOpts, StoreProxy, Value};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::task;
+use std::thread;
 use tracing::{error, info, warn};
 use tracing_subscriber;
 
@@ -20,8 +19,6 @@ struct Config {
     #[arg(short = 'p', long, default_value_t = 9100)]
     port: u16,
 
-
-
     /// Number of parallel connections (default 50)
     #[arg(short = 'c', long, default_value_t = 50)]
     clients: usize,
@@ -29,14 +26,6 @@ struct Config {
     /// Total number of requests (default 100000)
     #[arg(short = 'n', long, default_value_t = 100000)]
     requests: u64,
-
-    /// Pipeline <numreq> requests. Default 1 (no pipeline)
-    #[arg(short = 'P', long, default_value_t = 1)]
-    pipeline: usize,
-
-    /// Number of concurrent tasks per client (default 64)
-    #[arg(long, default_value_t = 64)]
-    concurrency: usize,
 
     /// Data size of SET/GET value in bytes (default 3)
     #[arg(short = 'd', long, default_value_t = 3)]
@@ -77,7 +66,6 @@ enum BenchmarkTest {
     FindEntities,
     WriteEntity,
     SearchEntities,
-    BulkWrite,
     ReadField,
 }
 
@@ -88,7 +76,6 @@ impl BenchmarkTest {
             "findentities" | "find" => Some(Self::FindEntities),
             "writeentity" | "write" | "set" => Some(Self::WriteEntity),
             "searchentities" | "search" => Some(Self::SearchEntities),
-            "bulkwrite" | "bulk" => Some(Self::BulkWrite),
             "readfield" | "read" | "get" => Some(Self::ReadField),
             _ => None,
         }
@@ -100,7 +87,6 @@ impl BenchmarkTest {
             Self::FindEntities => "FINDENTITIES",
             Self::WriteEntity => "WRITEENTITY",
             Self::SearchEntities => "SEARCHENTITIES",
-            Self::BulkWrite => "BULKWRITE",
             Self::ReadField => "READFIELD",
         }
     }
@@ -111,7 +97,6 @@ impl BenchmarkTest {
             Self::FindEntities,
             Self::WriteEntity,
             Self::SearchEntities,
-            Self::BulkWrite,
             Self::ReadField,
         ]
     }
@@ -125,13 +110,6 @@ struct TestResult {
     failed_requests: u64,
     latencies: Vec<Duration>,
     duration: Duration,
-}
-
-#[derive(Debug)]
-struct RequestBatchResult {
-    requests_in_batch: u64,
-    latencies: Vec<Duration>,
-    success: bool,
 }
 
 impl TestResult {
@@ -170,34 +148,33 @@ struct BenchmarkContext {
 }
 
 impl BenchmarkContext {
-    async fn new(config: Arc<Config>) -> Result<Self> {
+    fn new(config: Arc<Config>) -> Result<Self> {
         let mut context = Self {
             config,
             test_entities: Vec::new(),
             test_entity_id: None,
         };
-        context.initialize().await?;
+        context.initialize()?;
         Ok(context)
     }
 
-    async fn initialize(&mut self) -> Result<()> {
+    fn initialize(&mut self) -> Result<()> {
         // Connect to load test data
         let url = format!("{}:{}", self.config.host, self.config.port);
-        let store = AsyncStoreProxy::connect(
-            &url,
-        ).await.context("Failed to connect for initialization")?;
+        let store = StoreProxy::connect(&url)
+            .context("Failed to connect for initialization")?;
 
         // Load existing entities for read operations
-        if let Ok(entity_type) = store.get_entity_type(&self.config.entity_type).await {
-            if let Ok(entities) = store.find_entities(entity_type, None).await {
+        if let Ok(entity_type) = store.get_entity_type(&self.config.entity_type) {
+            if let Ok(entities) = store.find_entities(entity_type, None) {
                 self.test_entities = entities;
                 info!("Found {} existing {} entities", self.test_entities.len(), self.config.entity_type);
             }
         }
 
         // Find or create test entity for write operations
-        if let Ok(perf_test_et) = store.get_entity_type("PerfTestEntity").await {
-            let entities = store.find_entities(perf_test_et, Some("Name == 'TestEntity'")).await
+        if let Ok(perf_test_et) = store.get_entity_type("PerfTestEntity") {
+            let entities = store.find_entities(perf_test_et, Some("Name == 'TestEntity'"))
                 .unwrap_or_default();
             
             if !entities.is_empty() {
@@ -208,326 +185,92 @@ impl BenchmarkContext {
             }
         }
 
-        // Shutdown the connection used for initialization
-        store.shutdown().await;
         Ok(())
     }
 }
 
-async fn run_benchmark_test(
+fn run_benchmark_test(
     config: Arc<Config>,
     context: Arc<BenchmarkContext>,
     test: BenchmarkTest,
     requests_per_client: u64,
 ) -> Result<TestResult> {
-    // Pre-connect all clients before starting benchmark
-    if !config.quiet && !config.csv {
-        info!("Pre-connecting {} clients...", config.clients);
-    }
-    
-    let mut connection_handles = Vec::new();
-    let url = format!("{}:{}", config.host, config.port);
-    
-    // Spawn authentication tasks for all clients
-    for client_id in 0..config.clients {
-        let url_clone = url.clone();
-        
-        let handle = task::spawn(async move {
-            AsyncStoreProxy::connect(&url_clone)
-                .await
-                .with_context(|| format!("Client {} failed to connect", client_id))
-                .map(|store| (client_id, Arc::new(store)))
-        });
-        connection_handles.push(handle);
-    }
-    
-    // Wait for all connections to complete
-    let mut authenticated_stores = Vec::new();
-    for handle in connection_handles {
-        match handle.await {
-            Ok(Ok((client_id, store))) => {
-                authenticated_stores.push((client_id, store));
-            }
-            Ok(Err(e)) => {
-                error!("Authentication failed: {}", e);
-                return Err(e);
-            }
-            Err(e) => {
-                error!("Authentication task panicked: {}", e);
-                return Err(anyhow::anyhow!("Authentication task panicked: {}", e));
-            }
-        }
-    }
-    
-    if !config.quiet && !config.csv {
-        info!("All clients connected. Starting benchmark...");
-    }
-    
-    // Now start the actual benchmark timing
     let start_time = Instant::now();
+    let result = Arc::new(Mutex::new(TestResult::new(test.name().to_string())));
     let mut handles = Vec::new();
-    
-    for (client_id, store) in authenticated_stores {
+
+    // Spawn worker threads
+    for client_id in 0..config.clients {
         let config_clone = config.clone();
         let context_clone = context.clone();
+        let result_clone = result.clone();
         let test_clone = test.clone();
         
-        let handle = task::spawn(async move {
-            run_client_benchmark_with_store(config_clone, context_clone, test_clone, client_id, requests_per_client, store).await
+        let handle = thread::spawn(move || {
+            run_client_benchmark(config_clone, context_clone, test_clone, client_id, requests_per_client, result_clone)
         });
         handles.push(handle);
     }
 
-    let mut total_result = TestResult::new(test.name().to_string());
-    
+    // Wait for all workers to complete
     for handle in handles {
-        match handle.await {
-            Ok(Ok(client_result)) => {
-                total_result.total_requests += client_result.total_requests;
-                total_result.successful_requests += client_result.successful_requests;
-                total_result.failed_requests += client_result.failed_requests;
-                total_result.latencies.extend(client_result.latencies);
-            }
-            Ok(Err(e)) => {
-                error!("Client failed: {}", e);
-            }
-            Err(e) => {
-                error!("Client task panicked: {}", e);
-            }
+        if let Err(e) = handle.join() {
+            error!("Worker thread panicked: {:?}", e);
         }
     }
 
-    total_result.duration = start_time.elapsed();
-    total_result.latencies.sort();
+    let mut final_result = result.lock().unwrap().clone();
+    final_result.duration = start_time.elapsed();
+    final_result.latencies.sort();
     
-    Ok(total_result)
+    Ok(final_result)
 }
 
-async fn run_client_benchmark_with_store(
+fn run_client_benchmark(
     config: Arc<Config>,
     context: Arc<BenchmarkContext>,
     test: BenchmarkTest,
     client_id: usize,
     requests_count: u64,
-    store: Arc<AsyncStoreProxy>,
-) -> Result<TestResult> {
-    let mut result = TestResult::new(test.name().to_string());
-    let mut handles = Vec::new();
-    
-    // Calculate effective tasks needed based on pipelining
-    // For request-based operations that support pipelining, each task will handle pipeline_size requests
-    let supports_pipelining = matches!(test, BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField);
-    let effective_pipeline_size = if supports_pipelining && config.pipeline > 1 { config.pipeline as u64 } else { 1 };
-    let tasks_needed = (requests_count + effective_pipeline_size - 1) / effective_pipeline_size; // Ceiling division
-    
-    // Spawn concurrent tasks, using concurrency parameter for batching
-    let mut tasks_spawned = 0u64;
-    let batch_size = config.concurrency;
-    
-    while tasks_spawned < tasks_needed {
-        let current_batch_size = std::cmp::min(batch_size, (tasks_needed - tasks_spawned) as usize);
-        
-        // Spawn tasks for current batch
-        for i in 0..current_batch_size {
-            let store_clone = Arc::clone(&store);
-            let context_clone = Arc::clone(&context);
-            let test_clone = test.clone();
-            let config_clone = Arc::clone(&config);
-            let task_num = tasks_spawned + i as u64;
-            
-            let handle = task::spawn(async move {
-                execute_request_with_pipeline(store_clone, context_clone, test_clone, config_clone, client_id, task_num).await
-            });
-            
-            handles.push(handle);
-        }
-        
-        tasks_spawned += current_batch_size as u64;
-        
-        // Process the batch
-        let batch_results = future::join_all(handles.drain(..)).await;
-        
-        for task_result in batch_results {
-            match task_result {
-                Ok(request_result) => {
-                    result.total_requests += request_result.requests_in_batch;
-                    if request_result.success {
-                        result.successful_requests += request_result.requests_in_batch;
-                        result.latencies.extend(request_result.latencies);
-                    } else {
-                        result.failed_requests += request_result.requests_in_batch;
-                        // Add zero latencies for failed requests
-                        result.latencies.extend(vec![Duration::default(); request_result.requests_in_batch as usize]);
-                    }
+    result: Arc<Mutex<TestResult>>,
+) -> Result<()> {
+    // Connect to server
+    let url = format!("{}:{}", config.host, config.port);
+    let mut store = StoreProxy::connect(&url)
+        .with_context(|| format!("Client {} failed to connect", client_id))?;
+
+    // Execute requests
+    for request_num in 0..requests_count {
+        let start_time = Instant::now();
+        let success = match execute_single_request(&mut store, &context, &test, client_id, request_num) {
+            Ok(_) => true,
+            Err(e) => {
+                if config.verbose {
+                    error!("Request failed: {}", e);
                 }
-                Err(_) => {
-                    // Task panicked - assume 1 request failed (for single request operations)
-                    result.total_requests += 1;
-                    result.failed_requests += 1;
-                    result.latencies.push(Duration::default());
-                }
+                false
             }
-        }
-    }
+        };
+        let latency = start_time.elapsed();
 
-    // Clean shutdown of the async connection
-    store.shutdown().await;
-    Ok(result)
-}
-
-/// Execute a request or batch of pipelined requests.
-/// 
-/// Note: For pipelined operations, this records a single latency measurement for the entire
-/// batch rather than individual request latencies. This means latency percentiles for
-/// pipelined tests represent batch completion times, not individual request times.
-async fn execute_request_with_pipeline(
-    store: Arc<AsyncStoreProxy>,
-    context: Arc<BenchmarkContext>,
-    test: BenchmarkTest,
-    config: Arc<Config>,
-    client_id: usize,
-    task_num: u64,
-) -> RequestBatchResult {
-    let start_time = Instant::now();
-    
-    // Check if this test type supports pipelining (request-based operations)
-    let supports_pipelining = matches!(test, BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField);
-    
-    if supports_pipelining && config.pipeline > 1 {
-        // Execute pipelined requests - bundle multiple requests in a single Requests object
-        let mut requests = Vec::new();
-        
-        for i in 0..config.pipeline {
-            let request_num = task_num * config.pipeline as u64 + i as u64;
-            if let Ok(Some(request)) = prepare_request(&store, &context, &test, client_id, request_num).await {
-                requests.push(request);
-            }
-        }
-        
-        if !requests.is_empty() {
-            let requests_obj = Requests::new(requests);
-            let requests_count = requests_obj.read().len() as u64;
-            
-            // Measure individual request latencies within the pipeline
-            let mut individual_latencies = Vec::new();
-            
-            match store.perform(requests_obj).await {
-                Ok(_) => {
-                    // For pipelined requests, we approximate individual latencies
-                    // by dividing the total batch time evenly among requests
-                    let total_duration = start_time.elapsed();
-                    let per_request_duration = total_duration / requests_count as u32;
-                    
-                    for _ in 0..requests_count {
-                        individual_latencies.push(per_request_duration);
-                    }
-                    
-                    RequestBatchResult {
-                        requests_in_batch: requests_count,
-                        latencies: individual_latencies,
-                        success: true,
-                    }
-                }
-                Err(_) => RequestBatchResult {
-                    requests_in_batch: requests_count,
-                    latencies: vec![Duration::default(); requests_count as usize],
-                    success: false,
-                },
-            }
-        } else {
-            RequestBatchResult {
-                requests_in_batch: 1,
-                latencies: vec![Duration::default()],
-                success: false,
-            }
-        }
-    } else {
-        // Execute single request (either non-pipelined or non-request-based operation)
-        match execute_single_request(store, context, test, client_id, task_num).await {
-            Ok(duration) => RequestBatchResult {
-                requests_in_batch: 1,
-                latencies: vec![duration],
-                success: true,
-            },
-            Err(_) => RequestBatchResult {
-                requests_in_batch: 1,
-                latencies: vec![Duration::default()],
-                success: false,
-            },
-        }
-    }
-}
-
-async fn execute_single_request(
-    store: Arc<AsyncStoreProxy>,
-    context: Arc<BenchmarkContext>,
-    test: BenchmarkTest,
-    client_id: usize,
-    request_num: u64,
-) -> Result<Duration> {
-    let start_time = Instant::now();
-    
-    // Try to prepare and execute a request-based operation
-    if let Some(request) = prepare_request(&store, &context, &test, client_id, request_num).await? {
-        let requests = Requests::new(vec![request]);
-        store.perform(requests).await?;
-    } else {
-        // Execute non-request operations directly
-        execute_single_non_request_operation(&store, &context, &test, client_id, request_num).await?;
-    }
-    
-    Ok(start_time.elapsed())
-}
-
-async fn prepare_request(
-    store: &Arc<AsyncStoreProxy>,
-    context: &BenchmarkContext,
-    test: &BenchmarkTest,
-    client_id: usize,
-    request_num: u64,
-) -> Result<Option<qlib_rs::Request>> {
-    match test {
-        BenchmarkTest::WriteEntity => {
-            if let Some(test_entity_id) = context.test_entity_id {
-                let test_string_ft = store.get_field_type("TestString").await?;
-                // Generate string data of specified size
-                let data = generate_test_data(context.config.data_size, client_id, request_num);
-                Ok(Some(swrite!(test_entity_id, sfield![test_string_ft], sstr!(data))))
+        // Update results
+        {
+            let mut result_guard = result.lock().unwrap();
+            result_guard.total_requests += 1;
+            if success {
+                result_guard.successful_requests += 1;
             } else {
-                Ok(None)
+                result_guard.failed_requests += 1;
             }
-        }
-        BenchmarkTest::BulkWrite => {
-            if let Some(test_entity_id) = context.test_entity_id {
-                let test_string_ft = store.get_field_type("TestString").await?;
-                // Generate string data of specified size for bulk operations
-                let data = generate_test_data(context.config.data_size, client_id, request_num);
-                Ok(Some(swrite!(test_entity_id, sfield![test_string_ft], sstr!(data))))
-            } else {
-                Ok(None)
-            }
-        }
-        BenchmarkTest::ReadField => {
-            if !context.test_entities.is_empty() {
-                let entity_id = &context.test_entities[client_id % context.test_entities.len()];
-                if let Ok(name_ft) = store.get_field_type("Name").await {
-                    Ok(Some(sread!(*entity_id, sfield![name_ft])))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                Ok(None)
-            }
-        }
-        // These tests don't generate Request objects, they use direct method calls
-        BenchmarkTest::EntityExists | BenchmarkTest::FindEntities | BenchmarkTest::SearchEntities => {
-            Ok(None)
+            result_guard.latencies.push(latency);
         }
     }
+
+    Ok(())
 }
 
-async fn execute_single_non_request_operation(
-    store: &Arc<AsyncStoreProxy>,
+fn execute_single_request(
+    store: &mut StoreProxy,
     context: &BenchmarkContext,
     test: &BenchmarkTest,
     client_id: usize,
@@ -537,21 +280,32 @@ async fn execute_single_non_request_operation(
         BenchmarkTest::EntityExists => {
             if !context.test_entities.is_empty() {
                 let entity_id = &context.test_entities[(client_id + request_num as usize) % context.test_entities.len()];
-                let _ = store.entity_exists(*entity_id).await;
+                let _ = store.entity_exists(*entity_id);
             }
         }
         BenchmarkTest::FindEntities => {
-            let entity_type = store.get_entity_type(&context.config.entity_type).await?;
-            let _ = store.find_entities(entity_type, None).await?;
+            let entity_type = store.get_entity_type(&context.config.entity_type)?;
+            let _ = store.find_entities(entity_type, None)?;
+        }
+        BenchmarkTest::WriteEntity => {
+            if let Some(test_entity_id) = context.test_entity_id {
+                let test_string_ft = store.get_field_type("TestString")?;
+                let data = generate_test_data(context.config.data_size, client_id, request_num);
+                let _ = store.write(test_entity_id, &[test_string_ft], Value::String(data), None, None, None, None)?;
+            }
         }
         BenchmarkTest::SearchEntities => {
-            let entity_type = store.get_entity_type(&context.config.entity_type).await?;
+            let entity_type = store.get_entity_type(&context.config.entity_type)?;
             let query = format!("Name != 'NonExistent_{}'", client_id + request_num as usize);
-            let _ = store.find_entities_paginated(entity_type, Some(&PageOpts::new(20, None)), Some(&query)).await?;
+            let _ = store.find_entities_paginated(entity_type, Some(&PageOpts::new(20, None)), Some(&query))?;
         }
-        // Request-based operations should not reach here
-        BenchmarkTest::WriteEntity | BenchmarkTest::BulkWrite | BenchmarkTest::ReadField => {
-            return Err(anyhow::anyhow!("Request-based operation should not be executed here"));
+        BenchmarkTest::ReadField => {
+            if !context.test_entities.is_empty() {
+                let entity_id = &context.test_entities[client_id % context.test_entities.len()];
+                if let Ok(name_ft) = store.get_field_type("Name") {
+                    let _ = store.read(*entity_id, &[name_ft])?;
+                }
+            }
         }
     }
     Ok(())
@@ -638,13 +392,7 @@ fn print_detailed_results(config: &Config, results: &[TestResult]) {
         println!("  {} requests completed in {:.2} seconds", 
                  result.successful_requests, result.duration.as_secs_f64());
         println!("  {} parallel clients", config.clients);
-        println!("  {} concurrent tasks per client", config.concurrency);
         println!("  {} bytes payload", config.data_size);
-        
-        if config.pipeline > 1 {
-            println!("  {} requests per pipeline (sent together in single Requests object)", config.pipeline);
-        }
-        
         println!("  keep alive: 1");
         println!("");
 
@@ -674,8 +422,7 @@ fn get_tests_to_run(config: &Config) -> Vec<BenchmarkTest> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let config = Arc::new(Config::parse());
 
     // Initialize tracing
@@ -691,17 +438,14 @@ async fn main() -> Result<()> {
         .init();
 
     if !config.quiet && !config.csv {
-        info!("QCore async benchmark tool starting");
+        info!("QCore benchmark tool starting");
         info!("Target: {}:{}", config.host, config.port);
-        info!("Clients: {}, Requests: {}, Concurrency: {}, Data size: {} bytes", 
-              config.clients, config.requests, config.concurrency, config.data_size);
-        if config.pipeline > 1 {
-            info!("Pipeline: {} (requests per batch)", config.pipeline);
-        }
+        info!("Clients: {}, Requests: {}, Data size: {} bytes", 
+              config.clients, config.requests, config.data_size);
     }
 
     // Initialize benchmark context
-    let context = Arc::new(BenchmarkContext::new(config.clone()).await?);
+    let context = Arc::new(BenchmarkContext::new(config.clone())?);
     let tests_to_run = get_tests_to_run(&config);
     let requests_per_client = config.requests / config.clients as u64;
 
@@ -713,7 +457,7 @@ async fn main() -> Result<()> {
                 info!("Running {} benchmark...", test.name());
             }
             
-            match run_benchmark_test(config.clone(), context.clone(), test.clone(), requests_per_client).await {
+            match run_benchmark_test(config.clone(), context.clone(), test.clone(), requests_per_client) {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     error!("Failed to run {} benchmark: {}", test.name(), e);
