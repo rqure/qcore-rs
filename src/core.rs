@@ -526,7 +526,7 @@ impl CoreService {
                         break;
                     }
 
-                    let mut consumed = 0;
+                    let consumed;
                     if let Ok((command, next_remaining)) = ReadCommand::decode(&buffer) {
                         consumed = buffer.len() - next_remaining.len();
 
