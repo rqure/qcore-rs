@@ -6,18 +6,18 @@ use mio::{Events, Interest, Poll, Token, event::Event};
 use rustc_hash::FxHashMap;
 use serde_json;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::f32::consts::E;
+
 use std::io::{Read, Write};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use qlib_rs::data::entity_schema::{EntitySchemaResp, FieldSchemaResp};
+use qlib_rs::data::entity_schema::EntitySchemaResp;
 use qlib_rs::data::resp::{
     BooleanResponse, CreateEntityCommand, CreateEntityResponse, DeleteEntityCommand, EntityExistsCommand, EntityListResponse, EntityTypeListResponse, FieldExistsCommand, FieldSchemaResponse, FindEntitiesCommand, FindEntitiesExactCommand, FindEntitiesPaginatedCommand, FullSyncRequestCommand, FullSyncResponseCommand, GetEntitySchemaCommand, GetEntityTypeCommand, GetEntityTypesCommand, GetEntityTypesPaginatedCommand, GetFieldSchemaCommand, GetFieldTypeCommand, IntegerResponse, NotificationCommand, PaginatedEntityResponse, PaginatedEntityTypeResponse, PeerHandshakeCommand, ReadCommand, ReadResponse, RegisterNotificationCommand, ResolveEntityTypeCommand, ResolveFieldTypeCommand, ResolveIndirectionCommand, ResolveIndirectionResponse, RespCommand, RespDecode, RespEncode, RespValue, SetFieldSchemaCommand, SnapshotResponse, StringResponse, SyncWriteCommand, TakeSnapshotCommand, UnregisterNotificationCommand, UpdateSchemaCommand, WriteCommand
 };
 use qlib_rs::{
-    EntityId, EntityType, FieldType, NotificationQueue, NotifyConfig, PageOpts, Snapshot, Store,
+    EntityId, NotificationQueue, NotifyConfig, Snapshot, Store,
     StoreTrait, Value, WriteInfo,
 };
 
@@ -514,7 +514,7 @@ impl CoreService {
                 // Parse all complete commands from the buffer
                 loop {
                     // Check if we have data to process
-                    let mut remaining: &[u8] = {
+                    let buffer: &[u8] = {
                         if let Some(connection) = self.connections.get(&token) {
                             &connection.read_buffer
                         } else {
@@ -522,384 +522,367 @@ impl CoreService {
                         }
                     };
 
-                    if remaining.is_empty() {
+                    if buffer.is_empty() {
                         break;
                     }
 
                     let mut consumed = 0;
-                    
-                    if let Some(connection) = self.connections.get(&token) {
-                        if let Ok((command, next_remaining)) = ReadCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
+                    if let Ok((command, next_remaining)) = ReadCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
 
-                            match self.store.read(
-                                command.entity_id,
-                                &command.field_path,
-                            ) {
-                                Ok((value, timestamp, writer_id)) => {
-                                    let response = ReadResponse {
-                                        value,
-                                        timestamp,
-                                        writer_id,
-                                    };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Read error: {}", e).as_str()).encode())?;
-                                }
+                        match self.store.read(
+                            command.entity_id,
+                            &command.field_path,
+                        ) {
+                            Ok((value, timestamp, writer_id)) => {
+                                let response = ReadResponse {
+                                    value,
+                                    timestamp,
+                                    writer_id,
+                                };
+                                self.send_response(token, &response)?;
                             }
-                        } else if let Ok((command, next_remaining)) = WriteCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.write(
-                                command.entity_id,
-                                &command.field_path,
-                                command.value,
-                                command.writer_id,
-                                command.write_time,
-                                command.push_condition,
-                                command.adjust_behavior,
-                            ) {
-                                Ok(_) => {
-                                    self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Write error: {}", e).as_str()).encode())?;
-                                }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Read error: {}", e).as_str()))?;
                             }
-                        } else if let Ok((command, next_remaining)) = CreateEntityCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
+                        }
+                    } else if let Ok((command, next_remaining)) = WriteCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
 
-                            match self.store.create_entity(
-                                command.entity_type,
-                                command.parent_id,
-                                &command.name,
-                            ) {
-                                Ok(entity_id) => {
-                                    let response = CreateEntityResponse { entity_id };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Create entity error: {}", e).as_str()).encode())?;
-                                }
+                        match self.store.write(
+                            command.entity_id,
+                            &command.field_path,
+                            command.value,
+                            command.writer_id,
+                            command.write_time,
+                            command.push_condition,
+                            command.adjust_behavior,
+                        ) {
+                            Ok(_) => {
+                                self.send_response(token, &RespValue::SimpleString("OK"))?;
                             }
-                        } else if let Ok((command, next_remaining)) = DeleteEntityCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.delete_entity(command.entity_id) {
-                                Ok(_) => {
-                                    self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Delete entity error: {}", e).as_str()).encode())?;
-                                }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Write error: {}", e).as_str()))?;
                             }
-                        } else if let Ok((command, next_remaining)) = GetEntityTypeCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
+                        }
+                    } else if let Ok((command, next_remaining)) = CreateEntityCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
 
-                            match self.store.get_entity_type(&command.name) {
-                                Ok(entity_type) => {
-                                    let response = IntegerResponse { value: entity_type.0 as i64 };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Get entity type error: {}", e).as_str()).encode())?;
-                                }
+                        match self.store.create_entity(
+                            command.entity_type,
+                            command.parent_id,
+                            &command.name,
+                        ) {
+                            Ok(entity_id) => {
+                                let response = CreateEntityResponse { entity_id };
+                                self.send_response(token, &response)?;
                             }
-                        } else if let Ok((command, next_remaining)) = ResolveEntityTypeCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.resolve_entity_type(command.entity_type) {
-                                Ok(name) => {
-                                    let response = StringResponse { value: name };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Resolve entity type error: {}", e).as_str()).encode())?;
-                                }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Create entity error: {}", e).as_str()))?;
                             }
-                        } else if let Ok((command, next_remaining)) = GetFieldTypeCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
+                        }
+                    } else if let Ok((command, next_remaining)) = DeleteEntityCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
 
-                            match self.store.get_field_type(&command.name) {
-                                Ok(field_type) => {
-                                    let response = IntegerResponse { value: field_type.0 as i64 };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Get field type error: {}", e).as_str()).encode())?;
-                                }
+                        match self.store.delete_entity(command.entity_id) {
+                            Ok(_) => {
+                                self.send_response(token, &RespValue::SimpleString("OK"))?;
                             }
-                        } else if let Ok((command, next_remaining)) = ResolveFieldTypeCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.resolve_field_type(command.field_type) {
-                                Ok(name) => {
-                                    let response = StringResponse { value: name };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Resolve field type error: {}", e).as_str()).encode())?;
-                                }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Delete entity error: {}", e).as_str()))?;
                             }
-                        } else if let Ok((command, next_remaining)) = GetEntitySchemaCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
+                        }
+                    } else if let Ok((command, next_remaining)) = GetEntityTypeCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
 
-                            match self.store.get_entity_schema(command.entity_type) {
-                                Ok(schema) => {
-                                    let response = EntitySchemaResp::from_entity_schema(&schema, &self.store);
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Get entity schema error: {}", e).as_str()).encode())?;
-                                }
+                        match self.store.get_entity_type(&command.name) {
+                            Ok(entity_type) => {
+                                let response = IntegerResponse { value: entity_type.0 as i64 };
+                                self.send_response(token, &response)?;
                             }
-                        } else if let Ok((command, next_remaining)) = UpdateSchemaCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Get entity type error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = ResolveEntityTypeCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
 
-                            match command.schema.to_entity_schema(&self.store) {
-                                Ok(schema_string) => {
-                                    match self.store.update_schema(schema_string) {
-                                        Ok(_) => {
-                                            self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
-                                        }
-                                        Err(e) => {
-                                            self.send_resp_response(token, RespValue::Error(format!("Update schema error: {}", e).as_str()).encode())?;
-                                        }
+                        match self.store.resolve_entity_type(command.entity_type) {
+                            Ok(name) => {
+                                let response = StringResponse { value: name };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Resolve entity type error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = GetFieldTypeCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.get_field_type(&command.name) {
+                            Ok(field_type) => {
+                                let response = IntegerResponse { value: field_type.0 as i64 };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Get field type error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = ResolveFieldTypeCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.resolve_field_type(command.field_type) {
+                            Ok(name) => {
+                                let response = StringResponse { value: name };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Resolve field type error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = GetEntitySchemaCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.get_entity_schema(command.entity_type) {
+                            Ok(schema) => {
+                                let response = EntitySchemaResp::from_entity_schema(&schema, &self.store);
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Get entity schema error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = UpdateSchemaCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match command.schema.to_entity_schema(&self.store) {
+                            Ok(schema_string) => {
+                                match self.store.update_schema(schema_string) {
+                                    Ok(_) => {
+                                        self.send_response(token, &RespValue::SimpleString("OK"))?;
                                     }
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Schema conversion error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = GetFieldSchemaCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.get_field_schema(command.entity_type, command.field_type) {
-                                Ok(schema) => {
-                                    let response = FieldSchemaResponse::from_field_schema(&schema);
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Get field schema error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = SetFieldSchemaCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            let field_schema = qlib_rs::FieldSchema::from_string_schema(&command.schema.to_field_schema());
-                            match self.store.set_field_schema(command.entity_type, command.field_type, field_schema) {
-                                Ok(_) => {
-                                    self.send_resp_response(token, RespValue::SimpleString("OK").encode())?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Set field schema error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = FindEntitiesCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.find_entities(command.entity_type, command.filter.as_deref()) {
-                                Ok(entities) => {
-                                    let response = EntityListResponse { entities };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Find entities error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = FindEntitiesExactCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.find_entities_exact(command.entity_type, command.filter.as_deref()) {
-                                Ok(entities) => {
-                                    let response = EntityListResponse { entities };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Find entities exact error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = FindEntitiesPaginatedCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.find_entities_paginated(command.entity_type, command.filter.as_deref(), &command.page_opts) {
-                                Ok(result) => {
-                                    let response = PaginatedEntityResponse { 
-                                        entities: result.items,
-                                        has_more: result.has_more,
-                                        total_count: result.total_count,
-                                        next_cursor: result.next_cursor,
-                                    };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Find entities paginated error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = GetEntityTypesCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.get_entity_types() {
-                                Ok(entity_types) => {
-                                    let response = EntityTypeListResponse { entity_types };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Get entity types error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = GetEntityTypesPaginatedCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.get_entity_types_paginated(&command.page_opts) {
-                                Ok(result) => {
-                                    let response = PaginatedEntityTypeResponse { 
-                                        entity_types: result.items,
-                                        has_more: result.has_more,
-                                        total_count: result.total_count,
-                                        next_cursor: result.next_cursor,
-                                    };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Get entity types paginated error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = EntityExistsCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.entity_exists(command.entity_id) {
-                                Ok(exists) => {
-                                    let response = BooleanResponse { value: exists };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Entity exists error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = FieldExistsCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.field_exists(command.entity_type, command.field_type) {
-                                Ok(exists) => {
-                                    let response = BooleanResponse { value: exists };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Field exists error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((command, next_remaining)) = ResolveIndirectionCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            match self.store.resolve_indirection(command.entity_id, &command.fields) {
-                                Ok((entity_ids, reason)) => {
-                                    let response = ResolveIndirectionResponse { entity_ids, reason };
-                                    self.send_response(token, &response)?;
-                                }
-                                Err(e) => {
-                                    self.send_resp_response(token, RespValue::Error(format!("Resolve indirection error: {}", e).as_str()).encode())?;
-                                }
-                            }
-                        } else if let Ok((_command, next_remaining)) = TakeSnapshotCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            let snapshot = self.store.take_snapshot();
-                            if let Some(snapshot_handle) = &self.snapshot_handle {
-                                snapshot_handle.save(snapshot.clone());
-                            }
-                            let response = SnapshotResponse::from_snapshot(&snapshot);
-                            self.send_response(token, &response)?;
-                        } else if let Ok((command, next_remaining)) = RegisterNotificationCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-
-                            // Parse notification config
-                            let config = command.config;
-
-                            // Get the connection's notification queue
-                            if let Some(connection) = self.connections.get_mut(&token) {
-                                connection.notification_configs.insert(config.clone());
-
-                                match self.store.register_notification(
-                                    config.clone(),
-                                    connection.notification_queue.clone(),
-                                ) {
-                                    Ok(_) => self.send_resp_response(
-                                        token,
-                                        RespValue::SimpleString("OK").encode(),
-                                    )?,
                                     Err(e) => {
-                                        let error_str = format!("Register notification error: {}", e);
-                                        self.send_resp_response(
-                                            token,
-                                            RespValue::Error(&error_str).encode(),
-                                        )?
+                                        self.send_response(token, &RespValue::Error(format!("Update schema error: {}", e).as_str()))?;
                                     }
                                 }
-                            } else {
-                                self.send_resp_response(
-                                    token,
-                                    RespValue::Error("Connection not found").encode(),
-                                )?
                             }
-                        } else if let Ok((command, next_remaining)) = UnregisterNotificationCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Schema conversion error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = GetFieldSchemaCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
 
-                            // Get the connection's notification queue
-                            if let Some(connection) = self.connections.get_mut(&token) {
-                                connection.notification_configs.remove(&command.config);
-                                let removed = self.store.unregister_notification(
-                                    &command.config,
-                                    &connection.notification_queue,
-                                );
-                                let response = RespValue::Integer(if removed { 1 } else { 0 });
-                                self.send_resp_response(token, response.encode())?
-                            } else {
-                                self.send_resp_response(
-                                    token,
-                                    RespValue::Error("Connection not found").encode(),
-                                )?
+                        match self.store.get_field_schema(command.entity_type, command.field_type) {
+                            Ok(schema) => {
+                                let response = FieldSchemaResponse { schema: qlib_rs::data::entity_schema::FieldSchemaResp::from_field_schema(&schema, &self.store) };
+                                self.send_response(token, &response)?;
                             }
-                        } else if let Ok((command, next_remaining)) = PeerHandshakeCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-                            self.handle_peer_handshake(
-                                token,
-                                command.start_time,
-                                command.is_response,
-                                command.machine_id,
-                            )?;
-                            // Send OK response
-                            let ok_response = RespValue::SimpleString("OK");
-                            self.send_resp_response(token, ok_response.encode())?;
-                        } else if let Ok((_, next_remaining)) = FullSyncRequestCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-                            self.handle_peer_full_sync_request(token)?;
-                        } else if let Ok((command, next_remaining)) = FullSyncResponseCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-                            self.handle_peer_full_sync_response(
-                                token,
-                                command.snapshot_data,
-                            )?;
-                        } else if let Ok((command, next_remaining)) = SyncWriteCommand::decode(&remaining) {
-                            consumed = remaining.len() - next_remaining.len();
-                            self.handle_peer_sync_write(
-                                token,
-                                command.requests_data,
-                            )?;
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Get field schema error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = SetFieldSchemaCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        let field_schema = qlib_rs::FieldSchema::from_string_schema(command.schema.to_field_schema(), &self.store);
+                        match self.store.set_field_schema(command.entity_type, command.field_type, field_schema) {
+                            Ok(_) => {
+                                self.send_response(token, &RespValue::SimpleString("OK"))?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Set field schema error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = FindEntitiesCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.find_entities(command.entity_type, command.filter.as_deref()) {
+                            Ok(entities) => {
+                                let response = EntityListResponse { entities };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Find entities error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = FindEntitiesExactCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.find_entities_exact(command.entity_type, None, command.filter.as_deref()) {
+                            Ok(result) => {
+                                let response = EntityListResponse { entities: result.items };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Find entities exact error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = FindEntitiesPaginatedCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.find_entities_paginated(command.entity_type, command.page_opts.as_ref(), command.filter.as_deref()) {
+                            Ok(result) => {
+                                let response = PaginatedEntityResponse { 
+                                    items: result.items,
+                                    total: result.total,
+                                    next_cursor: result.next_cursor,
+                                };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Find entities paginated error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((_command, next_remaining)) = GetEntityTypesCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.get_entity_types() {
+                            Ok(entity_types) => {
+                                let response = EntityTypeListResponse { entity_types };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Get entity types error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = GetEntityTypesPaginatedCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.get_entity_types_paginated(command.page_opts.as_ref()) {
+                            Ok(result) => {
+                                let response = PaginatedEntityTypeResponse { 
+                                    items: result.items,
+                                    total: result.total,
+                                    next_cursor: result.next_cursor,
+                                };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Get entity types paginated error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((command, next_remaining)) = EntityExistsCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        let exists = self.store.entity_exists(command.entity_id);
+                        let response = BooleanResponse { result: exists };
+                        self.send_response(token, &response)?;
+                    } else if let Ok((command, next_remaining)) = FieldExistsCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        let exists = self.store.field_exists(command.entity_type, command.field_type);
+                        let response = BooleanResponse { result: exists };
+                        self.send_response(token, &response)?;
+                    } else if let Ok((command, next_remaining)) = ResolveIndirectionCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        match self.store.resolve_indirection(command.entity_id, &command.fields) {
+                            Ok((entity_id, field_type)) => {
+                                let response = ResolveIndirectionResponse { entity_id, field_type };
+                                self.send_response(token, &response)?;
+                            }
+                            Err(e) => {
+                                self.send_response(token, &RespValue::Error(format!("Resolve indirection error: {}", e).as_str()))?;
+                            }
+                        }
+                    } else if let Ok((_command, next_remaining)) = TakeSnapshotCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        let snapshot = self.store.take_snapshot();
+                        if let Some(snapshot_handle) = &self.snapshot_handle {
+                            snapshot_handle.save(snapshot.clone());
+                        }
+                        let response = SnapshotResponse { 
+                            data: serde_json::to_string(&snapshot).unwrap_or_default()
+                        };
+                        self.send_response(token, &response)?;
+                    } else if let Ok((command, next_remaining)) = RegisterNotificationCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+
+                        // Parse notification config
+                        let config = command.config;
+
+                        // Get the connection's notification queue
+                        if let Some(connection) = self.connections.get_mut(&token) {
+                            connection.notification_configs.insert(config.clone());
+
+                            match self.store.register_notification(
+                                config.clone(),
+                                connection.notification_queue.clone(),
+                            ) {
+                                Ok(_) => self.send_response(
+                                    token,
+                                    &RespValue::SimpleString("OK"),
+                                )?,
+                                Err(e) => {
+                                    let error_str = format!("Register notification error: {}", e);
+                                    self.send_response(
+                                        token,
+                                        &RespValue::Error(&error_str),
+                                    )?
+                                }
+                            }
                         } else {
-                            // No complete command could be parsed
-                            break;
+                            self.send_response(
+                                token,
+                                &RespValue::Error("Connection not found"),
+                            )?
                         }
+                    } else if let Ok((command, next_remaining)) = UnregisterNotificationCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
 
-                        // Update the buffer to remove consumed data
-                        if consumed > 0 {
-                            if let Some(connection) = self.connections.get_mut(&token) {
-                                connection.read_buffer.drain(0..consumed);
-                            }
+                        // Get the connection's notification queue
+                        if let Some(connection) = self.connections.get_mut(&token) {
+                            connection.notification_configs.remove(&command.config);
+                            let removed = self.store.unregister_notification(
+                                &command.config,
+                                &connection.notification_queue,
+                            );
+                            let response = RespValue::Integer(if removed { 1 } else { 0 });
+                            self.send_response(token, &response)?
+                        } else {
+                            self.send_response(
+                                token,
+                                &RespValue::Error("Connection not found"),
+                            )?
                         }
+                    } else if let Ok((command, next_remaining)) = PeerHandshakeCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+                        self.handle_peer_handshake(
+                            token,
+                            command.start_time,
+                            command.is_response,
+                            command.machine_id,
+                        )?;
+                        // Send OK response
+                        let ok_response = RespValue::SimpleString("OK");
+                        self.send_response(token, &ok_response)?;
+                    } else if let Ok((_, next_remaining)) = FullSyncRequestCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+                        self.handle_peer_full_sync_request(token)?;
+                    } else if let Ok((command, next_remaining)) = FullSyncResponseCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+                        self.handle_peer_full_sync_response(
+                            token,
+                            command.snapshot_data,
+                        )?;
+                    } else if let Ok((command, next_remaining)) = SyncWriteCommand::decode(&buffer) {
+                        consumed = buffer.len() - next_remaining.len();
+                        self.handle_peer_sync_write(
+                            token,
+                            command.requests_data,
+                        )?;
                     } else {
-                        return Err(anyhow::anyhow!("Connection not found"));
+                        // No complete command could be parsed
+                        break;
+                    }
+
+                    // Update the buffer to remove consumed data
+                    if consumed > 0 {
+                        if let Some(connection) = self.connections.get_mut(&token) {
+                            connection.read_buffer.drain(0..consumed);
+                        }
                     }
                 }
             }
@@ -967,22 +950,6 @@ impl CoreService {
         };
 
         self.send_response(token, &command)
-    }
-
-    /// Send a raw RESP response to a connection
-    fn send_resp_response(&mut self, token: Token, response: Vec<u8>) -> Result<()> {
-        if let Some(connection) = self.connections.get_mut(&token) {
-            connection.outbound_messages.push_back(response);
-
-            // Register for write events if we have messages to send
-            self.poll.registry().reregister(
-                &mut connection.stream,
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            )?;
-        }
-
-        Ok(())
     }
 
     /// Handle writing data to a connection
