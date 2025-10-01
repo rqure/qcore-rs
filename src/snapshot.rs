@@ -6,7 +6,7 @@ use crossbeam::channel::Sender;
 use tracing::{info, warn, error};
 use anyhow::Result;
 
-use crate::store_service::StoreHandle;
+use crate::store::StoreHandle;
 use crate::files::{FileConfig, FileManager, FileManagerTrait};
 
 /// Trait for snapshot operations

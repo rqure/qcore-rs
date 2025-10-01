@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use qlib_rs::Value;
 
-use crate::store_service::StoreHandle;
+use crate::store::StoreHandle;
 
 /// Configuration for fault tolerance service
 #[derive(Debug, Clone)]

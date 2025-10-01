@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use qlib_rs::Value;
 
-use crate::store_service::StoreHandle;
+use crate::store::StoreHandle;
 
 /// Configuration for heartbeat service
 #[derive(Debug, Clone)]

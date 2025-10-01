@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::thread;
 use tracing::{debug, error, info, warn};
 
-use crate::store_service::StoreHandle;
+use crate::store::StoreHandle;
 use crate::files::{FileConfig, FileInfo, FileManager, FileManagerTrait};
 
 /// Configuration for WAL manager operations

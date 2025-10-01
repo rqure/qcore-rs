@@ -34,7 +34,7 @@ use qlib_rs::{
 
 use crate::fault_tolerance::FaultToleranceHandle;
 use crate::snapshot::SnapshotHandle;
-use crate::store_service::StoreHandle;
+use crate::store::StoreHandle;
 use crate::wal::WalHandle;
 
 /// Configuration for the core service

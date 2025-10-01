@@ -2,7 +2,7 @@ mod wal;
 mod snapshot;
 mod files;
 mod core;
-mod store_service;
+mod store;
 mod heartbeat;
 mod fault_tolerance;
 
@@ -16,7 +16,7 @@ use tracing::error;
 use crate::{
     core::{CoreConfig, CoreService},
     snapshot::{SnapshotConfig, SnapshotService},
-    store_service::StoreService,
+    store::StoreService,
     wal::{WalConfig, WalService},
     heartbeat::{HeartbeatConfig, HeartbeatService},
     fault_tolerance::{FaultToleranceConfig, FaultToleranceService},
