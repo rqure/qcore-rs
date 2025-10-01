@@ -625,9 +625,15 @@ impl CoreService {
                             self.send_error(token, format!("Get entity schema error: {}", e))?;
                         }
                     }
-                } else if let Ok(_command) = UpdateSchemaCommand::decode(resp_value.clone()) {
-                    // TODO: Schema conversion requires StoreTrait - needs refactoring
-                    self.send_error(token, "Schema update not yet supported via store service".to_string())?;
+                } else if let Ok(command) = UpdateSchemaCommand::decode(resp_value.clone()) {
+                    match self.store_handle.update_schema(command.schema) {
+                        Ok(_) => {
+                            self.send_ok(token)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Update schema error: {}", e))?;
+                        }
+                    }
                 } else if let Ok(command) = GetFieldSchemaCommand::decode(resp_value.clone()) {
                     match self
 .store_handle
@@ -641,9 +647,15 @@ impl CoreService {
                             self.send_error(token, format!("Get field schema error: {}", e))?;
                         }
                     }
-                } else if let Ok(_command) = SetFieldSchemaCommand::decode(resp_value.clone()) {
-                    // TODO: Schema conversion requires StoreTrait - needs refactoring
-                    self.send_error(token, "Set field schema not yet supported via store service".to_string())?;
+                } else if let Ok(command) = SetFieldSchemaCommand::decode(resp_value.clone()) {
+                    match self.store_handle.set_field_schema(command.entity_type, command.field_type, command.schema) {
+                        Ok(_) => {
+                            self.send_ok(token)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Set field schema error: {}", e))?;
+                        }
+                    }
                 } else if let Ok(command) = FindEntitiesCommand::decode(resp_value.clone()) {
                     match self.store_handle.find_entities(command.entity_type, command.filter) {
                         Ok(response) => {

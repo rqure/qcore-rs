@@ -127,13 +127,13 @@ pub enum StoreRequest {
         respond_to: Sender<Result<()>>,
     },
     UpdateSchema {
-        schema: qlib_rs::EntitySchema<qlib_rs::Single, String, String>,
+        schema: qlib_rs::data::entity_schema::EntitySchemaResp,
         respond_to: Sender<Result<()>>,
     },
     SetFieldSchema {
         entity_type: EntityType,
         field_type: FieldType,
-        schema: qlib_rs::FieldSchema,
+        schema: qlib_rs::data::entity_schema::FieldSchemaResp,
         respond_to: Sender<Result<()>>,
     },
     // Bulk operations
@@ -464,7 +464,7 @@ impl StoreHandle {
 
     pub fn update_schema(
         &self,
-        schema: qlib_rs::EntitySchema<qlib_rs::Single, String, String>,
+        schema: qlib_rs::data::entity_schema::EntitySchemaResp,
     ) -> Result<()> {
         let (resp_sender, resp_receiver) = crossbeam::channel::bounded(1);
         self.sender
@@ -480,7 +480,7 @@ impl StoreHandle {
         &self,
         entity_type: EntityType,
         field_type: FieldType,
-        schema: qlib_rs::FieldSchema,
+        schema: qlib_rs::data::entity_schema::FieldSchemaResp,
     ) -> Result<()> {
         let (resp_sender, resp_receiver) = crossbeam::channel::bounded(1);
         self.sender
@@ -852,7 +852,11 @@ impl StoreService {
                 let _ = respond_to.send(result);
             }
             StoreRequest::UpdateSchema { schema, respond_to } => {
-                let result = self.store.update_schema(schema).map_err(|e| anyhow::anyhow!("{}", e));
+                let result = schema.to_entity_schema(&self.store)
+                    .and_then(|converted_schema| {
+                        self.store.update_schema(converted_schema).map_err(|e| e.into())
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = respond_to.send(result);
             }
             StoreRequest::SetFieldSchema {
@@ -861,7 +865,10 @@ impl StoreService {
                 schema,
                 respond_to,
             } => {
-                let result = self.store.set_field_schema(entity_type, field_type, schema).map_err(|e| anyhow::anyhow!("{}", e));
+                // Convert FieldSchemaResp to FieldSchema<String>, then to FieldSchema<FieldType>
+                let field_schema_string = schema.to_field_schema();
+                let field_schema = qlib_rs::FieldSchema::from_string_schema(field_schema_string, &self.store);
+                let result = self.store.set_field_schema(entity_type, field_type, field_schema).map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = respond_to.send(result);
             }
             // Bulk operations
