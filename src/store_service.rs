@@ -495,7 +495,7 @@ impl StoreHandle {
     pub fn restore_snapshot(&self, snapshot: Snapshot) {
         self.sender
             .send(StoreRequest::RestoreSnapshot { snapshot })
-            .unwrap();
+            .expect("Failed to send restore snapshot request");
     }
 
     pub fn replay(&self, writes: Vec<WriteInfo>) {

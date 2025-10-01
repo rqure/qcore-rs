@@ -32,6 +32,7 @@ use qlib_rs::{
     EntityId, NotificationQueue, NotifyConfig, Snapshot, WriteInfo,
 };
 
+use crate::fault_tolerance::FaultToleranceHandle;
 use crate::snapshot::SnapshotHandle;
 use crate::store_service::StoreHandle;
 use crate::wal::WalHandle;
@@ -77,7 +78,7 @@ pub enum CoreCommand {
         wal_handle: crate::wal::WalHandle,
     },
     SetFaultToleranceHandle {
-        fault_tolerance_handle: crate::fault_tolerance::FaultToleranceHandle,
+        fault_tolerance_handle: FaultToleranceHandle,
     },
     PeerConnected {
         machine_id: String,
@@ -89,6 +90,7 @@ pub enum CoreCommand {
     Replay {
         writes: Vec<WriteInfo>,
     },
+    OnSnapshotRestored,
 }
 
 /// Handle for communicating with core service
@@ -120,7 +122,7 @@ impl CoreHandle {
             .unwrap();
     }
 
-    pub fn set_fault_tolerance_handle(&self, fault_tolerance_handle: crate::fault_tolerance::FaultToleranceHandle) {
+    pub fn set_fault_tolerance_handle(&self, fault_tolerance_handle: FaultToleranceHandle) {
         self.sender
             .send(CoreCommand::SetFaultToleranceHandle { fault_tolerance_handle })
             .unwrap();
@@ -144,6 +146,10 @@ impl CoreHandle {
 
     pub fn replay(&self, writes: Vec<WriteInfo>) {
         self.sender.send(CoreCommand::Replay { writes }).unwrap();
+    }
+
+    pub fn on_snapshot_restored(&self) {
+        let _ = self.sender.send(CoreCommand::OnSnapshotRestored);
     }
 }
 
@@ -198,7 +204,7 @@ pub struct CoreService {
     // Handles to other services
     snapshot_handle: Option<SnapshotHandle>,
     wal_handle: Option<WalHandle>,
-    fault_tolerance_handle: Option<crate::fault_tolerance::FaultToleranceHandle>,
+    fault_tolerance_handle: Option<FaultToleranceHandle>,
 }
 
 const LISTENER_TOKEN: Token = Token(0);
@@ -985,10 +991,7 @@ impl CoreService {
     }
 
     /// Handle complete snapshot restoration including store, cache, and peer reinitialization
-    fn handle_snapshot_restoration(&mut self, snapshot: Snapshot) {
-        // Restore the snapshot to our store
-        self.store_handle.restore_snapshot(snapshot);
-
+    fn handle_snapshot_restoration(&mut self) {
         // Disconnect all non-peer clients since snapshot restoration invalidates their state
         let mut non_peer_tokens = Vec::new();
         let peer_tokens: HashSet<Token> = self
@@ -1247,8 +1250,8 @@ impl CoreService {
         let snapshot: Snapshot = serde_json::from_str(&snapshot_json)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize snapshot: {}", e))?;
 
-        // Handle complete snapshot restoration
-        self.handle_snapshot_restoration(snapshot);
+        // Restore the snapshot to the store (will trigger OnSnapshotRestored callback)
+        self.store_handle.restore_snapshot(snapshot);
 
         info!("Full sync completed successfully");
 
@@ -1361,8 +1364,14 @@ impl CoreService {
             CoreCommand::RestoreSnapshot { snapshot } => {
                 debug!("Handling restore snapshot command");
 
-                // Handle complete snapshot restoration
-                self.handle_snapshot_restoration(snapshot);
+                // Restore the snapshot to the store
+                self.store_handle.restore_snapshot(snapshot);
+            }
+            CoreCommand::OnSnapshotRestored => {
+                debug!("Handling snapshot restoration notification");
+
+                // Handle post-restoration cleanup and re-initialization
+                self.handle_snapshot_restoration();
             }
             CoreCommand::SetSnapshotHandle { snapshot_handle } => {
                 debug!("Setting snapshot handle");
