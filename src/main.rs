@@ -142,10 +142,10 @@ fn main() -> Result<()> {
         store_handle.clone(),
     );
 
-    let _fault_tolerance_handle = FaultToleranceService::spawn(
+    let fault_tolerance_handle = FaultToleranceService::spawn(
         FaultToleranceConfig {
             machine: config.machine.clone(),
-            is_leader: true, // TODO: Make configurable
+            is_leader: true, // Will be updated by CoreService based on peer evaluation
             interval_millis: 100,
         },
         store_handle.clone(),
@@ -159,6 +159,7 @@ fn main() -> Result<()> {
     
     core_handle.set_snapshot_handle(snapshot_handle.clone());
     core_handle.set_wal_handle(wal_handle.clone());
+    core_handle.set_fault_tolerance_handle(fault_tolerance_handle.clone());
 
     // Load snapshot and replay WAL
     snapshot_handle.load_latest();

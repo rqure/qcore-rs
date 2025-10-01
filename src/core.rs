@@ -76,6 +76,9 @@ pub enum CoreCommand {
     SetWalHandle {
         wal_handle: crate::wal::WalHandle,
     },
+    SetFaultToleranceHandle {
+        fault_tolerance_handle: crate::fault_tolerance::FaultToleranceHandle,
+    },
     PeerConnected {
         machine_id: String,
         stream: MioTcpStream,
@@ -114,6 +117,12 @@ impl CoreHandle {
     pub fn set_wal_handle(&self, wal_handle: crate::wal::WalHandle) {
         self.sender
             .send(CoreCommand::SetWalHandle { wal_handle })
+            .unwrap();
+    }
+
+    pub fn set_fault_tolerance_handle(&self, fault_tolerance_handle: crate::fault_tolerance::FaultToleranceHandle) {
+        self.sender
+            .send(CoreCommand::SetFaultToleranceHandle { fault_tolerance_handle })
             .unwrap();
     }
 
@@ -189,6 +198,7 @@ pub struct CoreService {
     // Handles to other services
     snapshot_handle: Option<SnapshotHandle>,
     wal_handle: Option<WalHandle>,
+    fault_tolerance_handle: Option<crate::fault_tolerance::FaultToleranceHandle>,
 }
 
 const LISTENER_TOKEN: Token = Token(0);
@@ -223,6 +233,7 @@ impl CoreService {
             candidate_entity_id: None,
             snapshot_handle: None,
             wal_handle: None,
+            fault_tolerance_handle: None,
         };
 
         // Create initial peer entries without entity IDs (will be resolved after snapshot restore)
@@ -1110,10 +1121,17 @@ impl CoreService {
             }
         }
 
+        let is_leader = !has_older_peer;
+        
         debug!(
-            "Leadership evaluation result: has_older_peer={}, oldest_start_time={}, oldest_machine={}",
-            has_older_peer, oldest_start_time, oldest_machine_id
+            "Leadership evaluation result: has_older_peer={}, is_leader={}, oldest_start_time={}, oldest_machine={}",
+            has_older_peer, is_leader, oldest_start_time, oldest_machine_id
         );
+        
+        // Notify FaultToleranceService of leadership status
+        if let Some(ft_handle) = &self.fault_tolerance_handle {
+            ft_handle.set_leader(is_leader);
+        }
     }
 
     /// Evaluate if we need to sync and from which peer
@@ -1353,6 +1371,10 @@ impl CoreService {
             CoreCommand::SetWalHandle { wal_handle } => {
                 debug!("Setting WAL handle");
                 self.wal_handle = Some(wal_handle);
+            }
+            CoreCommand::SetFaultToleranceHandle { fault_tolerance_handle } => {
+                debug!("Setting fault tolerance handle");
+                self.fault_tolerance_handle = Some(fault_tolerance_handle);
             }
             CoreCommand::PeerConnected {
                 machine_id,
