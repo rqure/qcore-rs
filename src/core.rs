@@ -531,384 +531,371 @@ impl CoreService {
         // Process ALL complete commands from the buffer - Redis optimization
         if bytes_read > 0 {
             // Parse all complete commands from the buffer
-                loop {
-                    // Check if we have data to process
-                    let buffer: &[u8] = {
-                        if let Some(connection) = self.connections.get(&token) {
-                            &connection.read_buffer
-                        } else {
-                            return Err(anyhow::anyhow!("Connection not found"));
-                        }
-                    };
-
-                    if buffer.is_empty() {
-                        break;
-                    }
-
-                    // First, parse the RESP value from the buffer
-                    let (resp_value, remaining_bytes) = match RespParser::parse_value(buffer) {
-                        Ok((val, rem)) => (val, rem),
-                        Err(_) => {
-                            // Incomplete message, wait for more data
-                            break;
-                        }
-                    };
-
-                    let consumed = buffer.len() - remaining_bytes.len();
-                    if let Ok(command) = ReadCommand::decode(resp_value.clone()) {
-                        match self.store.read(command.entity_id, &command.field_path) {
-                            Ok((value, timestamp, writer_id)) => {
-                                let response = ReadResponse {
-                                    value,
-                                    timestamp,
-                                    writer_id,
-                                };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Read error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = WriteCommand::decode(resp_value.clone()) {
-                        match self.store.write(
-                            command.entity_id,
-                            &command.field_path,
-                            command.value,
-                            command.writer_id,
-                            command.write_time,
-                            command.push_condition,
-                            command.adjust_behavior,
-                        ) {
-                            Ok(_) => {
-                                self.send_ok(token)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Write error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = CreateEntityCommand::decode(resp_value.clone()) {
-                        match self.store.create_entity(
-                            command.entity_type,
-                            command.parent_id,
-                            &command.name,
-                        ) {
-                            Ok(entity_id) => {
-                                let response = CreateEntityResponse { entity_id };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Create entity error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = DeleteEntityCommand::decode(resp_value.clone()) {
-                        match self.store.delete_entity(command.entity_id) {
-                            Ok(_) => {
-                                self.send_ok(token)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Delete entity error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = GetEntityTypeCommand::decode(resp_value.clone()) {
-                        match self.store.get_entity_type(&command.name) {
-                            Ok(entity_type) => {
-                                let response = IntegerResponse {
-                                    value: entity_type.0 as i64,
-                                };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Get entity type error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = ResolveEntityTypeCommand::decode(resp_value.clone())
-                    {
-                        match self.store.resolve_entity_type(command.entity_type) {
-                            Ok(name) => {
-                                let response = StringResponse { value: name };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(
-                                    token,
-                                    format!("Resolve entity type error: {}", e),
-                                )?;
-                            }
-                        }
-                    } else if let Ok(command) = GetFieldTypeCommand::decode(resp_value.clone()) {
-                        match self.store.get_field_type(&command.name) {
-                            Ok(field_type) => {
-                                let response = IntegerResponse {
-                                    value: field_type.0 as i64,
-                                };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Get field type error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = ResolveFieldTypeCommand::decode(resp_value.clone())
-                    {
-                        match self.store.resolve_field_type(command.field_type) {
-                            Ok(name) => {
-                                let response = StringResponse { value: name };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Resolve field type error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = GetEntitySchemaCommand::decode(resp_value.clone()) {
-                        match self.store.get_entity_schema(command.entity_type) {
-                            Ok(schema) => {
-                                let response =
-                                    EntitySchemaResp::from_entity_schema(&schema, &self.store);
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Get entity schema error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = UpdateSchemaCommand::decode(resp_value.clone()) {
-                        match command.schema.to_entity_schema(&self.store) {
-                            Ok(schema_string) => match self.store.update_schema(schema_string) {
-                                Ok(_) => {
-                                    self.send_ok(token)?;
-                                }
-                                Err(e) => {
-                                    self.send_error(token, format!("Update schema error: {}", e))?;
-                                }
-                            },
-                            Err(e) => {
-                                self.send_error(token, format!("Schema conversion error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = GetFieldSchemaCommand::decode(resp_value.clone()) {
-                        match self
-                            .store
-                            .get_field_schema(command.entity_type, command.field_type)
-                        {
-                            Ok(schema) => {
-                                let response = FieldSchemaResponse { schema: qlib_rs::data::entity_schema::FieldSchemaResp::from_field_schema(&schema, &self.store) };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Get field schema error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = SetFieldSchemaCommand::decode(resp_value.clone()) {
-                        let field_schema = qlib_rs::FieldSchema::from_string_schema(
-                            command.schema.to_field_schema(),
-                            &self.store,
-                        );
-                        match self.store.set_field_schema(
-                            command.entity_type,
-                            command.field_type,
-                            field_schema,
-                        ) {
-                            Ok(_) => {
-                                self.send_ok(token)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Set field schema error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = FindEntitiesCommand::decode(resp_value.clone()) {
-                        match self
-                            .store
-                            .find_entities(command.entity_type, command.filter.as_deref())
-                        {
-                            Ok(entities) => {
-                                let response = EntityListResponse { entities };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Find entities error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) = FindEntitiesExactCommand::decode(resp_value.clone())
-                    {
-                        match self.store.find_entities_exact(
-                            command.entity_type,
-                            None,
-                            command.filter.as_deref(),
-                        ) {
-                            Ok(result) => {
-                                let response = EntityListResponse {
-                                    entities: result.items,
-                                };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(
-                                    token,
-                                    format!("Find entities exact error: {}", e),
-                                )?;
-                            }
-                        }
-                    } else if let Ok(command) =
-                        FindEntitiesPaginatedCommand::decode(resp_value.clone())
-                    {
-                        match self.store.find_entities_paginated(
-                            command.entity_type,
-                            command.page_opts.as_ref(),
-                            command.filter.as_deref(),
-                        ) {
-                            Ok(result) => {
-                                let response = PaginatedEntityResponse {
-                                    items: result.items,
-                                    total: result.total,
-                                    next_cursor: result.next_cursor,
-                                };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(
-                                    token,
-                                    format!("Find entities paginated error: {}", e),
-                                )?;
-                            }
-                        }
-                    } else if let Ok(_command) = GetEntityTypesCommand::decode(resp_value.clone()) {
-                        match self.store.get_entity_types() {
-                            Ok(entity_types) => {
-                                let response = EntityTypeListResponse { entity_types };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Get entity types error: {}", e))?;
-                            }
-                        }
-                    } else if let Ok(command) =
-                        GetEntityTypesPaginatedCommand::decode(resp_value.clone())
-                    {
-                        match self
-                            .store
-                            .get_entity_types_paginated(command.page_opts.as_ref())
-                        {
-                            Ok(result) => {
-                                let response = PaginatedEntityTypeResponse {
-                                    items: result.items,
-                                    total: result.total,
-                                    next_cursor: result.next_cursor,
-                                };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(
-                                    token,
-                                    format!("Get entity types paginated error: {}", e),
-                                )?;
-                            }
-                        }
-                    } else if let Ok(command) = EntityExistsCommand::decode(resp_value.clone()) {
-                        let exists = self.store.entity_exists(command.entity_id);
-                        let response = BooleanResponse { result: exists };
-                        self.send_response(token, &response)?;
-                    } else if let Ok(command) = FieldExistsCommand::decode(resp_value.clone()) {
-                        let exists = self
-                            .store
-                            .field_exists(command.entity_type, command.field_type);
-                        let response = BooleanResponse { result: exists };
-                        self.send_response(token, &response)?;
-                    } else if let Ok(command) =
-                        ResolveIndirectionCommand::decode(resp_value.clone())
-                    {
-                        match self
-                            .store
-                            .resolve_indirection(command.entity_id, &command.fields)
-                        {
-                            Ok((entity_id, field_type)) => {
-                                let response = ResolveIndirectionResponse {
-                                    entity_id,
-                                    field_type,
-                                };
-                                self.send_response(token, &response)?;
-                            }
-                            Err(e) => {
-                                self.send_error(
-                                    token,
-                                    format!("Resolve indirection error: {}", e),
-                                )?;
-                            }
-                        }
-                    } else if let Ok(_command) = TakeSnapshotCommand::decode(resp_value.clone()) {
-                        let snapshot = self.store.take_snapshot();
-                        if let Some(snapshot_handle) = &self.snapshot_handle {
-                            snapshot_handle.save(snapshot.clone());
-                        }
-                        let response = SnapshotResponse {
-                            data: serde_json::to_string(&snapshot).unwrap_or_default(),
-                        };
-                        self.send_response(token, &response)?;
-                    } else if let Ok(command) =
-                        RegisterNotificationCommand::decode(resp_value.clone())
-                    {
-                        // Parse notification config
-                        let config = command.config;
-
-                        // Get the connection's notification queue
-                        if let Some(connection) = self.connections.get_mut(&token) {
-                            connection.notification_configs.insert(config.clone());
-
-                            match self.store.register_notification(
-                                config.clone(),
-                                connection.notification_queue.clone(),
-                            ) {
-                                Ok(_) => self.send_ok(token)?,
-                                Err(e) => self.send_error(
-                                    token,
-                                    format!("Register notification error: {}", e),
-                                )?,
-                            }
-                        } else {
-                            self.send_error(token, "Connection not found".to_string())?
-                        }
-                    } else if let Ok(command) =
-                        UnregisterNotificationCommand::decode(resp_value.clone())
-                    {
-                        // Get the connection's notification queue
-                        if let Some(connection) = self.connections.get_mut(&token) {
-                            connection.notification_configs.remove(&command.config);
-                            let removed = self.store.unregister_notification(
-                                &command.config,
-                                &connection.notification_queue,
-                            );
-                            let response = IntegerResponse {
-                                value: if removed { 1 } else { 0 },
-                            };
-                            self.send_response(token, &response)?
-                        } else {
-                            self.send_error(token, "Connection not found".to_string())?
-                        }
-                    } else if let Ok(command) = PeerHandshakeCommand::decode(resp_value.clone()) {
-                        self.handle_peer_handshake(
-                            token,
-                            command.start_time,
-                            command.is_response,
-                            command.machine_id,
-                        )?;
-                        // Send OK response
-                        self.send_ok(token)?;
-                    } else if let Ok(_) = FullSyncRequestCommand::decode(resp_value.clone()) {
-                        self.handle_peer_full_sync_request(token)?;
-                    } else if let Ok(command) = FullSyncResponseCommand::decode(resp_value.clone())
-                    {
-                        self.handle_peer_full_sync_response(token, command.snapshot_data)?;
-                    } else if let Ok(command) = SyncWriteCommand::decode(resp_value.clone()) {
-                        self.handle_peer_sync_write(token, command.requests_data)?;
+            loop {
+                // Check if we have data to process
+                let buffer: &[u8] = {
+                    if let Some(connection) = self.connections.get(&token) {
+                        &connection.read_buffer
                     } else {
-                        // No complete command could be parsed
+                        return Err(anyhow::anyhow!("Connection not found"));
+                    }
+                };
+
+                if buffer.is_empty() {
+                    break;
+                }
+
+                // First, parse the RESP value from the buffer
+                let (resp_value, remaining_bytes) = match RespParser::parse_value(buffer) {
+                    Ok((val, rem)) => (val, rem),
+                    Err(_) => {
+                        // Incomplete message, wait for more data
                         break;
                     }
+                };
 
-                    // Update the buffer to remove consumed data
-                    if consumed > 0 {
-                        if let Some(connection) = self.connections.get_mut(&token) {
-                            connection.read_buffer.advance(consumed);
+                let consumed = buffer.len() - remaining_bytes.len();
+                if let Ok(command) = ReadCommand::decode(resp_value.clone()) {
+                    match self.store.read(command.entity_id, &command.field_path) {
+                        Ok((value, timestamp, writer_id)) => {
+                            let response = ReadResponse {
+                                value,
+                                timestamp,
+                                writer_id,
+                            };
+                            self.send_response(token, &response)?;
                         }
+                        Err(e) => {
+                            self.send_error(token, format!("Read error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = WriteCommand::decode(resp_value.clone()) {
+                    match self.store.write(
+                        command.entity_id,
+                        &command.field_path,
+                        command.value,
+                        command.writer_id,
+                        command.write_time,
+                        command.push_condition,
+                        command.adjust_behavior,
+                    ) {
+                        Ok(_) => {
+                            self.send_ok(token)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Write error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = CreateEntityCommand::decode(resp_value.clone()) {
+                    match self.store.create_entity(
+                        command.entity_type,
+                        command.parent_id,
+                        &command.name,
+                    ) {
+                        Ok(entity_id) => {
+                            let response = CreateEntityResponse { entity_id };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Create entity error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = DeleteEntityCommand::decode(resp_value.clone()) {
+                    match self.store.delete_entity(command.entity_id) {
+                        Ok(_) => {
+                            self.send_ok(token)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Delete entity error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = GetEntityTypeCommand::decode(resp_value.clone()) {
+                    match self.store.get_entity_type(&command.name) {
+                        Ok(entity_type) => {
+                            let response = IntegerResponse {
+                                value: entity_type.0 as i64,
+                            };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Get entity type error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = ResolveEntityTypeCommand::decode(resp_value.clone()) {
+                    match self.store.resolve_entity_type(command.entity_type) {
+                        Ok(name) => {
+                            let response = StringResponse { value: name };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Resolve entity type error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = GetFieldTypeCommand::decode(resp_value.clone()) {
+                    match self.store.get_field_type(&command.name) {
+                        Ok(field_type) => {
+                            let response = IntegerResponse {
+                                value: field_type.0 as i64,
+                            };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Get field type error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = ResolveFieldTypeCommand::decode(resp_value.clone()) {
+                    match self.store.resolve_field_type(command.field_type) {
+                        Ok(name) => {
+                            let response = StringResponse { value: name };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Resolve field type error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = GetEntitySchemaCommand::decode(resp_value.clone()) {
+                    match self.store.get_entity_schema(command.entity_type) {
+                        Ok(schema) => {
+                            let response =
+                                EntitySchemaResp::from_entity_schema(&schema, &self.store);
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Get entity schema error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = UpdateSchemaCommand::decode(resp_value.clone()) {
+                    match command.schema.to_entity_schema(&self.store) {
+                        Ok(schema_string) => match self.store.update_schema(schema_string) {
+                            Ok(_) => {
+                                self.send_ok(token)?;
+                            }
+                            Err(e) => {
+                                self.send_error(token, format!("Update schema error: {}", e))?;
+                            }
+                        },
+                        Err(e) => {
+                            self.send_error(token, format!("Schema conversion error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = GetFieldSchemaCommand::decode(resp_value.clone()) {
+                    match self
+                        .store
+                        .get_field_schema(command.entity_type, command.field_type)
+                    {
+                        Ok(schema) => {
+                            let response = FieldSchemaResponse {
+                                schema:
+                                    qlib_rs::data::entity_schema::FieldSchemaResp::from_field_schema(
+                                        &schema,
+                                        &self.store,
+                                    ),
+                            };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Get field schema error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = SetFieldSchemaCommand::decode(resp_value.clone()) {
+                    let field_schema = qlib_rs::FieldSchema::from_string_schema(
+                        command.schema.to_field_schema(),
+                        &self.store,
+                    );
+                    match self.store.set_field_schema(
+                        command.entity_type,
+                        command.field_type,
+                        field_schema,
+                    ) {
+                        Ok(_) => {
+                            self.send_ok(token)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Set field schema error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = FindEntitiesCommand::decode(resp_value.clone()) {
+                    match self
+                        .store
+                        .find_entities(command.entity_type, command.filter.as_deref())
+                    {
+                        Ok(entities) => {
+                            let response = EntityListResponse { entities };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Find entities error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = FindEntitiesExactCommand::decode(resp_value.clone()) {
+                    match self.store.find_entities_exact(
+                        command.entity_type,
+                        None,
+                        command.filter.as_deref(),
+                    ) {
+                        Ok(result) => {
+                            let response = EntityListResponse {
+                                entities: result.items,
+                            };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Find entities exact error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = FindEntitiesPaginatedCommand::decode(resp_value.clone())
+                {
+                    match self.store.find_entities_paginated(
+                        command.entity_type,
+                        command.page_opts.as_ref(),
+                        command.filter.as_deref(),
+                    ) {
+                        Ok(result) => {
+                            let response = PaginatedEntityResponse {
+                                items: result.items,
+                                total: result.total,
+                                next_cursor: result.next_cursor,
+                            };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(
+                                token,
+                                format!("Find entities paginated error: {}", e),
+                            )?;
+                        }
+                    }
+                } else if let Ok(_command) = GetEntityTypesCommand::decode(resp_value.clone()) {
+                    match self.store.get_entity_types() {
+                        Ok(entity_types) => {
+                            let response = EntityTypeListResponse { entity_types };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Get entity types error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) =
+                    GetEntityTypesPaginatedCommand::decode(resp_value.clone())
+                {
+                    match self
+                        .store
+                        .get_entity_types_paginated(command.page_opts.as_ref())
+                    {
+                        Ok(result) => {
+                            let response = PaginatedEntityTypeResponse {
+                                items: result.items,
+                                total: result.total,
+                                next_cursor: result.next_cursor,
+                            };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(
+                                token,
+                                format!("Get entity types paginated error: {}", e),
+                            )?;
+                        }
+                    }
+                } else if let Ok(command) = EntityExistsCommand::decode(resp_value.clone()) {
+                    let exists = self.store.entity_exists(command.entity_id);
+                    let response = BooleanResponse { result: exists };
+                    self.send_response(token, &response)?;
+                } else if let Ok(command) = FieldExistsCommand::decode(resp_value.clone()) {
+                    let exists = self
+                        .store
+                        .field_exists(command.entity_type, command.field_type);
+                    let response = BooleanResponse { result: exists };
+                    self.send_response(token, &response)?;
+                } else if let Ok(command) = ResolveIndirectionCommand::decode(resp_value.clone()) {
+                    match self
+                        .store
+                        .resolve_indirection(command.entity_id, &command.fields)
+                    {
+                        Ok((entity_id, field_type)) => {
+                            let response = ResolveIndirectionResponse {
+                                entity_id,
+                                field_type,
+                            };
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Resolve indirection error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(_command) = TakeSnapshotCommand::decode(resp_value.clone()) {
+                    let snapshot = self.store.take_snapshot();
+                    if let Some(snapshot_handle) = &self.snapshot_handle {
+                        snapshot_handle.save(snapshot.clone());
+                    }
+                    let response = SnapshotResponse {
+                        data: serde_json::to_string(&snapshot).unwrap_or_default(),
+                    };
+                    self.send_response(token, &response)?;
+                } else if let Ok(command) = RegisterNotificationCommand::decode(resp_value.clone())
+                {
+                    // Parse notification config
+                    let config = command.config;
+
+                    // Get the connection's notification queue
+                    if let Some(connection) = self.connections.get_mut(&token) {
+                        connection.notification_configs.insert(config.clone());
+
+                        match self.store.register_notification(
+                            config.clone(),
+                            connection.notification_queue.clone(),
+                        ) {
+                            Ok(_) => self.send_ok(token)?,
+                            Err(e) => self
+                                .send_error(token, format!("Register notification error: {}", e))?,
+                        }
+                    } else {
+                        self.send_error(token, "Connection not found".to_string())?
+                    }
+                } else if let Ok(command) =
+                    UnregisterNotificationCommand::decode(resp_value.clone())
+                {
+                    // Get the connection's notification queue
+                    if let Some(connection) = self.connections.get_mut(&token) {
+                        connection.notification_configs.remove(&command.config);
+                        let removed = self.store.unregister_notification(
+                            &command.config,
+                            &connection.notification_queue,
+                        );
+                        let response = IntegerResponse {
+                            value: if removed { 1 } else { 0 },
+                        };
+                        self.send_response(token, &response)?
+                    } else {
+                        self.send_error(token, "Connection not found".to_string())?
+                    }
+                } else if let Ok(command) = PeerHandshakeCommand::decode(resp_value.clone()) {
+                    self.handle_peer_handshake(
+                        token,
+                        command.start_time,
+                        command.is_response,
+                        command.machine_id,
+                    )?;
+                    // Send OK response
+                    self.send_ok(token)?;
+                } else if let Ok(_) = FullSyncRequestCommand::decode(resp_value.clone()) {
+                    self.handle_peer_full_sync_request(token)?;
+                } else if let Ok(command) = FullSyncResponseCommand::decode(resp_value.clone()) {
+                    self.handle_peer_full_sync_response(token, command.snapshot_data)?;
+                } else if let Ok(command) = SyncWriteCommand::decode(resp_value.clone()) {
+                    self.handle_peer_sync_write(token, command.requests_data)?;
+                } else {
+                    // No complete command could be parsed
+                    break;
+                }
+
+                // Update the buffer to remove consumed data
+                if consumed > 0 {
+                    if let Some(connection) = self.connections.get_mut(&token) {
+                        connection.read_buffer.advance(consumed);
                     }
                 }
+            }
         }
 
         Ok(())
@@ -2166,13 +2153,13 @@ impl CoreService {
     fn optimize_socket(stream: &mut MioTcpStream) -> Result<()> {
         // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
         stream.set_nodelay(true)?;
-        
+
         // Set send/receive buffer sizes for better throughput
         // Using unsafe to call libc functions directly for fine-grained control
         let socket = stream.as_raw_fd();
         unsafe {
             let buf_size: libc::c_int = 65536;
-            
+
             // Set receive buffer size
             let ret = libc::setsockopt(
                 socket,
@@ -2184,7 +2171,7 @@ impl CoreService {
             if ret != 0 {
                 return Err(anyhow::anyhow!("Failed to set SO_RCVBUF"));
             }
-            
+
             // Set send buffer size
             let ret = libc::setsockopt(
                 socket,
@@ -2197,7 +2184,7 @@ impl CoreService {
                 return Err(anyhow::anyhow!("Failed to set SO_SNDBUF"));
             }
         }
-        
+
         Ok(())
     }
 }
