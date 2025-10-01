@@ -265,15 +265,11 @@ impl CoreService {
             let mut events = Events::with_capacity(1024);
 
             loop {
-                // Process commands first to reduce latency
-                while let Ok(request) = receiver.try_recv() {
-                    service.handle_command(request);
-                }
-
-                // Poll for I/O events with short timeout for responsiveness
+                // Poll for I/O events with no timeout for maximum responsiveness
+                // Periodic operations are now handled by the self-connecting periodic client
                 service
                     .poll
-                    .poll(&mut events, Some(Duration::from_millis(1)))
+                    .poll(&mut events, Some(Duration::from_millis(10)))
                     .unwrap();
 
                 // Handle all mio events
@@ -302,6 +298,10 @@ impl CoreService {
                 {
                     service.last_fault_tolerance_tick = now;
                     service.manage_fault_tolerance();
+                }
+
+                while let Ok(request) = receiver.try_recv() {
+                    service.handle_command(request);
                 }
 
                 // Process pending notifications for all connections
@@ -499,38 +499,38 @@ impl CoreService {
 
     /// Handle reading data from a connection
     fn handle_connection_read(&mut self, token: Token) -> Result<()> {
-        loop {
-            let (bytes_read, should_continue) = {
-                let connection = self
-                    .connections
-                    .get_mut(&token)
-                    .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+        // Perform a SINGLE read() call - Redis optimization
+        let bytes_read = {
+            let connection = self
+                .connections
+                .get_mut(&token)
+                .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
 
-                match connection.stream.read(&mut connection.static_read_buffer) {
-                    Ok(0) => {
-                        // Connection closed by peer
-                        return Err(anyhow::anyhow!("Connection closed by peer"));
-                    }
-                    Ok(n) => {
-                        // Append new data to the read buffer
-                        connection
-                            .read_buffer
-                            .extend_from_slice(&connection.static_read_buffer[0..n]);
-                        (n, true)
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No more data available right now
-                        (0, false)
-                    }
-                    Err(e) => {
-                        return Err(anyhow::anyhow!("Read error: {}", e));
-                    }
+            match connection.stream.read(&mut connection.static_read_buffer) {
+                Ok(0) => {
+                    // Connection closed by peer
+                    return Err(anyhow::anyhow!("Connection closed by peer"));
                 }
-            };
+                Ok(n) => {
+                    // Append new data to the read buffer
+                    connection
+                        .read_buffer
+                        .extend_from_slice(&connection.static_read_buffer[0..n]);
+                    n
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No more data available right now
+                    0
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Read error: {}", e));
+                }
+            }
+        };
 
-            // Process any complete commands after reading new data
-            if bytes_read > 0 {
-                // Parse all complete commands from the buffer
+        // Process ALL complete commands from the buffer - Redis optimization
+        if bytes_read > 0 {
+            // Parse all complete commands from the buffer
                 loop {
                     // Check if we have data to process
                     let buffer: &[u8] = {
@@ -909,11 +909,6 @@ impl CoreService {
                         }
                     }
                 }
-            }
-
-            if !should_continue {
-                break;
-            }
         }
 
         Ok(())
