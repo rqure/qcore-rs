@@ -259,7 +259,7 @@ impl CoreService {
                 // Periodic operations are now handled by the self-connecting periodic client
                 service
                     .poll
-                    .poll(&mut events, Some(Duration::from_millis(100)))
+                    .poll(&mut events, Some(Duration::from_millis(10)))
                     .unwrap();
 
                 // Handle all mio events
