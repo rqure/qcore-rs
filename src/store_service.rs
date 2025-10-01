@@ -146,6 +146,9 @@ pub enum StoreRequest {
     CollectPendingWrites {
         respond_to: Sender<Vec<WriteInfo>>,
     },
+    SetCoreHandle {
+        core_handle: crate::core::CoreHandle,
+    },
 }
 
 /// Handle for communicating with store service
@@ -511,17 +514,25 @@ impl StoreHandle {
             .unwrap();
         resp_receiver.recv().unwrap()
     }
+
+    pub fn set_core_handle(&self, core_handle: crate::core::CoreHandle) {
+        self.sender
+            .send(StoreRequest::SetCoreHandle { core_handle })
+            .unwrap();
+    }
 }
 
 /// Store service that processes store operations in its own thread
 pub struct StoreService {
     store: Store,
+    core_handle: Option<crate::core::CoreHandle>,
 }
 
 impl StoreService {
     pub fn new() -> Self {
         Self {
             store: Store::new(),
+            core_handle: None,
         }
     }
 
@@ -856,6 +867,11 @@ impl StoreService {
             // Bulk operations
             StoreRequest::RestoreSnapshot { snapshot } => {
                 self.store.restore_snapshot(snapshot);
+                
+                // Notify CoreService that restoration is complete
+                if let Some(core_handle) = &self.core_handle {
+                    core_handle.on_snapshot_restored();
+                }
             }
             StoreRequest::Replay { writes } => {
                 // Process writes one by one through the store's write_queue
@@ -869,6 +885,9 @@ impl StoreService {
                     writes.push(write);
                 }
                 let _ = respond_to.send(writes);
+            }
+            StoreRequest::SetCoreHandle { core_handle } => {
+                self.core_handle = Some(core_handle);
             }
         }
     }

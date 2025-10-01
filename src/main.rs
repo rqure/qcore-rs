@@ -156,6 +156,7 @@ fn main() -> Result<()> {
     // Wire up service handles
     wal_handle.set_store_handle(store_handle.clone());
     snapshot_handle.set_store_handle(store_handle.clone());
+    store_handle.set_core_handle(core_handle.clone());
     
     core_handle.set_snapshot_handle(snapshot_handle.clone());
     core_handle.set_wal_handle(wal_handle.clone());
