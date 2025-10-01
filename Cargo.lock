@@ -1234,6 +1234,7 @@ dependencies = [
  "crossbeam",
  "futures-util",
  "itertools",
+ "itoa",
  "log",
  "lru",
  "mio",
