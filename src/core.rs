@@ -167,6 +167,7 @@ struct Connection {
     outbound_buffer: BytesMut,
     read_buffer: BytesMut,
     static_read_buffer: [u8; 65_536],
+    needs_write_interest: bool,
 }
 
 /// Core service that handles both client and peer connections
@@ -191,9 +192,6 @@ pub struct CoreService {
     // Handles to other services
     snapshot_handle: Option<SnapshotHandle>,
     wal_handle: Option<WalHandle>,
-
-    // Track connections that need write interest updates (optimization)
-    connections_needing_write: HashSet<Token>,
 }
 
 const LISTENER_TOKEN: Token = Token(0);
@@ -233,7 +231,6 @@ impl CoreService {
             candidate_entity_id: None,
             snapshot_handle: None,
             wal_handle: None,
-            connections_needing_write: HashSet::new(),
         };
 
         // Create initial peer entries without entity IDs (will be resolved after snapshot restore)
@@ -268,11 +265,15 @@ impl CoreService {
             let mut events = Events::with_capacity(1024);
 
             loop {
-                // Poll for I/O events with no timeout for maximum responsiveness
-                // Periodic operations are now handled by the self-connecting periodic client
+                // Process commands first to reduce latency
+                while let Ok(request) = receiver.try_recv() {
+                    service.handle_command(request);
+                }
+
+                // Poll for I/O events with short timeout for responsiveness
                 service
                     .poll
-                    .poll(&mut events, Some(Duration::from_millis(10)))
+                    .poll(&mut events, Some(Duration::from_millis(1)))
                     .unwrap();
 
                 // Handle all mio events
@@ -301,10 +302,6 @@ impl CoreService {
                 {
                     service.last_fault_tolerance_tick = now;
                     service.manage_fault_tolerance();
-                }
-
-                while let Ok(request) = receiver.try_recv() {
-                    service.handle_command(request);
                 }
 
                 // Process pending notifications for all connections
@@ -433,6 +430,7 @@ impl CoreService {
                         outbound_buffer: BytesMut::with_capacity(65536),
                         read_buffer: BytesMut::with_capacity(65536),
                         static_read_buffer: [0u8; 65536],
+                        needs_write_interest: false,
                     };
                     self.connections.insert(token, connection);
                     debug!("Connection {} registered with token {:?}", addr, token);
@@ -932,8 +930,7 @@ impl CoreService {
 
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_buffer.extend_from_slice(&encoded_bytes);
-            // Mark this connection as needing write interest
-            self.connections_needing_write.insert(token);
+            connection.needs_write_interest = true;
         }
 
         Ok(())
@@ -946,8 +943,7 @@ impl CoreService {
 
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_buffer.extend_from_slice(&encoded_bytes);
-            // Mark this connection as needing write interest
-            self.connections_needing_write.insert(token);
+            connection.needs_write_interest = true;
         }
 
         Ok(())
@@ -960,8 +956,7 @@ impl CoreService {
 
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_buffer.extend_from_slice(&encoded_bytes);
-            // Mark this connection as needing write interest
-            self.connections_needing_write.insert(token);
+            connection.needs_write_interest = true;
         }
 
         Ok(())
@@ -974,8 +969,7 @@ impl CoreService {
 
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_buffer.extend_from_slice(&encoded_bytes);
-            // Mark this connection as needing write interest
-            self.connections_needing_write.insert(token);
+            connection.needs_write_interest = true;
         }
 
         Ok(())
@@ -1000,21 +994,19 @@ impl CoreService {
 
     /// Apply batched write interest updates to all connections that need it
     fn apply_write_interest_updates(&mut self) {
-        // Process all tokens that need write interest
-        for token in self.connections_needing_write.drain() {
-            if let Some(connection) = self.connections.get_mut(&token) {
-                if !connection.outbound_buffer.is_empty() {
-                    // Only update if we still have messages to send
-                    if let Err(e) = self.poll.registry().reregister(
-                        &mut connection.stream,
-                        token,
-                        Interest::READABLE | Interest::WRITABLE,
-                    ) {
-                        error!(
-                            "Failed to reregister connection {:?} for writing: {}",
-                            token, e
-                        );
-                    }
+        // Process all connections that need write interest
+        for (token, connection) in self.connections.iter_mut() {
+            if connection.needs_write_interest && !connection.outbound_buffer.is_empty() {
+                connection.needs_write_interest = false;
+                if let Err(e) = self.poll.registry().reregister(
+                    &mut connection.stream,
+                    *token,
+                    Interest::READABLE | Interest::WRITABLE,
+                ) {
+                    error!(
+                        "Failed to reregister connection {:?} for writing: {}",
+                        token, e
+                    );
                 }
             }
         }
@@ -1045,11 +1037,10 @@ impl CoreService {
 
         // If no more data to write, stop watching for write events
         if connection.outbound_buffer.is_empty() {
+            connection.needs_write_interest = false;
             self.poll
                 .registry()
                 .reregister(&mut connection.stream, token, Interest::READABLE)?;
-            // Remove from the pending write set since we've finished writing
-            self.connections_needing_write.remove(&token);
         }
 
         Ok(())
@@ -1601,6 +1592,7 @@ impl CoreService {
                     outbound_buffer: BytesMut::with_capacity(65536),
                     read_buffer: BytesMut::with_capacity(65536),
                     static_read_buffer: [0u8; 65536],
+                    needs_write_interest: false,
                 };
 
                 self.connections.insert(token, connection);
