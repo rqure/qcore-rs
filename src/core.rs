@@ -1,11 +1,12 @@
 use ahash::AHashMap;
 use anyhow::Result;
+use bytes::{Buf, BytesMut};
 use crossbeam::channel::Sender;
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
 use mio::{Events, Interest, Poll, Token, event::Event};
 use rustc_hash::FxHashMap;
 use serde_json;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use std::io::{Read, Write};
 use std::thread;
@@ -152,7 +153,7 @@ struct Connection {
     client_id: Option<EntityId>,
     notification_queue: NotificationQueue,
     notification_configs: HashSet<NotifyConfig>,
-    outbound_messages: VecDeque<Vec<u8>>,
+    outbound_buffer: BytesMut,
     read_buffer: Vec<u8>,
 }
 
@@ -417,7 +418,7 @@ impl CoreService {
                         client_id: None,
                         notification_queue: NotificationQueue::new(),
                         notification_configs: HashSet::new(),
-                        outbound_messages: VecDeque::new(),
+                        outbound_buffer: BytesMut::with_capacity(8192),
                         read_buffer: Vec::with_capacity(8192),
                     };
                     self.connections.insert(token, connection);
@@ -857,7 +858,7 @@ impl CoreService {
         let encoded_bytes = encoded.to_bytes();
 
         if let Some(connection) = self.connections.get_mut(&token) {
-            connection.outbound_messages.push_back(encoded_bytes);
+            connection.outbound_buffer.extend_from_slice(&encoded_bytes);
             // Mark this connection as needing write interest
             self.connections_needing_write.insert(token);
         }
@@ -871,7 +872,7 @@ impl CoreService {
         let encoded_bytes = encoded.to_bytes();
 
         if let Some(connection) = self.connections.get_mut(&token) {
-            connection.outbound_messages.push_back(encoded_bytes);
+            connection.outbound_buffer.extend_from_slice(&encoded_bytes);
             // Mark this connection as needing write interest
             self.connections_needing_write.insert(token);
         }
@@ -885,7 +886,7 @@ impl CoreService {
         let encoded_bytes = error_response.to_bytes();
 
         if let Some(connection) = self.connections.get_mut(&token) {
-            connection.outbound_messages.push_back(encoded_bytes);
+            connection.outbound_buffer.extend_from_slice(&encoded_bytes);
             // Mark this connection as needing write interest
             self.connections_needing_write.insert(token);
         }
@@ -899,7 +900,7 @@ impl CoreService {
         let encoded_bytes = ok_response.to_bytes();
 
         if let Some(connection) = self.connections.get_mut(&token) {
-            connection.outbound_messages.push_back(encoded_bytes);
+            connection.outbound_buffer.extend_from_slice(&encoded_bytes);
             // Mark this connection as needing write interest
             self.connections_needing_write.insert(token);
         }
@@ -929,7 +930,7 @@ impl CoreService {
         // Process all tokens that need write interest
         for token in self.connections_needing_write.drain() {
             if let Some(connection) = self.connections.get_mut(&token) {
-                if !connection.outbound_messages.is_empty() {
+                if !connection.outbound_buffer.is_empty() {
                     // Only update if we still have messages to send
                     if let Err(e) = self.poll.registry().reregister(
                         &mut connection.stream,
@@ -950,22 +951,17 @@ impl CoreService {
             .get_mut(&token)
             .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
 
-        while let Some(message_data) = connection.outbound_messages.pop_front() {
-            match connection.stream.write(&message_data) {
-                Ok(n) if n == message_data.len() => {
-                    // Full message written
-                    continue;
-                }
+        while !connection.outbound_buffer.is_empty() {
+            match connection.stream.write(&connection.outbound_buffer) {
                 Ok(n) => {
-                    // Partial write - put remaining data back at front of queue
-                    connection
-                        .outbound_messages
-                        .push_front(message_data[n..].to_vec());
-                    break;
+                    // Advance the buffer by the number of bytes written
+                    connection.outbound_buffer.advance(n);
+                    if connection.outbound_buffer.is_empty() {
+                        break;
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Can't write more right now - put message back
-                    connection.outbound_messages.push_front(message_data);
+                    // Can't write more right now
                     break;
                 }
                 Err(e) => {
@@ -974,8 +970,8 @@ impl CoreService {
             }
         }
 
-        // If no more messages to write, stop watching for write events
-        if connection.outbound_messages.is_empty() {
+        // If no more data to write, stop watching for write events
+        if connection.outbound_buffer.is_empty() {
             self.poll
                 .registry()
                 .reregister(&mut connection.stream, token, Interest::READABLE)?;
@@ -1523,17 +1519,15 @@ impl CoreService {
                     None
                 };
 
-                let connection = Connection {
-                    stream,
-                    addr_string: addr,
-                    client_id,
-                    notification_queue: NotificationQueue::new(),
-                    notification_configs: HashSet::new(),
-                    outbound_messages: VecDeque::new(),
-                    read_buffer: Vec::with_capacity(8192),
-                };
-
-                self.connections.insert(token, connection);
+            let connection = Connection {
+                stream,
+                addr_string: addr,
+                client_id,
+                notification_queue: NotificationQueue::new(),
+                notification_configs: HashSet::new(),
+                outbound_buffer: BytesMut::with_capacity(8192),
+                read_buffer: Vec::with_capacity(8192),
+            };                self.connections.insert(token, connection);
                 info!("Peer {} connected with token {:?}", machine_id, token);
 
                 // Send initial handshake with RESP protocol
