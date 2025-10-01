@@ -178,6 +178,9 @@ pub struct CoreService {
     // Handles to other services
     snapshot_handle: Option<SnapshotHandle>,
     wal_handle: Option<WalHandle>,
+
+    // Track connections that need write interest updates (optimization)
+    connections_needing_write: HashSet<Token>,
 }
 
 const LISTENER_TOKEN: Token = Token(0);
@@ -217,6 +220,7 @@ impl CoreService {
             candidate_entity_id: None,
             snapshot_handle: None,
             wal_handle: None,
+            connections_needing_write: HashSet::new(),
         };
 
         // Create initial peer entries without entity IDs (will be resolved after snapshot restore)
@@ -292,6 +296,9 @@ impl CoreService {
 
                 // Process pending notifications for all connections
                 service.process_notifications();
+
+                // Apply batched write interest updates (optimization: do once per loop instead of per send)
+                service.apply_write_interest_updates();
 
                 // Drain the write queue from the store (WriteInfo items for internal tracking)
                 while let Some(write_info) = service.store.write_queue.pop_front() {
@@ -851,13 +858,8 @@ impl CoreService {
 
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_messages.push_back(encoded_bytes);
-
-            // Register for write events if we have messages to send
-            self.poll.registry().reregister(
-                &mut connection.stream,
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            )?;
+            // Mark this connection as needing write interest
+            self.connections_needing_write.insert(token);
         }
 
         Ok(())
@@ -870,13 +872,8 @@ impl CoreService {
 
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_messages.push_back(encoded_bytes);
-
-            // Register for write events if we have messages to send
-            self.poll.registry().reregister(
-                &mut connection.stream,
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            )?;
+            // Mark this connection as needing write interest
+            self.connections_needing_write.insert(token);
         }
 
         Ok(())
@@ -889,13 +886,8 @@ impl CoreService {
 
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_messages.push_back(encoded_bytes);
-
-            // Register for write events if we have messages to send
-            self.poll.registry().reregister(
-                &mut connection.stream,
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            )?;
+            // Mark this connection as needing write interest
+            self.connections_needing_write.insert(token);
         }
 
         Ok(())
@@ -908,13 +900,8 @@ impl CoreService {
 
         if let Some(connection) = self.connections.get_mut(&token) {
             connection.outbound_messages.push_back(encoded_bytes);
-
-            // Register for write events if we have messages to send
-            self.poll.registry().reregister(
-                &mut connection.stream,
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            )?;
+            // Mark this connection as needing write interest
+            self.connections_needing_write.insert(token);
         }
 
         Ok(())
@@ -935,6 +922,25 @@ impl CoreService {
         };
 
         self.send_response(token, &command)
+    }
+
+    /// Apply batched write interest updates to all connections that need it
+    fn apply_write_interest_updates(&mut self) {
+        // Process all tokens that need write interest
+        for token in self.connections_needing_write.drain() {
+            if let Some(connection) = self.connections.get_mut(&token) {
+                if !connection.outbound_messages.is_empty() {
+                    // Only update if we still have messages to send
+                    if let Err(e) = self.poll.registry().reregister(
+                        &mut connection.stream,
+                        token,
+                        Interest::READABLE | Interest::WRITABLE,
+                    ) {
+                        error!("Failed to reregister connection {:?} for writing: {}", token, e);
+                    }
+                }
+            }
+        }
     }
 
     /// Handle writing data to a connection
@@ -973,6 +979,8 @@ impl CoreService {
             self.poll
                 .registry()
                 .reregister(&mut connection.stream, token, Interest::READABLE)?;
+            // Remove from the pending write set since we've finished writing
+            self.connections_needing_write.remove(&token);
         }
 
         Ok(())
