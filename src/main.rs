@@ -1,7 +1,7 @@
 mod wal;
 mod snapshot;
 mod files;
-mod core;
+mod io;
 mod store;
 mod heartbeat;
 mod fault_tolerance;
@@ -14,7 +14,7 @@ use clap::Parser;
 use tracing::error;
 
 use crate::{
-    core::{CoreConfig, CoreService},
+    io::{IoConfig, IoService},
     snapshot::{SnapshotConfig, SnapshotService},
     store::StoreService,
     wal::{WalConfig, WalService},
@@ -151,7 +151,7 @@ fn main() -> Result<()> {
         store_handle.clone(),
     );
 
-    let core_handle = CoreService::spawn(CoreConfig::from(&config), store_handle.clone());
+    let core_handle = IoService::spawn(IoConfig::from(&config), store_handle.clone());
     
     // Wire up service handles
     wal_handle.set_store_handle(store_handle.clone());

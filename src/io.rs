@@ -39,7 +39,7 @@ use crate::wal::WalHandle;
 
 /// Configuration for the core service
 #[derive(Debug, Clone)]
-pub struct CoreConfig {
+pub struct IoConfig {
     /// Port for unified client and peer communication
     pub port: u16,
     /// Machine ID for request origination
@@ -48,7 +48,7 @@ pub struct CoreConfig {
     pub peers: HashMap<String, String>,
 }
 
-impl From<&crate::Config> for CoreConfig {
+impl From<&crate::Config> for IoConfig {
     fn from(config: &crate::Config) -> Self {
         let peers = config
             .peer_addresses
@@ -66,7 +66,7 @@ impl From<&crate::Config> for CoreConfig {
 
 /// Core service request types
 #[derive(Debug)]
-pub enum CoreCommand {
+pub enum IoCommand {
     SetSnapshotHandle {
         snapshot_handle: SnapshotHandle,
     },
@@ -88,39 +88,39 @@ pub enum CoreCommand {
 
 /// Handle for communicating with core service
 #[derive(Debug, Clone)]
-pub struct CoreHandle {
-    sender: Sender<CoreCommand>,
+pub struct IoHandle {
+    sender: Sender<IoCommand>,
 }
 
-impl CoreHandle {
+impl IoHandle {
     pub fn set_snapshot_handle(&self, snapshot_handle: SnapshotHandle) {
         self.sender
-            .send(CoreCommand::SetSnapshotHandle { snapshot_handle })
+            .send(IoCommand::SetSnapshotHandle { snapshot_handle })
             .unwrap();
     }
 
     pub fn set_wal_handle(&self, wal_handle: crate::wal::WalHandle) {
         self.sender
-            .send(CoreCommand::SetWalHandle { wal_handle })
+            .send(IoCommand::SetWalHandle { wal_handle })
             .unwrap();
     }
 
     pub fn set_fault_tolerance_handle(&self, fault_tolerance_handle: FaultToleranceHandle) {
         self.sender
-            .send(CoreCommand::SetFaultToleranceHandle { fault_tolerance_handle })
+            .send(IoCommand::SetFaultToleranceHandle { fault_tolerance_handle })
             .unwrap();
     }
 
     pub fn peer_connected(&self, machine_id: String, stream: MioTcpStream) {
         self.sender
-            .send(CoreCommand::PeerConnected { machine_id, stream })
+            .send(IoCommand::PeerConnected { machine_id, stream })
             .unwrap();
     }
 
     pub fn get_peers(&self) -> AHashMap<String, (Option<Token>, Option<EntityId>)> {
         let (resp_sender, resp_receiver) = crossbeam::channel::bounded(1);
         self.sender
-            .send(CoreCommand::GetPeers {
+            .send(IoCommand::GetPeers {
                 respond_to: resp_sender,
             })
             .unwrap();
@@ -128,7 +128,7 @@ impl CoreHandle {
     }
 
     pub fn on_snapshot_restored(&self) {
-        let _ = self.sender.send(CoreCommand::OnSnapshotRestored);
+        let _ = self.sender.send(IoCommand::OnSnapshotRestored);
     }
 }
 
@@ -165,8 +165,8 @@ struct Connection {
 }
 
 /// Core service that handles both client and peer connections
-pub struct CoreService {
-    config: CoreConfig,
+pub struct IoService {
+    config: IoConfig,
     listener: MioTcpListener,
     poll: Poll,
     connections: FxHashMap<Token, Connection>,
@@ -188,9 +188,9 @@ pub struct CoreService {
 
 const LISTENER_TOKEN: Token = Token(0);
 
-impl CoreService {
+impl IoService {
     /// Create a new core service with peer configuration
-    pub fn new(config: CoreConfig, store_handle: StoreHandle) -> Result<Self> {
+    pub fn new(config: IoConfig, store_handle: StoreHandle) -> Result<Self> {
         let addr = format!("0.0.0.0:{}", config.port).parse()?;
         let mut listener = MioTcpListener::bind(addr)?;
         let poll = Poll::new()?;
@@ -230,9 +230,9 @@ impl CoreService {
     }
 
     /// Spawn the core service in its own thread and return a handle
-    pub fn spawn(config: CoreConfig, store_handle: StoreHandle) -> CoreHandle {
+    pub fn spawn(config: IoConfig, store_handle: StoreHandle) -> IoHandle {
         let (sender, receiver) = crossbeam::channel::unbounded();
-        let handle = CoreHandle { sender };
+        let handle = IoHandle { sender };
 
         // Start peer connection thread
         let peer_handle = handle.clone();
@@ -299,7 +299,7 @@ impl CoreService {
     }
 
     /// Peer connection thread that connects to peers with higher machine IDs
-    fn peer_connection_thread(handle: CoreHandle, config: CoreConfig) {
+    fn peer_connection_thread(handle: IoHandle, config: IoConfig) {
         info!(
             "Starting peer connection thread for machine {}",
             config.machine
@@ -1342,27 +1342,27 @@ impl CoreService {
     }
 
     /// Handle commands from other actors
-    fn handle_command(&mut self, command: CoreCommand) {
+    fn handle_command(&mut self, command: IoCommand) {
         match command {
-            CoreCommand::OnSnapshotRestored => {
+            IoCommand::OnSnapshotRestored => {
                 debug!("Handling snapshot restoration notification");
 
                 // Handle post-restoration cleanup and re-initialization
                 self.handle_snapshot_restoration();
             }
-            CoreCommand::SetSnapshotHandle { snapshot_handle } => {
+            IoCommand::SetSnapshotHandle { snapshot_handle } => {
                 debug!("Setting snapshot handle");
                 self.snapshot_handle = Some(snapshot_handle);
             }
-            CoreCommand::SetWalHandle { wal_handle } => {
+            IoCommand::SetWalHandle { wal_handle } => {
                 debug!("Setting WAL handle");
                 self.wal_handle = Some(wal_handle);
             }
-            CoreCommand::SetFaultToleranceHandle { fault_tolerance_handle } => {
+            IoCommand::SetFaultToleranceHandle { fault_tolerance_handle } => {
                 debug!("Setting fault tolerance handle");
                 self.fault_tolerance_handle = Some(fault_tolerance_handle);
             }
-            CoreCommand::PeerConnected {
+            IoCommand::PeerConnected {
                 machine_id,
                 mut stream,
             } => {
@@ -1445,7 +1445,7 @@ impl CoreService {
                     );
                 }
             }
-            CoreCommand::GetPeers { respond_to } => {
+            IoCommand::GetPeers { respond_to } => {
                 // Convert PeerInfo to the expected tuple format
                 let peers_response: AHashMap<String, (Option<Token>, Option<EntityId>)> = self
                     .peers

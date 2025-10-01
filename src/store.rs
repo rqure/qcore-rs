@@ -147,7 +147,7 @@ pub enum StoreRequest {
         respond_to: Sender<Vec<WriteInfo>>,
     },
     SetCoreHandle {
-        core_handle: crate::core::CoreHandle,
+        core_handle: crate::io::IoHandle,
     },
 }
 
@@ -515,7 +515,7 @@ impl StoreHandle {
         resp_receiver.recv().unwrap()
     }
 
-    pub fn set_core_handle(&self, core_handle: crate::core::CoreHandle) {
+    pub fn set_core_handle(&self, core_handle: crate::io::IoHandle) {
         self.sender
             .send(StoreRequest::SetCoreHandle { core_handle })
             .unwrap();
@@ -525,7 +525,7 @@ impl StoreHandle {
 /// Store service that processes store operations in its own thread
 pub struct StoreService {
     store: Store,
-    core_handle: Option<crate::core::CoreHandle>,
+    core_handle: Option<crate::io::IoHandle>,
 }
 
 impl StoreService {
