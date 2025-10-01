@@ -956,9 +956,6 @@ impl CoreService {
                 Ok(n) => {
                     // Advance the buffer by the number of bytes written
                     connection.outbound_buffer.advance(n);
-                    if connection.outbound_buffer.is_empty() {
-                        break;
-                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Can't write more right now
