@@ -6,7 +6,7 @@ use crossbeam::channel::Sender;
 use tracing::{info, warn, error};
 use anyhow::Result;
 
-use crate::store::StoreHandle;
+use crate::core::CoreHandle;
 use crate::files::{FileConfig, FileManager, FileManagerTrait};
 
 /// Trait for snapshot operations
@@ -36,8 +36,8 @@ pub enum SnapshotCommand {
     Save {
         snapshot: qlib_rs::Snapshot,
     },
-    SetStoreHandle {
-        store_handle: StoreHandle,
+    SetCoreHandle {
+        core_handle: CoreHandle,
     },
     LoadLatest,
 }
@@ -53,8 +53,8 @@ impl SnapshotHandle {
         self.sender.send(SnapshotCommand::Save { snapshot }).unwrap();
     }
 
-    pub fn set_store_handle(&self, store_handle: StoreHandle) {
-        self.sender.send(SnapshotCommand::SetStoreHandle { store_handle }).unwrap();
+    pub fn set_core_handle(&self, core_handle: CoreHandle) {
+        self.sender.send(SnapshotCommand::SetCoreHandle { core_handle }).unwrap();
     }
     
     pub fn load_latest(&self) {
@@ -86,8 +86,8 @@ impl SnapshotService {
                             error!(error = %e, "Failed to save snapshot");
                         }
                     }
-                    SnapshotCommand::SetStoreHandle { store_handle } => {
-                        service.store_handle = Some(store_handle);
+                    SnapshotCommand::SetCoreHandle { core_handle } => {
+                        service.core_handle = Some(core_handle);
                     }
                     SnapshotCommand::LoadLatest => {
                         match service.load_latest() {
@@ -97,10 +97,10 @@ impl SnapshotService {
                                     "Loaded latest snapshot successfully"
                                 );
 
-                                if let Some(store) = &service.store_handle {
-                                    store.restore_snapshot(snapshot);
+                                if let Some(core) = &service.core_handle {
+                                    core.restore_snapshot(snapshot);
                                 } else {
-                                    warn!("Store handle not set, cannot load snapshot into store");
+                                    warn!("Core handle not set, cannot load snapshot into core");
                                 }                                
                             },
                             Ok(None) => {
@@ -126,7 +126,7 @@ pub struct SnapshotManagerTrait<F: FileManagerTrait> {
     /// Configuration for snapshot operations
     config: SnapshotConfig,
 
-    store_handle: Option<StoreHandle>,
+    core_handle: Option<CoreHandle>,
 }
 
 impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
@@ -139,7 +139,7 @@ impl<F: FileManagerTrait> SnapshotManagerTrait<F> {
                 max_files: config.max_files,
             },
             config,
-            store_handle: None,
+            core_handle: None,
         }
     }
 }

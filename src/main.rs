@@ -1,10 +1,7 @@
 mod wal;
 mod snapshot;
 mod files;
-mod io;
-mod store;
-mod heartbeat;
-mod fault_tolerance;
+mod core;
 
 use std::path::PathBuf;
 use std::collections::HashMap;
@@ -14,12 +11,9 @@ use clap::Parser;
 use tracing::error;
 
 use crate::{
-    io::{IoConfig, IoService},
+    core::{CoreConfig, CoreService},
     snapshot::{SnapshotConfig, SnapshotService},
-    store::StoreService,
     wal::{WalConfig, WalService},
-    heartbeat::{HeartbeatConfig, HeartbeatService},
-    fault_tolerance::{FaultToleranceConfig, FaultToleranceService},
 };
 
 /// Peer configuration mapping machine ID to address
@@ -120,8 +114,6 @@ fn main() -> Result<()> {
         .init();
 
     // Create service handles (each runs in its own thread)
-    let store_handle = StoreService::spawn();
-    
     let snapshot_handle = SnapshotService::spawn(SnapshotConfig {
         snapshots_dir: PathBuf::from(&config.data_dir).join(&config.machine).join("snapshots"),
         max_files: config.snapshot_max_files,
@@ -134,35 +126,14 @@ fn main() -> Result<()> {
         snapshot_wal_interval: config.snapshot_wal_interval,
     });
 
-    let _heartbeat_handle = HeartbeatService::spawn(
-        HeartbeatConfig {
-            machine: config.machine.clone(),
-            interval_secs: 1,
-        },
-        store_handle.clone(),
-    );
-
-    let fault_tolerance_handle = FaultToleranceService::spawn(
-        FaultToleranceConfig {
-            machine: config.machine.clone(),
-            is_leader: true, // Will be updated by CoreService based on peer evaluation
-            interval_millis: 100,
-        },
-        store_handle.clone(),
-    );
-
-    let core_handle = IoService::spawn(IoConfig::from(&config), store_handle.clone());
+    let core_handle = CoreService::spawn(CoreConfig::from(&config));
     
-    // Wire up service handles
-    wal_handle.set_store_handle(store_handle.clone());
-    snapshot_handle.set_store_handle(store_handle.clone());
-    store_handle.set_core_handle(core_handle.clone());
-    
+    wal_handle.set_core_handle(core_handle.clone());
+
     core_handle.set_snapshot_handle(snapshot_handle.clone());
     core_handle.set_wal_handle(wal_handle.clone());
-    core_handle.set_fault_tolerance_handle(fault_tolerance_handle.clone());
 
-    // Load snapshot and replay WAL
+    snapshot_handle.set_core_handle(core_handle.clone());
     snapshot_handle.load_latest();
     wal_handle.replay();
 

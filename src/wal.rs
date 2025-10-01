@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::thread;
 use tracing::{debug, error, info, warn};
 
-use crate::store::StoreHandle;
+use crate::core::CoreHandle;
 use crate::files::{FileConfig, FileInfo, FileManager, FileManagerTrait};
 
 /// Configuration for WAL manager operations
@@ -28,7 +28,7 @@ pub struct WalConfig {
 pub enum WalCommand {
     LogWrite { write_info: WriteInfo },
     Replay,
-    SetStoreHandle { handle: StoreHandle },
+    SetCoreHandle { handle: CoreHandle },
 }
 
 /// Trait for WAL operations
@@ -130,9 +130,9 @@ impl WalHandle {
         self.sender.send(WalCommand::Replay).unwrap();
     }
 
-    pub fn set_store_handle(&self, store: StoreHandle) {
+    pub fn set_core_handle(&self, core: CoreHandle) {
         self.sender
-            .send(WalCommand::SetStoreHandle { handle: store })
+            .send(WalCommand::SetCoreHandle { handle: core })
             .unwrap();
     }
 }
@@ -163,19 +163,19 @@ impl WalService {
                         }
                     }
                     WalCommand::Replay => {
-                        if let Some(store_handle) = &service.store_handle {
+                        if let Some(core_handle) = &service.core_handle {
                             match service.replay() {
-                                Ok(writes) => store_handle.replay(writes),
+                                Ok(writes) => core_handle.replay(writes),
                                 Err(e) => {
                                     error!(error = %e, "Failed to replay WAL files");
                                 }
                             }
                         } else {
-                            warn!("Store handle not set, cannot replay WAL");
+                            warn!("Core handle not set, cannot replay WAL");
                         }
                     }
-                    WalCommand::SetStoreHandle { handle } => {
-                        service.store_handle = Some(handle);
+                    WalCommand::SetCoreHandle { handle } => {
+                        service.core_handle = Some(handle);
                     }
                 }
             }
@@ -198,8 +198,8 @@ pub struct WalManagerTrait<F: FileManagerTrait> {
     current_wal_size: usize,
     /// Number of WAL files created since last snapshot
     wal_files_since_snapshot: u64,
-    /// Handle to communicate with store service
-    store_handle: Option<StoreHandle>,
+    /// Handle to communicate with core service
+    core_handle: Option<CoreHandle>,
 }
 
 impl<F: FileManagerTrait> WalManagerTrait<F> {
@@ -215,7 +215,7 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
             current_wal_file: None,
             current_wal_size: 0,
             wal_files_since_snapshot: 0,
-            store_handle: None,
+            core_handle: None,
         }
     }
 }
@@ -305,8 +305,8 @@ impl<F: FileManagerTrait> WalManagerTrait<F> {
                 "WAL rollover interval reached, triggering snapshot"
             );
 
-            if let Some(store_handle) = &self.store_handle {
-                store_handle.take_snapshot();
+            if let Some(core_handle) = &self.core_handle {
+                core_handle.take_snapshot();
                 self.wal_files_since_snapshot = 0;
             }
         }
