@@ -1,5 +1,7 @@
 use anyhow::Result;
 use crossbeam::channel::Sender;
+use mio::Waker;
+use std::sync::Arc;
 use std::thread;
 use tracing::{error, info};
 
@@ -180,6 +182,9 @@ pub enum StoreRequest {
     },
     SetCoreHandle {
         core_handle: crate::io::IoHandle,
+    },
+    SetWaker {
+        waker: Arc<Waker>,
     },
     
     // Non-blocking operations with callbacks
@@ -676,6 +681,12 @@ impl StoreHandle {
             .unwrap();
     }
     
+    pub fn set_waker(&self, waker: Arc<Waker>) {
+        self.sender
+            .send(StoreRequest::SetWaker { waker })
+            .unwrap();
+    }
+    
     // Non-blocking methods that use callbacks
     pub fn read_async(
         &self,
@@ -1029,6 +1040,7 @@ impl StoreHandle {
 pub struct StoreService {
     store: Store,
     core_handle: Option<crate::io::IoHandle>,
+    waker: Option<Arc<Waker>>,
 }
 
 impl StoreService {
@@ -1036,6 +1048,7 @@ impl StoreService {
         Self {
             store: Store::new(),
             core_handle: None,
+            waker: None,
         }
     }
 
@@ -1399,6 +1412,9 @@ impl StoreService {
             StoreRequest::SetCoreHandle { core_handle } => {
                 self.core_handle = Some(core_handle);
             }
+            StoreRequest::SetWaker { waker } => {
+                self.waker = Some(waker);
+            }
             
             // Async operations
             StoreRequest::ReadAsync {
@@ -1415,6 +1431,9 @@ impl StoreService {
                     },
                 ).map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::Read(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::WriteAsync {
                 request_id,
@@ -1441,6 +1460,9 @@ impl StoreService {
                     )
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::Write(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::CreateEntityAsync {
                 request_id,
@@ -1455,6 +1477,9 @@ impl StoreService {
                     .map(|entity_id| CreateEntityResponse { entity_id })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::CreateEntity(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::DeleteEntityAsync {
                 request_id,
@@ -1466,6 +1491,9 @@ impl StoreService {
                     .delete_entity(entity_id)
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::DeleteEntity(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::FindEntitiesAsync {
                 request_id,
@@ -1479,6 +1507,9 @@ impl StoreService {
                     .map(|entities| EntityListResponse { entities })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::FindEntities(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::FindEntitiesExactAsync {
                 request_id,
@@ -1494,6 +1525,9 @@ impl StoreService {
                     })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::FindEntitiesExact(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::FindEntitiesPaginatedAsync {
                 request_id,
@@ -1512,6 +1546,9 @@ impl StoreService {
                     })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::FindEntitiesPaginated(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::GetEntityTypeAsync {
                 request_id,
@@ -1526,6 +1563,9 @@ impl StoreService {
                     })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::GetEntityType(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::ResolveEntityTypeAsync {
                 request_id,
@@ -1538,6 +1578,9 @@ impl StoreService {
                     .map(|name| StringResponse { value: name })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::ResolveEntityType(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::GetFieldTypeAsync {
                 request_id,
@@ -1552,6 +1595,9 @@ impl StoreService {
                     })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::GetFieldType(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::ResolveFieldTypeAsync {
                 request_id,
@@ -1564,6 +1610,9 @@ impl StoreService {
                     .map(|name| StringResponse { value: name })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::ResolveFieldType(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::GetEntitySchemaAsync {
                 request_id,
@@ -1576,6 +1625,9 @@ impl StoreService {
                     .map(|schema| EntitySchemaResp::from_entity_schema(&schema, &self.store))
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::GetEntitySchema(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::GetFieldSchemaAsync {
                 request_id,
@@ -1594,6 +1646,9 @@ impl StoreService {
                     })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::GetFieldSchema(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::GetEntityTypesAsync {
                 request_id,
@@ -1605,6 +1660,9 @@ impl StoreService {
                     .map(|entity_types| EntityTypeListResponse { entity_types })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::GetEntityTypes(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::GetEntityTypesPaginatedAsync {
                 request_id,
@@ -1621,6 +1679,9 @@ impl StoreService {
                     })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::GetEntityTypesPaginated(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::EntityExistsAsync {
                 request_id,
@@ -1629,6 +1690,9 @@ impl StoreService {
             } => {
                 let exists = self.store.entity_exists(entity_id);
                 let _ = callback.send((request_id, StoreResponse::EntityExists(BooleanResponse { result: exists })));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::FieldExistsAsync {
                 request_id,
@@ -1638,6 +1702,9 @@ impl StoreService {
             } => {
                 let exists = self.store.field_exists(entity_type, field_type);
                 let _ = callback.send((request_id, StoreResponse::FieldExists(BooleanResponse { result: exists })));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::ResolveIndirectionAsync {
                 request_id,
@@ -1654,6 +1721,9 @@ impl StoreService {
                     })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::ResolveIndirection(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::TakeSnapshotAsync {
                 request_id,
@@ -1664,6 +1734,9 @@ impl StoreService {
                     data: serde_json::to_string(&snapshot).unwrap_or_default(),
                 };
                 let _ = callback.send((request_id, StoreResponse::TakeSnapshot(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::UpdateSchemaAsync {
                 request_id,
@@ -1676,6 +1749,9 @@ impl StoreService {
                     })
                     .map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::UpdateSchema(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
             StoreRequest::SetFieldSchemaAsync {
                 request_id,
@@ -1688,6 +1764,9 @@ impl StoreService {
                 let field_schema = qlib_rs::FieldSchema::from_string_schema(field_schema_string, &self.store);
                 let result = self.store.set_field_schema(entity_type, field_type, field_schema).map_err(|e| anyhow::anyhow!("{}", e));
                 let _ = callback.send((request_id, StoreResponse::SetFieldSchema(result)));
+                if let Some(waker) = &self.waker {
+                    let _ = waker.wake();
+                }
             }
         }
     }

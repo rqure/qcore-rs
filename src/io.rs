@@ -3,13 +3,14 @@ use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use crossbeam::channel::Sender;
 use mio::net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream};
-use mio::{Events, Interest, Poll, Token, event::Event};
+use mio::{Events, Interest, Poll, Token, Waker, event::Event};
 use rustc_hash::FxHashMap;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
@@ -199,6 +200,7 @@ pub struct IoService {
 }
 
 const LISTENER_TOKEN: Token = Token(0);
+const WAKER_TOKEN: Token = Token(1);
 
 impl IoService {
     /// Generate next request ID
@@ -362,9 +364,12 @@ impl IoService {
 
     /// Create a new core service with peer configuration
     pub fn new(config: IoConfig, store_handle: StoreHandle) -> Result<Self> {
+        // Create poll and waker for I/O operations
+        let poll = Poll::new().expect("Failed to create poll");
+        let waker = Arc::new(Waker::new(poll.registry(), mio::Token(1)).expect("Failed to create waker"));
+
         let addr = format!("0.0.0.0:{}", config.port).parse()?;
         let mut listener = MioTcpListener::bind(addr)?;
-        let poll = Poll::new()?;
 
         poll.registry()
             .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
@@ -377,8 +382,11 @@ impl IoService {
             .unwrap_or_default()
             .as_secs();
 
-        // Create channel for store responses
+        // Create channel for store responses with waker
         let (store_response_sender, store_response_receiver) = crossbeam::channel::unbounded();
+
+        // Set the waker on the store service
+        store_handle.set_waker(waker);
 
         let mut service = Self {
             config,
@@ -386,9 +394,9 @@ impl IoService {
             poll,
             connections: FxHashMap::default(),
             peers: AHashMap::default(),
-            next_token: 1,
+            next_token: 2, // Start at 2 since 0 and 1 are reserved
             start_time,
-            store_handle,
+            store_handle: store_handle.clone(),
             candidate_entity_id: None,
             next_request_id: 1,
             pending_requests: FxHashMap::default(),
@@ -435,7 +443,7 @@ impl IoService {
                 // Periodic operations are now handled by the self-connecting periodic client
                 service
                     .poll
-                    .poll(&mut events, Some(Duration::from_millis(1)))
+                    .poll(&mut events, Some(Duration::from_millis(5)))
                     .unwrap();
 
                 // Handle all mio events
@@ -445,6 +453,10 @@ impl IoService {
                             if event.is_readable() {
                                 service.accept_new_connections();
                             }
+                        }
+                        WAKER_TOKEN => {
+                            // Waker was triggered, store responses are ready
+                            // They will be processed below
                         }
                         token => {
                             service.handle_connection_event(token, event);
