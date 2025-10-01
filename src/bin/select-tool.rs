@@ -454,10 +454,12 @@ fn fetch_entity_data(
         for (field_name, field_types) in fields {
             match store.read(*entity_id, field_types) {
                 Ok((value, _, _)) => {
+                    debug!("Successfully read field {} for entity {:?}: {:?}", field_name, entity_id, value);
                     entity_fields.insert(field_name.clone(), DisplayValue::from_value(Some(&value)));
                     fields_fetched += 1;
                 }
-                Err(_) => {
+                Err(e) => {
+                    debug!("Failed to read field {} for entity {:?}: {}", field_name, entity_id, e);
                     entity_fields.insert(field_name.clone(), DisplayValue::None);
                 }
             }
