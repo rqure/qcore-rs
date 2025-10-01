@@ -9,6 +9,7 @@ use serde_json;
 use std::collections::{HashMap, HashSet};
 
 use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
@@ -2172,5 +2173,44 @@ impl CoreService {
                 }
             }
         }
+    }
+
+    /// Optimize TCP socket for low latency
+    fn optimize_socket(stream: &mut MioTcpStream) -> Result<()> {
+        // Set TCP_NODELAY to disable Nagle's algorithm for lower latency
+        stream.set_nodelay(true)?;
+        
+        // Set send/receive buffer sizes for better throughput
+        // Using unsafe to call libc functions directly for fine-grained control
+        let socket = stream.as_raw_fd();
+        unsafe {
+            let buf_size: libc::c_int = 65536;
+            
+            // Set receive buffer size
+            let ret = libc::setsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if ret != 0 {
+                return Err(anyhow::anyhow!("Failed to set SO_RCVBUF"));
+            }
+            
+            // Set send buffer size
+            let ret = libc::setsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if ret != 0 {
+                return Err(anyhow::anyhow!("Failed to set SO_SNDBUF"));
+            }
+        }
+        
+        Ok(())
     }
 }
