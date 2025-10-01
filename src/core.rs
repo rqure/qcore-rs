@@ -67,10 +67,6 @@ impl From<&crate::Config> for CoreConfig {
 /// Core service request types
 #[derive(Debug)]
 pub enum CoreCommand {
-    TakeSnapshot,
-    RestoreSnapshot {
-        snapshot: Snapshot,
-    },
     SetSnapshotHandle {
         snapshot_handle: SnapshotHandle,
     },
@@ -87,9 +83,6 @@ pub enum CoreCommand {
     GetPeers {
         respond_to: Sender<AHashMap<String, (Option<Token>, Option<EntityId>)>>,
     },
-    Replay {
-        writes: Vec<WriteInfo>,
-    },
     OnSnapshotRestored,
 }
 
@@ -100,16 +93,6 @@ pub struct CoreHandle {
 }
 
 impl CoreHandle {
-    pub fn take_snapshot(&self) {
-        self.sender.send(CoreCommand::TakeSnapshot).unwrap();
-    }
-
-    pub fn restore_snapshot(&self, snapshot: Snapshot) {
-        self.sender
-            .send(CoreCommand::RestoreSnapshot { snapshot })
-            .unwrap();
-    }
-
     pub fn set_snapshot_handle(&self, snapshot_handle: SnapshotHandle) {
         self.sender
             .send(CoreCommand::SetSnapshotHandle { snapshot_handle })
@@ -142,10 +125,6 @@ impl CoreHandle {
             })
             .unwrap();
         resp_receiver.recv().unwrap_or_default()
-    }
-
-    pub fn replay(&self, writes: Vec<WriteInfo>) {
-        self.sender.send(CoreCommand::Replay { writes }).unwrap();
     }
 
     pub fn on_snapshot_restored(&self) {
@@ -1353,20 +1332,6 @@ impl CoreService {
     /// Handle commands from other actors
     fn handle_command(&mut self, command: CoreCommand) {
         match command {
-            CoreCommand::TakeSnapshot => {
-                debug!("Handling take snapshot command");
-                if let Some(_snapshot_handle) = &self.snapshot_handle {
-                    let _snapshot_response = self.store_handle.take_snapshot();
-                    // TODO: SnapshotResponse contains JSON string, need to deserialize to Snapshot
-                    warn!("Snapshot saving not yet supported via store service - SnapshotResponse type mismatch");
-                }
-            }
-            CoreCommand::RestoreSnapshot { snapshot } => {
-                debug!("Handling restore snapshot command");
-
-                // Restore the snapshot to the store
-                self.store_handle.restore_snapshot(snapshot);
-            }
             CoreCommand::OnSnapshotRestored => {
                 debug!("Handling snapshot restoration notification");
 
@@ -1481,79 +1446,6 @@ impl CoreService {
                 if let Err(e) = respond_to.send(peers_response) {
                     error!("Failed to send peers response: {}", e);
                 }
-            }
-            CoreCommand::Replay { writes } => {
-                debug!("Replaying {} WAL writes", writes.len());
-                for write_info in writes {
-                    match write_info {
-                        WriteInfo::CreateEntity {
-                            entity_type,
-                            parent_id,
-                            name,
-                            created_entity_id: _,
-                            timestamp: _,
-                        } => {
-                            if let Err(e) = self.store_handle.create_entity(entity_type, parent_id, name.clone())
-                            {
-                                warn!("Failed to replay CreateEntity for {}: {}", name, e);
-                            }
-                        }
-                        WriteInfo::DeleteEntity {
-                            entity_id,
-                            timestamp: _,
-                        } => {
-                            if let Err(e) = self.store_handle.delete_entity(entity_id) {
-                                warn!("Failed to replay DeleteEntity for {:?}: {}", entity_id, e);
-                            }
-                        }
-                        WriteInfo::FieldUpdate {
-                            entity_id,
-                            field_type,
-                            value,
-                            push_condition,
-                            adjust_behavior,
-                            write_time,
-                            writer_id,
-                        } => {
-                            if let Some(value) = value {
-                                let write_time_u64 = write_time.map(|t| t.unix_timestamp_nanos() as u64);
-                                if let Err(e) = self.store_handle.write(
-                                    entity_id,
-                                    vec![field_type],
-                                    value,
-                                    writer_id,
-                                    write_time_u64,
-                                    Some(push_condition),
-                                    Some(adjust_behavior),
-                                ) {
-                                    warn!(
-                                        "Failed to replay FieldUpdate for {:?}: {}",
-                                        entity_id, e
-                                    );
-                                }
-                            }
-                        }
-                        WriteInfo::SchemaUpdate {
-                            schema: _,
-                            timestamp: _,
-                        } => {
-                            // TODO: Schema conversion requires StoreTrait - needs refactoring
-                            if let Err(e) = Ok::<(), anyhow::Error>(()) {
-                                warn!("Failed to replay SchemaUpdate: {}", e);
-                            }
-                        }
-                        WriteInfo::Snapshot {
-                            snapshot_counter,
-                            timestamp: _,
-                        } => {
-                            warn!(
-                                "Skipping replay of Snapshot write (counter {})",
-                                snapshot_counter
-                            );
-                        }
-                    }
-                }
-                info!("WAL replay completed");
             }
         }
     }

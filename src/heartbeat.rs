@@ -1,4 +1,4 @@
-use crossbeam::channel::{Sender, Receiver, bounded};
+use crossbeam::channel::{unbounded, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -18,19 +18,15 @@ pub struct HeartbeatConfig {
 /// Heartbeat service commands
 #[derive(Debug)]
 pub enum HeartbeatCommand {
-    Stop,
 }
 
 /// Handle for communicating with heartbeat service
 #[derive(Debug, Clone)]
 pub struct HeartbeatHandle {
-    sender: Sender<HeartbeatCommand>,
+    _sender: Sender<HeartbeatCommand>,
 }
 
 impl HeartbeatHandle {
-    pub fn stop(&self) {
-        let _ = self.sender.send(HeartbeatCommand::Stop);
-    }
 }
 
 /// Service that periodically writes heartbeat information to the store
@@ -49,27 +45,21 @@ impl HeartbeatService {
 
     /// Spawn the heartbeat service in a background thread
     pub fn spawn(config: HeartbeatConfig, store_handle: StoreHandle) -> HeartbeatHandle {
-        let (sender, receiver) = bounded(100);
+        let (sender, receiver) = unbounded();
         let mut service = Self::new(config, store_handle);
 
         thread::spawn(move || {
             service.run(receiver);
         });
 
-        HeartbeatHandle { sender }
+        HeartbeatHandle { _sender: sender }
     }
 
-    fn run(&mut self, receiver: Receiver<HeartbeatCommand>) {
+    fn run(&mut self, _receiver: Receiver<HeartbeatCommand>) {
         let mut last_tick = Instant::now();
         let interval = Duration::from_secs(self.config.interval_secs);
 
         loop {
-            // Check for stop command
-            if let Ok(HeartbeatCommand::Stop) = receiver.try_recv() {
-                debug!("Heartbeat service stopping");
-                break;
-            }
-
             let now = Instant::now();
             if now.duration_since(last_tick) >= interval {
                 last_tick = now;

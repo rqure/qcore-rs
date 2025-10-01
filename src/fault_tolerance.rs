@@ -20,7 +20,6 @@ pub struct FaultToleranceConfig {
 /// Fault tolerance service commands
 #[derive(Debug)]
 pub enum FaultToleranceCommand {
-    Stop,
     SetLeader { is_leader: bool },
 }
 
@@ -31,10 +30,6 @@ pub struct FaultToleranceHandle {
 }
 
 impl FaultToleranceHandle {
-    pub fn stop(&self) {
-        let _ = self.sender.send(FaultToleranceCommand::Stop);
-    }
-
     pub fn set_leader(&self, is_leader: bool) {
         let _ = self.sender.send(FaultToleranceCommand::SetLeader { is_leader });
     }
@@ -76,10 +71,6 @@ impl FaultToleranceService {
         loop {
             // Check for commands
             match receiver.try_recv() {
-                Ok(FaultToleranceCommand::Stop) => {
-                    debug!("Fault tolerance service stopping");
-                    break;
-                }
                 Ok(FaultToleranceCommand::SetLeader { is_leader }) => {
                     debug!("Fault tolerance service leader status changed: {}", is_leader);
                     self.is_leader = is_leader;
