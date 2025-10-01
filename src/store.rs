@@ -17,6 +17,38 @@ use qlib_rs::{
     StoreTrait, Value, WriteInfo,
 };
 
+/// Unique identifier for tracking non-blocking requests
+pub type RequestId = u64;
+
+/// Callback sender for non-blocking store operations
+pub type StoreResponseSender = Sender<(RequestId, StoreResponse)>;
+
+/// Response types for non-blocking store operations
+#[derive(Debug)]
+pub enum StoreResponse {
+    Read(Result<ReadResponse>),
+    Write(Result<()>),
+    CreateEntity(Result<CreateEntityResponse>),
+    DeleteEntity(Result<()>),
+    FindEntities(Result<EntityListResponse>),
+    FindEntitiesExact(Result<EntityListResponse>),
+    FindEntitiesPaginated(Result<PaginatedEntityResponse>),
+    GetEntityType(Result<IntegerResponse>),
+    ResolveEntityType(Result<StringResponse>),
+    GetFieldType(Result<IntegerResponse>),
+    ResolveFieldType(Result<StringResponse>),
+    GetEntitySchema(Result<EntitySchemaResp>),
+    GetFieldSchema(Result<FieldSchemaResponse>),
+    GetEntityTypes(Result<EntityTypeListResponse>),
+    GetEntityTypesPaginated(Result<PaginatedEntityTypeResponse>),
+    EntityExists(BooleanResponse),
+    FieldExists(BooleanResponse),
+    ResolveIndirection(Result<ResolveIndirectionResponse>),
+    TakeSnapshot(SnapshotResponse),
+    UpdateSchema(Result<()>),
+    SetFieldSchema(Result<()>),
+}
+
 /// Store service request that uses OwnedRespValue for flexibility
 #[derive(Debug)]
 pub enum StoreRequest {
@@ -148,6 +180,129 @@ pub enum StoreRequest {
     },
     SetCoreHandle {
         core_handle: crate::io::IoHandle,
+    },
+    
+    // Non-blocking operations with callbacks
+    ReadAsync {
+        request_id: RequestId,
+        entity_id: EntityId,
+        field_path: Vec<FieldType>,
+        callback: StoreResponseSender,
+    },
+    WriteAsync {
+        request_id: RequestId,
+        entity_id: EntityId,
+        field_path: Vec<FieldType>,
+        value: Value,
+        writer_id: Option<EntityId>,
+        write_time: Option<u64>,
+        push_condition: Option<qlib_rs::PushCondition>,
+        adjust_behavior: Option<qlib_rs::AdjustBehavior>,
+        callback: StoreResponseSender,
+    },
+    CreateEntityAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        parent_id: Option<EntityId>,
+        name: String,
+        callback: StoreResponseSender,
+    },
+    DeleteEntityAsync {
+        request_id: RequestId,
+        entity_id: EntityId,
+        callback: StoreResponseSender,
+    },
+    FindEntitiesAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        filter: Option<String>,
+        callback: StoreResponseSender,
+    },
+    FindEntitiesExactAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        filter: Option<String>,
+        callback: StoreResponseSender,
+    },
+    FindEntitiesPaginatedAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        page_opts: Option<PageOpts>,
+        filter: Option<String>,
+        callback: StoreResponseSender,
+    },
+    GetEntityTypeAsync {
+        request_id: RequestId,
+        name: String,
+        callback: StoreResponseSender,
+    },
+    ResolveEntityTypeAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        callback: StoreResponseSender,
+    },
+    GetFieldTypeAsync {
+        request_id: RequestId,
+        name: String,
+        callback: StoreResponseSender,
+    },
+    ResolveFieldTypeAsync {
+        request_id: RequestId,
+        field_type: FieldType,
+        callback: StoreResponseSender,
+    },
+    GetEntitySchemaAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        callback: StoreResponseSender,
+    },
+    GetFieldSchemaAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        field_type: FieldType,
+        callback: StoreResponseSender,
+    },
+    GetEntityTypesAsync {
+        request_id: RequestId,
+        callback: StoreResponseSender,
+    },
+    GetEntityTypesPaginatedAsync {
+        request_id: RequestId,
+        page_opts: Option<PageOpts>,
+        callback: StoreResponseSender,
+    },
+    EntityExistsAsync {
+        request_id: RequestId,
+        entity_id: EntityId,
+        callback: StoreResponseSender,
+    },
+    FieldExistsAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        field_type: FieldType,
+        callback: StoreResponseSender,
+    },
+    ResolveIndirectionAsync {
+        request_id: RequestId,
+        entity_id: EntityId,
+        fields: Vec<FieldType>,
+        callback: StoreResponseSender,
+    },
+    TakeSnapshotAsync {
+        request_id: RequestId,
+        callback: StoreResponseSender,
+    },
+    UpdateSchemaAsync {
+        request_id: RequestId,
+        schema: qlib_rs::data::entity_schema::EntitySchemaResp,
+        callback: StoreResponseSender,
+    },
+    SetFieldSchemaAsync {
+        request_id: RequestId,
+        entity_type: EntityType,
+        field_type: FieldType,
+        schema: qlib_rs::data::entity_schema::FieldSchemaResp,
+        callback: StoreResponseSender,
     },
 }
 
@@ -518,6 +673,354 @@ impl StoreHandle {
     pub fn set_core_handle(&self, core_handle: crate::io::IoHandle) {
         self.sender
             .send(StoreRequest::SetCoreHandle { core_handle })
+            .unwrap();
+    }
+    
+    // Non-blocking methods that use callbacks
+    pub fn read_async(
+        &self,
+        request_id: RequestId,
+        entity_id: EntityId,
+        field_path: Vec<FieldType>,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::ReadAsync {
+                request_id,
+                entity_id,
+                field_path,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn write_async(
+        &self,
+        request_id: RequestId,
+        entity_id: EntityId,
+        field_path: Vec<FieldType>,
+        value: Value,
+        writer_id: Option<EntityId>,
+        write_time: Option<u64>,
+        push_condition: Option<qlib_rs::PushCondition>,
+        adjust_behavior: Option<qlib_rs::AdjustBehavior>,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::WriteAsync {
+                request_id,
+                entity_id,
+                field_path,
+                value,
+                writer_id,
+                write_time,
+                push_condition,
+                adjust_behavior,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn create_entity_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        parent_id: Option<EntityId>,
+        name: String,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::CreateEntityAsync {
+                request_id,
+                entity_type,
+                parent_id,
+                name,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn delete_entity_async(
+        &self,
+        request_id: RequestId,
+        entity_id: EntityId,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::DeleteEntityAsync {
+                request_id,
+                entity_id,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn find_entities_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        filter: Option<String>,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::FindEntitiesAsync {
+                request_id,
+                entity_type,
+                filter,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn find_entities_exact_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        filter: Option<String>,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::FindEntitiesExactAsync {
+                request_id,
+                entity_type,
+                filter,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn find_entities_paginated_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        page_opts: Option<PageOpts>,
+        filter: Option<String>,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::FindEntitiesPaginatedAsync {
+                request_id,
+                entity_type,
+                page_opts,
+                filter,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn get_entity_type_async(
+        &self,
+        request_id: RequestId,
+        name: String,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::GetEntityTypeAsync {
+                request_id,
+                name,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn resolve_entity_type_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::ResolveEntityTypeAsync {
+                request_id,
+                entity_type,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn get_field_type_async(
+        &self,
+        request_id: RequestId,
+        name: String,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::GetFieldTypeAsync {
+                request_id,
+                name,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn resolve_field_type_async(
+        &self,
+        request_id: RequestId,
+        field_type: FieldType,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::ResolveFieldTypeAsync {
+                request_id,
+                field_type,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn get_entity_schema_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::GetEntitySchemaAsync {
+                request_id,
+                entity_type,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn get_field_schema_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        field_type: FieldType,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::GetFieldSchemaAsync {
+                request_id,
+                entity_type,
+                field_type,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn get_entity_types_async(
+        &self,
+        request_id: RequestId,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::GetEntityTypesAsync {
+                request_id,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn get_entity_types_paginated_async(
+        &self,
+        request_id: RequestId,
+        page_opts: Option<PageOpts>,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::GetEntityTypesPaginatedAsync {
+                request_id,
+                page_opts,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn entity_exists_async(
+        &self,
+        request_id: RequestId,
+        entity_id: EntityId,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::EntityExistsAsync {
+                request_id,
+                entity_id,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn field_exists_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        field_type: FieldType,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::FieldExistsAsync {
+                request_id,
+                entity_type,
+                field_type,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn resolve_indirection_async(
+        &self,
+        request_id: RequestId,
+        entity_id: EntityId,
+        fields: Vec<FieldType>,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::ResolveIndirectionAsync {
+                request_id,
+                entity_id,
+                fields,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn take_snapshot_async(
+        &self,
+        request_id: RequestId,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::TakeSnapshotAsync {
+                request_id,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn update_schema_async(
+        &self,
+        request_id: RequestId,
+        schema: qlib_rs::data::entity_schema::EntitySchemaResp,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::UpdateSchemaAsync {
+                request_id,
+                schema,
+                callback,
+            })
+            .unwrap();
+    }
+    
+    pub fn set_field_schema_async(
+        &self,
+        request_id: RequestId,
+        entity_type: EntityType,
+        field_type: FieldType,
+        schema: qlib_rs::data::entity_schema::FieldSchemaResp,
+        callback: StoreResponseSender,
+    ) {
+        self.sender
+            .send(StoreRequest::SetFieldSchemaAsync {
+                request_id,
+                entity_type,
+                field_type,
+                schema,
+                callback,
+            })
             .unwrap();
     }
 }
@@ -895,6 +1398,296 @@ impl StoreService {
             }
             StoreRequest::SetCoreHandle { core_handle } => {
                 self.core_handle = Some(core_handle);
+            }
+            
+            // Async operations
+            StoreRequest::ReadAsync {
+                request_id,
+                entity_id,
+                field_path,
+                callback,
+            } => {
+                let result = self.store.read(entity_id, &field_path).map(
+                    |(value, timestamp, writer_id)| ReadResponse {
+                        value,
+                        timestamp,
+                        writer_id,
+                    },
+                ).map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::Read(result)));
+            }
+            StoreRequest::WriteAsync {
+                request_id,
+                entity_id,
+                field_path,
+                value,
+                writer_id,
+                write_time,
+                push_condition,
+                adjust_behavior,
+                callback,
+            } => {
+                let write_time_converted = write_time.map(|t| time::OffsetDateTime::from_unix_timestamp_nanos(t as i128 * 1_000_000).unwrap_or_else(|_| time::OffsetDateTime::now_utc()));
+                let result = self
+                    .store
+                    .write(
+                        entity_id,
+                        &field_path,
+                        value,
+                        writer_id,
+                        write_time_converted,
+                        push_condition,
+                        adjust_behavior,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::Write(result)));
+            }
+            StoreRequest::CreateEntityAsync {
+                request_id,
+                entity_type,
+                parent_id,
+                name,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .create_entity(entity_type, parent_id, &name)
+                    .map(|entity_id| CreateEntityResponse { entity_id })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::CreateEntity(result)));
+            }
+            StoreRequest::DeleteEntityAsync {
+                request_id,
+                entity_id,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .delete_entity(entity_id)
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::DeleteEntity(result)));
+            }
+            StoreRequest::FindEntitiesAsync {
+                request_id,
+                entity_type,
+                filter,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .find_entities(entity_type, filter.as_deref())
+                    .map(|entities| EntityListResponse { entities })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::FindEntities(result)));
+            }
+            StoreRequest::FindEntitiesExactAsync {
+                request_id,
+                entity_type,
+                filter,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .find_entities_exact(entity_type, None, filter.as_deref())
+                    .map(|result| EntityListResponse {
+                        entities: result.items,
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::FindEntitiesExact(result)));
+            }
+            StoreRequest::FindEntitiesPaginatedAsync {
+                request_id,
+                entity_type,
+                page_opts,
+                filter,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .find_entities_paginated(entity_type, page_opts.as_ref(), filter.as_deref())
+                    .map(|result| PaginatedEntityResponse {
+                        items: result.items,
+                        total: result.total,
+                        next_cursor: result.next_cursor,
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::FindEntitiesPaginated(result)));
+            }
+            StoreRequest::GetEntityTypeAsync {
+                request_id,
+                name,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .get_entity_type(&name)
+                    .map(|entity_type| IntegerResponse {
+                        value: entity_type.0 as i64,
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::GetEntityType(result)));
+            }
+            StoreRequest::ResolveEntityTypeAsync {
+                request_id,
+                entity_type,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .resolve_entity_type(entity_type)
+                    .map(|name| StringResponse { value: name })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::ResolveEntityType(result)));
+            }
+            StoreRequest::GetFieldTypeAsync {
+                request_id,
+                name,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .get_field_type(&name)
+                    .map(|field_type| IntegerResponse {
+                        value: field_type.0 as i64,
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::GetFieldType(result)));
+            }
+            StoreRequest::ResolveFieldTypeAsync {
+                request_id,
+                field_type,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .resolve_field_type(field_type)
+                    .map(|name| StringResponse { value: name })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::ResolveFieldType(result)));
+            }
+            StoreRequest::GetEntitySchemaAsync {
+                request_id,
+                entity_type,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .get_entity_schema(entity_type)
+                    .map(|schema| EntitySchemaResp::from_entity_schema(&schema, &self.store))
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::GetEntitySchema(result)));
+            }
+            StoreRequest::GetFieldSchemaAsync {
+                request_id,
+                entity_type,
+                field_type,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .get_field_schema(entity_type, field_type)
+                    .map(|schema| FieldSchemaResponse {
+                        schema: qlib_rs::data::entity_schema::FieldSchemaResp::from_field_schema(
+                            &schema,
+                            &self.store,
+                        ),
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::GetFieldSchema(result)));
+            }
+            StoreRequest::GetEntityTypesAsync {
+                request_id,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .get_entity_types()
+                    .map(|entity_types| EntityTypeListResponse { entity_types })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::GetEntityTypes(result)));
+            }
+            StoreRequest::GetEntityTypesPaginatedAsync {
+                request_id,
+                page_opts,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .get_entity_types_paginated(page_opts.as_ref())
+                    .map(|result| PaginatedEntityTypeResponse {
+                        items: result.items,
+                        total: result.total,
+                        next_cursor: result.next_cursor,
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::GetEntityTypesPaginated(result)));
+            }
+            StoreRequest::EntityExistsAsync {
+                request_id,
+                entity_id,
+                callback,
+            } => {
+                let exists = self.store.entity_exists(entity_id);
+                let _ = callback.send((request_id, StoreResponse::EntityExists(BooleanResponse { result: exists })));
+            }
+            StoreRequest::FieldExistsAsync {
+                request_id,
+                entity_type,
+                field_type,
+                callback,
+            } => {
+                let exists = self.store.field_exists(entity_type, field_type);
+                let _ = callback.send((request_id, StoreResponse::FieldExists(BooleanResponse { result: exists })));
+            }
+            StoreRequest::ResolveIndirectionAsync {
+                request_id,
+                entity_id,
+                fields,
+                callback,
+            } => {
+                let result = self
+                    .store
+                    .resolve_indirection(entity_id, &fields)
+                    .map(|(entity_id, field_type)| ResolveIndirectionResponse {
+                        entity_id,
+                        field_type,
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::ResolveIndirection(result)));
+            }
+            StoreRequest::TakeSnapshotAsync {
+                request_id,
+                callback,
+            } => {
+                let snapshot = self.store.take_snapshot();
+                let result = SnapshotResponse {
+                    data: serde_json::to_string(&snapshot).unwrap_or_default(),
+                };
+                let _ = callback.send((request_id, StoreResponse::TakeSnapshot(result)));
+            }
+            StoreRequest::UpdateSchemaAsync {
+                request_id,
+                schema,
+                callback,
+            } => {
+                let result = schema.to_entity_schema(&self.store)
+                    .and_then(|converted_schema| {
+                        self.store.update_schema(converted_schema).map_err(|e| e.into())
+                    })
+                    .map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::UpdateSchema(result)));
+            }
+            StoreRequest::SetFieldSchemaAsync {
+                request_id,
+                entity_type,
+                field_type,
+                schema,
+                callback,
+            } => {
+                let field_schema_string = schema.to_field_schema();
+                let field_schema = qlib_rs::FieldSchema::from_string_schema(field_schema_string, &self.store);
+                let result = self.store.set_field_schema(entity_type, field_type, field_schema).map_err(|e| anyhow::anyhow!("{}", e));
+                let _ = callback.send((request_id, StoreResponse::SetFieldSchema(result)));
             }
         }
     }
