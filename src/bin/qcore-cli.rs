@@ -336,7 +336,7 @@ fn cmd_get(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
 
     let (value, timestamp, writer_id) = store.read(entity_id, &field_path)?;
 
-    println!("{}", format_value(&value, colors));
+    println!("{}", format_value_with_store(&value, colors, Some(store)));
     
     if writer_id.is_some() || timestamp.unix_timestamp() > 0 {
         println!("{}  Timestamp:{} {}", colors.dim, colors.reset, format_timestamp(&timestamp));
@@ -378,7 +378,12 @@ fn cmd_create(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> 
 
     let entity_id = store.create_entity(entity_type, parent_id, name)?;
 
-    println!("{}{}{}", colors.cyan, entity_id.0, colors.reset);
+    let name_display = get_entity_name(store, entity_id).unwrap_or_default();
+    if !name_display.is_empty() {
+        println!("{}{}{} ({})", colors.cyan, entity_id.0, colors.reset, name_display);
+    } else {
+        println!("{}{}{}", colors.cyan, entity_id.0, colors.reset);
+    }
     Ok(())
 }
 
@@ -467,7 +472,12 @@ fn cmd_find(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
     let entities = store.find_entities(entity_type, filter.as_deref())?;
 
     for (i, entity_id) in entities.iter().enumerate() {
-        println!("{}{}{} {}", colors.dim, i + 1, colors.reset, entity_id.0);
+        let name_display = get_entity_name(store, *entity_id).unwrap_or_default();
+        if !name_display.is_empty() {
+            println!("{}{}{} {} ({})", colors.dim, i + 1, colors.reset, entity_id.0, name_display);
+        } else {
+            println!("{}{}{} {}", colors.dim, i + 1, colors.reset, entity_id.0);
+        }
     }
     
     println!();
@@ -604,6 +614,18 @@ fn print_help(colors: &Colors) {
 
 // Helper functions
 
+fn get_entity_name(store: &StoreProxy, entity_id: EntityId) -> Result<String> {
+    // Try to read the Name field
+    if let Ok(name_field) = store.get_field_type("Name") {
+        if let Ok((value, _, _)) = store.read(entity_id, &[name_field]) {
+            if let Value::String(s) = value {
+                return Ok(s.as_str().to_string());
+            }
+        }
+    }
+    Ok(String::new())
+}
+
 fn parse_entity_id(s: &str) -> Result<EntityId> {
     let id: u64 = s.parse()
         .context("Invalid entity ID")?;
@@ -666,16 +688,38 @@ fn parse_value(s: &str) -> Result<Value> {
 }
 
 fn format_value(value: &Value, colors: &Colors) -> String {
+    format_value_with_store(value, colors, None)
+}
+
+fn format_value_with_store(value: &Value, colors: &Colors, store: Option<&StoreProxy>) -> String {
     match value {
         Value::String(s) => format!("{}\"{}\"{}", colors.yellow, s.as_str(), colors.reset),
         Value::Int(i) => format!("{}{}{}", colors.cyan, i, colors.reset),
         Value::Float(f) => format!("{}{}{}", colors.cyan, f, colors.reset),
         Value::Bool(b) => format!("{}{}{}", colors.cyan, b, colors.reset),
-        Value::EntityReference(Some(e)) => format!("{}@{}{}", colors.magenta, e.0, colors.reset),
+        Value::EntityReference(Some(e)) => {
+            if let Some(store) = store {
+                if let Ok(name) = get_entity_name(store, *e) {
+                    if !name.is_empty() {
+                        return format!("{}@{}{} ({})", colors.magenta, e.0, colors.reset, name);
+                    }
+                }
+            }
+            format!("{}@{}{}", colors.magenta, e.0, colors.reset)
+        }
         Value::EntityReference(None) => format!("{}null{}", colors.dim, colors.reset),
         Value::EntityList(list) => {
             let items: Vec<String> = list.iter()
-                .map(|e| format!("@{}", e.0))
+                .map(|e| {
+                    if let Some(store) = store {
+                        if let Ok(name) = get_entity_name(store, *e) {
+                            if !name.is_empty() {
+                                return format!("@{} ({})", e.0, name);
+                            }
+                        }
+                    }
+                    format!("@{}", e.0)
+                })
                 .collect();
             format!("{}[{}]{}", colors.magenta, items.join(", "), colors.reset)
         }
