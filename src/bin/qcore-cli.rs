@@ -1,9 +1,18 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use qlib_rs::{EntityId, EntityType, FieldType, StoreProxy, Value, Timestamp};
-use std::io::{self, Write};
 use tracing::{info, debug};
 use base64::{Engine as _, engine::general_purpose};
+use rustyline::{
+    completion::{Completer, Pair},
+    error::ReadlineError,
+    highlight::{Highlighter, MatchingBracketHighlighter},
+    hint::{Hinter, HistoryHinter},
+    history::FileHistory,
+    validate::{Validator, ValidationContext, ValidationResult},
+    Context as RustyContext, Editor, Helper, Result as RustyResult,
+};
+use std::borrow::Cow;
 
 /// QCore CLI - Interactive command-line interface for QCore data store
 /// Similar to redis-cli, supports both interactive and command execution modes
@@ -159,55 +168,83 @@ fn run_interactive(store: &StoreProxy, config: &Config, colors: &Colors) -> Resu
         colors.cyan, colors.reset, colors.cyan, colors.reset, colors.cyan, colors.reset);
     println!();
 
-    let mut command_history = Vec::new();
+    // Setup rustyline editor
+    let mut rl = Editor::<QCoreHelper, FileHistory>::new()
+        .context("Failed to create readline editor")?;
+    rl.set_helper(Some(QCoreHelper::new()));
+    
+    // Load history from file
+    let history_file = std::env::var("HOME")
+        .ok()
+        .map(|home| std::path::PathBuf::from(home).join(".qcore_history"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".qcore_history"));
+    
+    if rl.load_history(&history_file).is_err() {
+        debug!("No previous history found");
+    }
 
     loop {
-        print!("{}qcore>{} ", colors.green, colors.reset);
-        io::stdout().flush()?;
+        let prompt = format!("{}qcore>{} ", colors.green, colors.reset);
+        let readline = rl.readline(&prompt);
 
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            break;
-        }
+        match readline {
+            Ok(line) => {
+                let input = line.trim();
+                if input.is_empty() {
+                    continue;
+                }
 
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
+                // Add to history
+                let _ = rl.add_history_entry(input);
 
-        // Handle special commands
-        match input.to_uppercase().as_str() {
-            "EXIT" | "QUIT" => {
-                println!("Goodbye!");
+                // Handle special commands
+                match input.to_uppercase().as_str() {
+                    "EXIT" | "QUIT" => {
+                        println!("Goodbye!");
+                        break;
+                    }
+                    "HELP" => {
+                        print_help(colors);
+                        continue;
+                    }
+                    "CLEAR" | "CLS" => {
+                        print!("\x1b[2J\x1b[1;1H");
+                        continue;
+                    }
+                    "HISTORY" => {
+                        for (i, entry) in rl.history().iter().enumerate() {
+                            println!("{}{:4}{} {}", colors.dim, i + 1, colors.reset, entry);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // Execute command
+                match execute_command(store, input, config, colors) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("{}Error:{} {}", colors.red, colors.reset, e);
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("^D");
                 break;
             }
-            "HELP" => {
-                print_help(colors);
-                continue;
-            }
-            "CLEAR" | "CLS" => {
-                print!("\x1b[2J\x1b[1;1H");
-                continue;
-            }
-            "HISTORY" => {
-                for (i, cmd) in command_history.iter().enumerate() {
-                    println!("{}{:4}{} {}", colors.dim, i + 1, colors.reset, cmd);
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        // Execute command
-        command_history.push(input.to_string());
-
-        match execute_command(store, input, config, colors) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("{}Error:{} {}", colors.red, colors.reset, e);
+            Err(err) => {
+                eprintln!("{}Error:{} {}", colors.red, colors.reset, err);
+                break;
             }
         }
     }
+
+    // Save history
+    let _ = rl.save_history(&history_file);
 
     Ok(())
 }
@@ -678,3 +715,86 @@ fn format_duration(d: &std::time::Duration) -> String {
         format!("{:.2}s", d.as_secs_f64())
     }
 }
+
+// Rustyline helper for tab completion, hints, and history
+struct QCoreHelper {
+    commands: Vec<String>,
+    hinter: HistoryHinter,
+    highlighter: MatchingBracketHighlighter,
+}
+
+impl QCoreHelper {
+    fn new() -> Self {
+        let commands = vec![
+            "PING", "GET", "SET", "CREATE", "DELETE", "DEL", "EXISTS",
+            "GETTYPE", "RESTYPE", "GETFLD", "RESFLD", "FIND", "TYPES",
+            "GETSCH", "SNAP", "INFO", "HELP", "CLEAR", "CLS", "HISTORY",
+            "EXIT", "QUIT"
+        ].into_iter().map(String::from).collect();
+
+        QCoreHelper {
+            commands,
+            hinter: HistoryHinter::new(),
+            highlighter: MatchingBracketHighlighter::new(),
+        }
+    }
+}
+
+impl Completer for QCoreHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &RustyContext<'_>,
+    ) -> RustyResult<(usize, Vec<Pair>)> {
+        let line_up_to_pos = &line[..pos];
+        
+        // Find the start of the current word
+        let start = line_up_to_pos.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let word = &line_up_to_pos[start..];
+        
+        // If we're completing the first word (command)
+        if !line_up_to_pos[..start].trim().is_empty() {
+            return Ok((start, vec![]));
+        }
+        
+        let word_upper = word.to_uppercase();
+        let matches: Vec<Pair> = self.commands.iter()
+            .filter(|cmd| cmd.starts_with(&word_upper))
+            .map(|cmd| Pair {
+                display: cmd.clone(),
+                replacement: cmd.clone(),
+            })
+            .collect();
+
+        Ok((start, matches))
+    }
+}
+
+impl Hinter for QCoreHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &RustyContext<'_>) -> Option<String> {
+        self.hinter.hint(line, pos, ctx)
+    }
+}
+
+impl Highlighter for QCoreHelper {
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
+        self.highlighter.highlight(line, pos)
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
+        self.highlighter.highlight_char(line, pos, forced)
+    }
+}
+
+impl Validator for QCoreHelper {
+    fn validate(&self, _ctx: &mut ValidationContext) -> RustyResult<ValidationResult> {
+        Ok(ValidationResult::Valid(None))
+    }
+}
+
+impl Helper for QCoreHelper {}
