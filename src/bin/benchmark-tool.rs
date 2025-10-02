@@ -88,11 +88,11 @@ impl BenchmarkTest {
 
     fn name(&self) -> &'static str {
         match self {
-            Self::EntityExists => "ENTITYEXISTS",
-            Self::FindEntities => "FINDENTITIES",
-            Self::WriteEntity => "WRITEENTITY",
-            Self::SearchEntities => "SEARCHENTITIES",
-            Self::ReadField => "READFIELD",
+            Self::EntityExists => "EXISTS",
+            Self::FindEntities => "FIND",
+            Self::WriteEntity => "SET",
+            Self::SearchEntities => "FINDPAG",
+            Self::ReadField => "GET",
         }
     }
 
