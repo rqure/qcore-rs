@@ -7,14 +7,29 @@ set -euo pipefail
 NUM_NODES=${1:-3}
 BASE_PORT=9100
 
+# Enable debug logs if --debug flag is present
+DEBUG_MODE=0
+if [[ "${1:-}" == "--debug" ]]; then
+    DEBUG_MODE=1
+    NUM_NODES=${2:-3}
+    shift
+elif [[ "${2:-}" == "--debug" ]]; then
+    DEBUG_MODE=1
+fi
+
 # Validate input
 if ! [[ "$NUM_NODES" =~ ^[0-9]+$ ]] || [ "$NUM_NODES" -lt 1 ]; then
-    echo "Usage: $0 [number_of_nodes]"
+    echo "Usage: $0 [--debug] [number_of_nodes]"
+    echo "  --debug: enable debug logging"
     echo "  number_of_nodes: positive integer (default: 3)"
     exit 1
 fi
 
 echo "Starting cluster with $NUM_NODES nodes..."
+if [ $DEBUG_MODE -eq 1 ]; then
+    echo "Debug logging enabled (RUST_LOG=debug)"
+    export RUST_LOG=debug
+fi
 
 # Prefer release binaries, fall back to debug if not found
 BIN_DIR=${BIN_DIR:-./target/release}

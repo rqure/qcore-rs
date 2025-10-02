@@ -105,12 +105,17 @@ fn main() -> Result<()> {
     let config = Config::parse();
 
     // Initialize tracing with better structured logging
+    // If RUST_LOG is set, use it; otherwise default to info level
+    let env_filter = if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::EnvFilter::from_default_env()
+    } else {
+        tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("qcore_rs=info".parse().unwrap())
+            .add_directive("info".parse().unwrap())
+    };
+    
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("qcore_rs=info".parse().unwrap())
-                .add_directive("info".parse().unwrap())
-        )
+        .with_env_filter(env_filter)
         .init();
 
     // Create service handles (each runs in its own thread)
