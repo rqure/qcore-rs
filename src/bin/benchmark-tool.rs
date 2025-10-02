@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{EntityId, PageOpts, Value};
+use qlib_rs::{EntityId, EntityType, FieldType, PageOpts, Value};
 use qlib_rs::data::AsyncStoreProxy;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,6 +59,10 @@ struct Config {
     /// Enable verbose logging
     #[arg(long)]
     verbose: bool,
+
+    /// Pipeline <numreq> requests. Default 1 (no pipeline).
+    #[arg(short = 'P', long, default_value_t = 1)]
+    pipeline: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +150,10 @@ struct BenchmarkContext {
     config: Arc<Config>,
     test_entities: Vec<EntityId>,
     test_entity_id: Option<EntityId>,
+    // Cached field types for performance
+    entity_type_cache: Option<EntityType>,
+    test_string_ft: Option<FieldType>,
+    name_ft: Option<FieldType>,
 }
 
 impl BenchmarkContext {
@@ -154,6 +162,9 @@ impl BenchmarkContext {
             config,
             test_entities: Vec::new(),
             test_entity_id: None,
+            entity_type_cache: None,
+            test_string_ft: None,
+            name_ft: None,
         }
     }
 
@@ -165,6 +176,7 @@ impl BenchmarkContext {
 
         // Load existing entities for read operations
         if let Ok(entity_type) = store.get_entity_type(&self.config.entity_type).await {
+            self.entity_type_cache = Some(entity_type);
             if let Ok(entities) = store.find_entities(entity_type, None).await {
                 self.test_entities = entities;
                 info!("Found {} existing {} entities", self.test_entities.len(), self.config.entity_type);
@@ -182,6 +194,14 @@ impl BenchmarkContext {
             } else {
                 warn!("TestEntity not found. Write operations will be limited.");
             }
+        }
+
+        // Cache commonly used field types
+        if let Ok(test_string_ft) = store.get_field_type("TestString").await {
+            self.test_string_ft = Some(test_string_ft);
+        }
+        if let Ok(name_ft) = store.get_field_type("Name").await {
+            self.name_ft = Some(name_ft);
         }
 
         Ok(())
@@ -238,33 +258,155 @@ async fn run_client_benchmark(
     let store = AsyncStoreProxy::connect(&url).await
         .with_context(|| format!("Client {} failed to connect", client_id))?;
 
-    // Execute requests
-    for request_num in 0..requests_count {
-        let start_time = Instant::now();
-        let success = match execute_single_request(&store, &context, &test, client_id, request_num).await {
-            Ok(_) => true,
-            Err(e) => {
-                if config.verbose {
-                    error!("Request failed: {}", e);
+    if config.pipeline <= 1 {
+        // Execute requests without pipelining
+        for request_num in 0..requests_count {
+            let start_time = Instant::now();
+            let success = match execute_single_request(&store, &context, &test, client_id, request_num).await {
+                Ok(_) => true,
+                Err(e) => {
+                    if config.verbose {
+                        error!("Request failed: {}", e);
+                    }
+                    false
                 }
-                false
-            }
-        };
-        let latency = start_time.elapsed();
+            };
+            let latency = start_time.elapsed();
 
-        // Update results
-        {
-            let mut result_guard = result.lock().await;
-            result_guard.total_requests += 1;
-            if success {
-                result_guard.successful_requests += 1;
-            } else {
-                result_guard.failed_requests += 1;
+            // Update results
+            {
+                let mut result_guard = result.lock().await;
+                result_guard.total_requests += 1;
+                if success {
+                    result_guard.successful_requests += 1;
+                } else {
+                    result_guard.failed_requests += 1;
+                }
+                result_guard.latencies.push(latency);
             }
-            result_guard.latencies.push(latency);
+        }
+    } else {
+        // Execute requests with pipelining
+        let mut request_num = 0u64;
+        while request_num < requests_count {
+            let pipeline_size = config.pipeline.min((requests_count - request_num) as usize);
+            let start_time = Instant::now();
+            
+            let (successes, failures) = match execute_pipeline_requests(&store, &context, &test, client_id, request_num, pipeline_size).await {
+                Ok(count) => (count, pipeline_size - count),
+                Err(e) => {
+                    if config.verbose {
+                        error!("Pipeline failed: {}", e);
+                    }
+                    (0, pipeline_size)
+                }
+            };
+            
+            let latency = start_time.elapsed();
+            let per_request_latency = latency / pipeline_size as u32;
+
+            // Update results
+            {
+                let mut result_guard = result.lock().await;
+                result_guard.total_requests += pipeline_size as u64;
+                result_guard.successful_requests += successes as u64;
+                result_guard.failed_requests += failures as u64;
+                // Record latency for each request in the pipeline
+                for _ in 0..pipeline_size {
+                    result_guard.latencies.push(per_request_latency);
+                }
+            }
+            
+            request_num += pipeline_size as u64;
         }
     }
 
+    Ok(())
+}
+
+async fn execute_pipeline_requests(
+    store: &AsyncStoreProxy,
+    context: &BenchmarkContext,
+    test: &BenchmarkTest,
+    client_id: usize,
+    start_request_num: u64,
+    pipeline_size: usize,
+) -> Result<usize> {
+    let mut pipeline = store.pipeline();
+    
+    // Queue all requests in the pipeline
+    for i in 0..pipeline_size {
+        let request_num = start_request_num + i as u64;
+        if let Err(e) = queue_pipeline_request(&mut pipeline, store, context, test, client_id, request_num).await {
+            if context.config.verbose {
+                error!("Failed to queue request: {}", e);
+            }
+            // If we can't queue, execute what we have so far
+            break;
+        }
+    }
+    
+    // Execute the pipeline
+    let results = pipeline.execute().await?;
+    
+    // Count successes (all results are considered successful if execute didn't fail)
+    Ok(results.len())
+}
+
+async fn queue_pipeline_request(
+    pipeline: &mut qlib_rs::data::pipeline::AsyncPipeline<'_>,
+    store: &AsyncStoreProxy,
+    context: &BenchmarkContext,
+    test: &BenchmarkTest,
+    client_id: usize,
+    request_num: u64,
+) -> Result<()> {
+    match test {
+        BenchmarkTest::EntityExists => {
+            if !context.test_entities.is_empty() {
+                let entity_id = context.test_entities[(client_id + request_num as usize) % context.test_entities.len()];
+                pipeline.entity_exists(entity_id)?;
+            }
+        }
+        BenchmarkTest::FindEntities => {
+            // Use cached entity type if available, otherwise look it up
+            let entity_type = if let Some(et) = context.entity_type_cache {
+                et
+            } else {
+                store.get_entity_type(&context.config.entity_type).await?
+            };
+            pipeline.find_entities(entity_type, None)?;
+        }
+        BenchmarkTest::WriteEntity => {
+            if let Some(test_entity_id) = context.test_entity_id {
+                // Use cached field type if available, otherwise look it up
+                let test_string_ft = if let Some(ft) = context.test_string_ft {
+                    ft
+                } else {
+                    store.get_field_type("TestString").await?
+                };
+                let data = generate_test_data(context.config.data_size, client_id, request_num);
+                pipeline.write(test_entity_id, &[test_string_ft], Value::String(data), None, None, None, None)?;
+            }
+        }
+        BenchmarkTest::SearchEntities => {
+            // SearchEntities uses find_entities_paginated which is not yet supported in pipeline
+            // Fall back to individual request
+            return Err(anyhow::anyhow!("SearchEntities not supported in pipeline mode"));
+        }
+        BenchmarkTest::ReadField => {
+            if !context.test_entities.is_empty() {
+                let entity_id = context.test_entities[client_id % context.test_entities.len()];
+                // Use cached field type if available, otherwise look it up
+                let name_ft = if let Some(ft) = context.name_ft {
+                    ft
+                } else {
+                    store.get_field_type("Name").await?
+                };
+                pipeline.read(entity_id, &[name_ft])?;
+            }
+        }
+    }
     Ok(())
 }
 
