@@ -162,6 +162,7 @@ struct Connection {
     stream: MioTcpStream,
     addr_string: String,
     client_id: Option<EntityId>,
+    is_peer_connection: bool, // Track if this is a peer vs client connection
     notification_queue: NotificationQueue,
     notification_configs: HashSet<NotifyConfig>,
     outbound_buffer: BytesMut,
@@ -312,6 +313,7 @@ impl CoreService {
 
                 // Drain the write queue from the store (WriteInfo items for internal tracking)
                 while let Some(write_info) = service.store.write_queue.pop_front() {
+                    // Send to WAL
                     if let Some(wal_handle) = &service.wal_handle {
                         wal_handle.log_write(write_info);
                     }
@@ -425,6 +427,7 @@ impl CoreService {
                         stream,
                         addr_string: addr.to_string(),
                         client_id: None,
+                        is_peer_connection: false, // New connections start as client connections
                         notification_queue: NotificationQueue::new(),
                         notification_configs: HashSet::new(),
                         outbound_buffer: BytesMut::with_capacity(65536),
@@ -570,16 +573,42 @@ impl CoreService {
                         }
                     }
                 } else if let Ok(command) = WriteCommand::decode(resp_value.clone()) {
+                    // Check if this is from a client (non-peer) connection
+                    let is_client_write = self
+                        .connections
+                        .get(&token)
+                        .map(|conn| !conn.is_peer_connection)
+                        .unwrap_or(false);
+
+                    // Save values needed for broadcasting before they're moved
+                    let push_cond = command.push_condition.clone().unwrap_or(qlib_rs::PushCondition::Always);
+                    let adjust_behav = command.adjust_behavior.clone().unwrap_or(qlib_rs::AdjustBehavior::Set);
+                    let field_type = command.field_path[0]; // Assuming single field path for now
+                    let value_clone = command.value.clone();
+
                     match self.store.write(
                         command.entity_id,
                         &command.field_path,
-                        command.value,
+                        command.value.clone(),
                         command.writer_id,
                         command.write_time,
-                        command.push_condition,
-                        command.adjust_behavior,
+                        Some(push_cond.clone()),
+                        Some(adjust_behav.clone()),
                     ) {
                         Ok(_) => {
+                            // Broadcast to peers if this was a client write
+                            if is_client_write {
+                                let write_info = WriteInfo::FieldUpdate {
+                                    entity_id: command.entity_id,
+                                    field_type,
+                                    value: Some(value_clone),
+                                    push_condition: push_cond,
+                                    adjust_behavior: adjust_behav,
+                                    write_time: command.write_time,
+                                    writer_id: command.writer_id,
+                                };
+                                self.broadcast_write_to_peers(write_info);
+                            }
                             self.send_ok(token)?;
                         }
                         Err(e) => {
@@ -587,12 +616,30 @@ impl CoreService {
                         }
                     }
                 } else if let Ok(command) = CreateEntityCommand::decode(resp_value.clone()) {
+                    // Check if this is from a client (non-peer) connection
+                    let is_client_write = self
+                        .connections
+                        .get(&token)
+                        .map(|conn| !conn.is_peer_connection)
+                        .unwrap_or(false);
+
                     match self.store.create_entity(
                         command.entity_type,
                         command.parent_id,
                         &command.name,
                     ) {
                         Ok(entity_id) => {
+                            // Broadcast to peers if this was a client write
+                            if is_client_write {
+                                let write_info = WriteInfo::CreateEntity {
+                                    entity_type: command.entity_type,
+                                    parent_id: command.parent_id,
+                                    name: command.name.clone(),
+                                    created_entity_id: entity_id,
+                                    timestamp: qlib_rs::data::now(),
+                                };
+                                self.broadcast_write_to_peers(write_info);
+                            }
                             let response = CreateEntityResponse { entity_id };
                             self.send_response(token, &response)?;
                         }
@@ -601,8 +648,23 @@ impl CoreService {
                         }
                     }
                 } else if let Ok(command) = DeleteEntityCommand::decode(resp_value.clone()) {
+                    // Check if this is from a client (non-peer) connection
+                    let is_client_write = self
+                        .connections
+                        .get(&token)
+                        .map(|conn| !conn.is_peer_connection)
+                        .unwrap_or(false);
+
                     match self.store.delete_entity(command.entity_id) {
                         Ok(_) => {
+                            // Broadcast to peers if this was a client write
+                            if is_client_write {
+                                let write_info = WriteInfo::DeleteEntity {
+                                    entity_id: command.entity_id,
+                                    timestamp: qlib_rs::data::now(),
+                                };
+                                self.broadcast_write_to_peers(write_info);
+                            }
                             self.send_ok(token)?;
                         }
                         Err(e) => {
@@ -665,13 +727,33 @@ impl CoreService {
                         }
                     }
                 } else if let Ok(command) = UpdateSchemaCommand::decode(resp_value.clone()) {
+                    // Check if this is from a client (non-peer) connection
+                    let is_client_write = self
+                        .connections
+                        .get(&token)
+                        .map(|conn| !conn.is_peer_connection)
+                        .unwrap_or(false);
+
                     match command.schema.to_entity_schema(&self.store) {
-                        Ok(schema_string) => match self.store.update_schema(schema_string) {
-                            Ok(_) => {
-                                self.send_ok(token)?;
-                            }
-                            Err(e) => {
-                                self.send_error(token, format!("Update schema error: {}", e))?;
+                        Ok(schema_string) => {
+                            // Convert to FieldType-based schema for WriteInfo
+                            let schema_for_sync = qlib_rs::EntitySchema::from_string_schema(schema_string.clone(), &self.store);
+                            
+                            match self.store.update_schema(schema_string) {
+                                Ok(_) => {
+                                    // Broadcast to peers if this was a client write
+                                    if is_client_write {
+                                        let write_info = WriteInfo::SchemaUpdate {
+                                            schema: schema_for_sync,
+                                            timestamp: qlib_rs::data::now(),
+                                        };
+                                        self.broadcast_write_to_peers(write_info);
+                                    }
+                                    self.send_ok(token)?;
+                                }
+                                Err(e) => {
+                                    self.send_error(token, format!("Update schema error: {}", e))?;
+                                }
                             }
                         },
                         Err(e) => {
@@ -899,6 +981,43 @@ impl CoreService {
         }
 
         Ok(())
+    }
+
+    /// Broadcast a write to all peer connections (called after processing client writes)
+    fn broadcast_write_to_peers(&mut self, write_info: WriteInfo) {
+        // Serialize the write_info to JSON
+        let write_json = match serde_json::to_string(&write_info) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("Failed to serialize write_info for peer sync: {}", e);
+                return;
+            }
+        };
+
+        let sync_write_cmd = SyncWriteCommand {
+            requests_data: write_json,
+            _marker: std::marker::PhantomData,
+        };
+
+        // Send to all peer connections
+        let peer_tokens: Vec<_> = self
+            .peers
+            .values()
+            .filter_map(|peer_info| peer_info.token)
+            .collect();
+
+        let mut tokens_to_remove = Vec::new();
+        for token in peer_tokens {
+            if let Err(e) = self.send_peer_command(token, &sync_write_cmd) {
+                warn!("Failed to send SyncWrite to peer: {}", e);
+                tokens_to_remove.push(token);
+            }
+        }
+
+        // Remove failed peer connections
+        for token in tokens_to_remove {
+            self.remove_connection(token);
+        }
     }
 
     /// Send a RESP command to a peer connection
@@ -1385,12 +1504,22 @@ impl CoreService {
     }
 
     /// Handle peer sync write message
-    fn handle_peer_sync_write(&mut self, _token: Token, requests_json: String) -> Result<()> {
-        debug!("Received sync write from peer");
+    fn handle_peer_sync_write(&mut self, token: Token, requests_json: String) -> Result<()> {
+        // Find the machine ID for this peer connection
+        let peer_machine_id = self
+            .peers
+            .iter()
+            .find(|(_, peer_info)| peer_info.token.map_or(false, |t| t == token))
+            .map(|(machine_id, _)| machine_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        debug!("Received sync write from peer {}", peer_machine_id);
 
         // Deserialize requests from JSON
         let write_info: WriteInfo = serde_json::from_str(&requests_json)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize requests: {}", e))?;
+
+        debug!("Applying sync write from peer {}", peer_machine_id);
 
         // Apply the write to our store
         match write_info {
@@ -1569,6 +1698,7 @@ impl CoreService {
                     stream,
                     addr_string: addr,
                     client_id,
+                    is_peer_connection: true, // Mark as peer connection
                     notification_queue: NotificationQueue::new(),
                     notification_configs: HashSet::new(),
                     outbound_buffer: BytesMut::with_capacity(65536),
