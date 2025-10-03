@@ -461,12 +461,13 @@ fn output_entry(write_info: &WriteInfo, offset: usize, format: &OutputFormat, sn
             };
 
             let entry_str = match write_info {
-                WriteInfo::FieldUpdate { entity_id, field_type, value, push_condition: _, adjust_behavior: _, write_time: _, writer_id: _ } => {
+                WriteInfo::FieldUpdate { entity_id, field_type, value, push_condition: _, adjust_behavior: _, write_time: _, writer_id } => {
                     let field_name = resolve_field_type(snapshot, field_type);
                     let entity_type = entity_id.extract_type();
                     let entity_type_name = resolve_entity_type(snapshot, &entity_type);
                     let value_str = format_value(value);
-                    format!("FieldUpdate {} {} {} {}", entity_id.0, entity_type_name, field_name, value_str)
+                    let writer_str = writer_id.map(|id| id.0.to_string()).unwrap_or("none".to_string());
+                    format!("FieldUpdate {} {} {} {} {}", entity_id.0, entity_type_name, field_name, value_str, writer_str)
                 }
                 WriteInfo::CreateEntity { entity_type, parent_id, name, created_entity_id, .. } => {
                     let type_name = resolve_entity_type(snapshot, entity_type);
