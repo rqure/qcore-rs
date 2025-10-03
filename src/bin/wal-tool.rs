@@ -35,8 +35,8 @@ struct Config {
     #[arg(long)]
     follow: bool,
 
-    /// Output format: json, pretty, or compact
-    #[arg(long, default_value = "pretty")]
+    /// Output format: json or compact
+    #[arg(long, default_value = "compact")]
     format: OutputFormat,
 
     /// Show file sizes and basic information only
@@ -47,7 +47,6 @@ struct Config {
 #[derive(Clone, Debug)]
 enum OutputFormat {
     Json,
-    Pretty,
     Compact,
 }
 
@@ -57,9 +56,8 @@ impl std::str::FromStr for OutputFormat {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "json" => Ok(OutputFormat::Json),
-            "pretty" => Ok(OutputFormat::Pretty),
             "compact" => Ok(OutputFormat::Compact),
-            _ => Err(format!("Invalid format: {}. Use json, pretty, or compact", s)),
+            _ => Err(format!("Invalid format: {}. Use json or compact", s)),
         }
     }
 }
@@ -190,7 +188,7 @@ fn main() -> Result<()> {
     } else {
         // Process all WAL files
         for (wal_file, counter) in &wal_files {
-            println!("\n=== WAL File #{}: {} ===", counter, wal_file.display());
+            safe_println(&format!("\n=== WAL File #{}: {} ===", counter, wal_file.display()))?;
 
             if config.info {
                 show_file_info(wal_file)?;
@@ -327,7 +325,7 @@ fn process_wal_file(
     file.read_to_end(&mut buffer)?;
 
     if buffer.is_empty() {
-        println!("Empty file");
+        safe_println("Empty file")?;
         return Ok(());
     }
 
@@ -367,7 +365,7 @@ fn process_wal_file(
         }
     }
 
-    println!("\nProcessed {} entries, displayed {}", entry_count, filtered_count);
+    safe_println(&format!("\nProcessed {} entries, displayed {}", entry_count, filtered_count))?;
     Ok(())
 }
 
@@ -379,8 +377,8 @@ fn follow_wal_file(
     format: &OutputFormat,
     snapshot: &Option<Snapshot>,
 ) -> Result<()> {
-    println!("Following WAL file: {}", wal_path.display());
-    println!("Press Ctrl+C to stop following");
+    safe_println(&format!("Following WAL file: {}", wal_path.display()))?;
+    safe_println("Press Ctrl+C to stop following")?;
 
     let mut last_size = 0;
     let mut buffer = Vec::new();
@@ -436,6 +434,16 @@ fn follow_wal_file(
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+fn safe_println(s: &str) -> Result<()> {
+    use std::io::{self, Write};
+    match io::stdout().write_all(format!("{}\n", s).as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+            std::process::exit(0);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
 
 /// Output a WAL entry in the specified format
 fn output_entry(write_info: &WriteInfo, offset: usize, format: &OutputFormat, snapshot: &Option<Snapshot>) -> Result<()> {
@@ -444,14 +452,6 @@ fn output_entry(write_info: &WriteInfo, offset: usize, format: &OutputFormat, sn
     let output = match format {
         OutputFormat::Json => {
             format!("{}\n", serde_json::to_string(write_info)?)
-        }
-        OutputFormat::Pretty => {
-            let mut s = format!("Offset: {}\n", offset);
-            if let Some(timestamp) = extract_timestamp(write_info) {
-                s.push_str(&format!("Timestamp: {}\n", timestamp.format(&time::format_description::well_known::Rfc3339)?));
-            }
-            s.push_str(&format!("Entry: {:#?}\n---\n", write_info));
-            s
         }
         OutputFormat::Compact => {
             let timestamp_str = if let Some(timestamp) = extract_timestamp(write_info) {
@@ -525,14 +525,14 @@ fn find_wal_files(wal_dir: &PathBuf) -> Result<Vec<(PathBuf, u64)>> {
 
 fn show_file_info(wal_path: &PathBuf) -> Result<()> {
     let metadata = std::fs::metadata(wal_path)?;
-    println!("File size: {} bytes", metadata.len());
+    safe_println(&format!("File size: {} bytes", metadata.len()))?;
     
     if let Ok(modified) = metadata.modified() {
         if let Ok(system_time) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
             let timestamp = time::OffsetDateTime::from_unix_timestamp(system_time.as_secs() as i64)
                 .unwrap_or_else(|_| time::OffsetDateTime::UNIX_EPOCH);
-            println!("Last modified: {}", timestamp.format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_else(|_| "Unknown".to_string()));
+            safe_println(&format!("Last modified: {}", timestamp.format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "Unknown".to_string())))?;
         }
     }
     
