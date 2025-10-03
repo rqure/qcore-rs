@@ -588,31 +588,57 @@ fn cmd_info(store: &StoreProxy, colors: &Colors) -> Result<()> {
 
 fn cmd_listen(store: &StoreProxy, args: &[&str], colors: &Colors, notifications: &mut HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>) -> Result<()> {
     if args.len() < 2 {
-        return Err(anyhow::anyhow!("Usage: LISTEN <target> <field>\n  target: @<entity_id> or <entity_type>\n  field: field name"));
+        return Err(anyhow::anyhow!("Usage: LISTEN <target> <field> [CHANGE] [context_fields...]\n  target: @<entity_id>, <entity_id>, or <entity_type>\n  field: field name\n  CHANGE: trigger only on value changes (default: trigger on all writes)\n  context_fields: additional fields to include in notifications"));
     }
 
     let target = args[0];
     let field_name = args[1];
+    
+    // Parse optional CHANGE flag and context fields
+    let mut trigger_on_change = false;
+    let mut context_start_idx = 2;
+    
+    if args.len() > 2 && args[2].eq_ignore_ascii_case("CHANGE") {
+        trigger_on_change = true;
+        context_start_idx = 3;
+    }
+    
     let field_type = store.get_field_type(field_name)?;
+    
+    // Parse context fields
+    let mut context = Vec::new();
+    for arg in &args[context_start_idx..] {
+        let field_path = parse_field_path(store, arg)?;
+        context.push(field_path);
+    }
 
     let config = if target.starts_with('@') {
-        // Entity ID
+        // Entity ID with @ prefix
         let entity_id_str = &target[1..];
         let entity_id = parse_entity_id(entity_id_str)?;
         NotifyConfig::EntityId {
             entity_id,
             field_type,
-            trigger_on_change: true,
-            context: vec![], // Empty context for now
+            trigger_on_change,
+            context,
+        }
+    } else if target.parse::<u64>().is_ok() {
+        // Entity ID as plain number
+        let entity_id = parse_entity_id(target)?;
+        NotifyConfig::EntityId {
+            entity_id,
+            field_type,
+            trigger_on_change,
+            context,
         }
     } else {
-        // Entity type
+        // Entity type name
         let entity_type = store.get_entity_type(target)?;
         NotifyConfig::EntityType {
             entity_type,
             field_type,
-            trigger_on_change: true,
-            context: vec![], // Empty context for now
+            trigger_on_change,
+            context,
         }
     };
 
@@ -637,31 +663,57 @@ fn cmd_listen(store: &StoreProxy, args: &[&str], colors: &Colors, notifications:
 
 fn cmd_unlisten(store: &StoreProxy, args: &[&str], colors: &Colors, notifications: &mut HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>) -> Result<()> {
     if args.len() < 2 {
-        return Err(anyhow::anyhow!("Usage: UNLISTEN <target> <field>\n  target: @<entity_id> or <entity_type>\n  field: field name"));
+        return Err(anyhow::anyhow!("Usage: UNLISTEN <target> <field> [CHANGE] [context_fields...]\n  target: @<entity_id>, <entity_id>, or <entity_type>\n  field: field name\n  CHANGE: trigger only on value changes (default: trigger on all writes)\n  context_fields: additional fields to include in notifications"));
     }
 
     let target = args[0];
     let field_name = args[1];
+    
+    // Parse optional CHANGE flag and context fields
+    let mut trigger_on_change = false;
+    let mut context_start_idx = 2;
+    
+    if args.len() > 2 && args[2].eq_ignore_ascii_case("CHANGE") {
+        trigger_on_change = true;
+        context_start_idx = 3;
+    }
+    
     let field_type = store.get_field_type(field_name)?;
+    
+    // Parse context fields
+    let mut context = Vec::new();
+    for arg in &args[context_start_idx..] {
+        let field_path = parse_field_path(store, arg)?;
+        context.push(field_path);
+    }
 
     let config = if target.starts_with('@') {
-        // Entity ID
+        // Entity ID with @ prefix
         let entity_id_str = &target[1..];
         let entity_id = parse_entity_id(entity_id_str)?;
         NotifyConfig::EntityId {
             entity_id,
             field_type,
-            trigger_on_change: true,
-            context: vec![], // Empty context for now
+            trigger_on_change,
+            context,
+        }
+    } else if target.parse::<u64>().is_ok() {
+        // Entity ID as plain number
+        let entity_id = parse_entity_id(target)?;
+        NotifyConfig::EntityId {
+            entity_id,
+            field_type,
+            trigger_on_change,
+            context,
         }
     } else {
-        // Entity type
+        // Entity type name
         let entity_type = store.get_entity_type(target)?;
         NotifyConfig::EntityType {
             entity_type,
             field_type,
-            trigger_on_change: true,
-            context: vec![], // Empty context for now
+            trigger_on_change,
+            context,
         }
     };
 
@@ -723,8 +775,8 @@ fn print_help(colors: &Colors) {
         ("FIND <type> [filter]", "Find entities"),
         ("TYPES", "List all entity types"),
         ("GETSCH <type>", "Get entity schema"),
-        ("LISTEN <target> <field>", "Listen for field changes"),
-        ("UNLISTEN <target> <field>", "Stop listening for field changes"),
+        ("LISTEN <target> <field> [CHANGE] [ctx...]", "Listen for field changes"),
+        ("UNLISTEN <target> <field> [CHANGE] [ctx...]", "Stop listening for field changes"),
         ("SNAP", "Take snapshot"),
         ("INFO", "Server information"),
         ("HELP", "Show this help"),
@@ -743,6 +795,10 @@ fn print_help(colors: &Colors) {
     println!("  {}SET 12345 Name \"John Doe\"{}", colors.dim, colors.reset);
     println!("  {}CREATE User \"john@example.com\"{}", colors.dim, colors.reset);
     println!("  {}FIND User \"Age > 25\"{}", colors.dim, colors.reset);
+    println!("  {}LISTEN @12345 Name{}", colors.dim, colors.reset);
+    println!("  {}LISTEN 12345 Name{}", colors.dim, colors.reset);
+    println!("  {}LISTEN User Email CHANGE{}", colors.dim, colors.reset);
+    println!("  {}LISTEN @12345 Status Age Name{}", colors.dim, colors.reset);
 }
 
 // Helper functions
