@@ -773,7 +773,8 @@ fn process_notifications(notifications: &HashMap<NotifyConfig, (Sender<Notificat
     for (_config, (_sender, receiver)) in notifications.iter() {
         // Try to receive notifications without blocking
         while let Ok(notification) = receiver.try_recv() {
-            println!("{}NOTIFY:{} {}", colors.magenta, colors.reset, format_notification(&notification, colors, store));
+            let formatted = format_notification(&notification, colors, store);
+            println!("{}NOTIFY:{} {}", colors.magenta, colors.reset, formatted);
         }
     }
 }
