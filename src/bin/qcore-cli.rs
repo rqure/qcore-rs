@@ -229,8 +229,6 @@ fn run_interactive(store: &StoreProxy, config: &Config, colors: &Colors) -> Resu
                 // Execute command
                 match execute_command(store, input, config, colors, &mut notifications) {
                     Ok(_) => {
-                        // Process any pending notifications
-                        process_notifications(&notifications, colors, store);
                     }
                     Err(e) => {
                         eprintln!("{}Error:{} {}", colors.red, colors.reset, e);
@@ -310,6 +308,7 @@ fn execute_command(store: &StoreProxy, input: &str, config: &Config, colors: &Co
         "INFO" => cmd_info(store, colors),
         "LISTEN" => cmd_listen(store, args, colors, notifications),
         "UNLISTEN" => cmd_unlisten(store, args, colors, notifications),
+        "POLL" => cmd_poll(store, args, colors, notifications),
         _ => {
             eprintln!("{}Unknown command:{} {}", colors.red, colors.reset, cmd);
             eprintln!("Type {}HELP{} for available commands", colors.cyan, colors.reset);
@@ -729,6 +728,25 @@ fn cmd_unlisten(store: &StoreProxy, args: &[&str], colors: &Colors, notification
     Ok(())
 }
 
+fn cmd_poll(store: &StoreProxy, args: &[&str], colors: &Colors, notifications: &HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>) -> Result<()> {
+    let interval_ms = if args.is_empty() {
+        100
+    } else {
+        args[0].parse().context("Invalid interval (milliseconds)")?
+    };
+
+    println!("{}Polling for notifications every {}ms. Press Ctrl+C to stop.{}", colors.green, interval_ms, colors.reset);
+    println!();
+
+    loop {
+        // Process any pending notifications
+        process_notifications(notifications, colors, store);
+        
+        // Sleep for the specified interval
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    }
+}
+
 fn process_notifications(notifications: &HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>, colors: &Colors, store: &StoreProxy) {
     for (_config, (_sender, receiver)) in notifications.iter() {
         // Try to receive notifications without blocking
@@ -811,6 +829,7 @@ fn print_help(colors: &Colors) {
         ("GETSCH <type>", "Get entity schema"),
         ("LISTEN <target> <field> [CHANGE] [ctx...]", "Listen for field changes"),
         ("UNLISTEN <target> <field> [CHANGE] [ctx...]", "Stop listening for field changes"),
+        ("POLL [interval_ms]", "Poll for notifications continuously"),
         ("SNAP", "Take snapshot"),
         ("INFO", "Server information"),
         ("HELP", "Show this help"),
@@ -833,6 +852,8 @@ fn print_help(colors: &Colors) {
     println!("  {}LISTEN 12345 Name{}", colors.dim, colors.reset);
     println!("  {}LISTEN User Email CHANGE{}", colors.dim, colors.reset);
     println!("  {}LISTEN @12345 Status Age Name{}", colors.dim, colors.reset);
+    println!("  {}POLL{}", colors.dim, colors.reset);
+    println!("  {}POLL 500{}", colors.dim, colors.reset);
 }
 
 // Helper functions
@@ -995,7 +1016,7 @@ impl QCoreHelper {
         let commands = vec![
             "PING", "GET", "SET", "CREATE", "DELETE", "DEL", "EXISTS",
             "GETTYPE", "RESTYPE", "GETFLD", "RESFLD", "FIND", "TYPES",
-            "GETSCH", "LISTEN", "UNLISTEN", "SNAP", "INFO", "HELP", "CLEAR", "CLS", "HISTORY",
+            "GETSCH", "LISTEN", "UNLISTEN", "POLL", "SNAP", "INFO", "HELP", "CLEAR", "CLS", "HISTORY",
             "EXIT", "QUIT"
         ].into_iter().map(String::from).collect();
 
