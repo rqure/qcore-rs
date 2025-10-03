@@ -439,17 +439,19 @@ fn follow_wal_file(
 
 /// Output a WAL entry in the specified format
 fn output_entry(write_info: &WriteInfo, offset: usize, format: &OutputFormat, snapshot: &Option<Snapshot>) -> Result<()> {
-    match format {
+    use std::io::{self, Write};
+
+    let output = match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string(write_info)?);
+            format!("{}\n", serde_json::to_string(write_info)?)
         }
         OutputFormat::Pretty => {
-            println!("Offset: {}", offset);
+            let mut s = format!("Offset: {}\n", offset);
             if let Some(timestamp) = extract_timestamp(write_info) {
-                println!("Timestamp: {}", timestamp.format(&time::format_description::well_known::Rfc3339)?);
+                s.push_str(&format!("Timestamp: {}\n", timestamp.format(&time::format_description::well_known::Rfc3339)?));
             }
-            println!("Entry: {:#?}", write_info);
-            println!("---");
+            s.push_str(&format!("Entry: {:#?}\n---\n", write_info));
+            s
         }
         OutputFormat::Compact => {
             let timestamp_str = if let Some(timestamp) = extract_timestamp(write_info) {
@@ -457,7 +459,7 @@ fn output_entry(write_info: &WriteInfo, offset: usize, format: &OutputFormat, sn
             } else {
                 "unknown".to_string()
             };
-            
+
             let entry_str = match write_info {
                 WriteInfo::FieldUpdate { entity_id, field_type, value, push_condition: _, adjust_behavior: _, write_time: _, writer_id: _ } => {
                     let field_name = resolve_field_type(snapshot, field_type);
@@ -481,11 +483,20 @@ fn output_entry(write_info: &WriteInfo, offset: usize, format: &OutputFormat, sn
                     format!("Snapshot {}", snapshot_counter)
                 }
             };
-            
-            println!("{} [{}] {}", timestamp_str, offset, entry_str);
+
+            format!("{} [{}] {}\n", timestamp_str, offset, entry_str)
         }
+    };
+
+    // Handle broken pipe gracefully
+    match io::stdout().write_all(output.as_bytes()) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+            // Pipe was closed (e.g., by head command), exit gracefully
+            std::process::exit(0);
+        }
+        Err(e) => Err(e.into()),
     }
-    Ok(())
 }
 
 fn find_wal_files(wal_dir: &PathBuf) -> Result<Vec<(PathBuf, u64)>> {
