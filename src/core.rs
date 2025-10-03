@@ -1901,7 +1901,7 @@ impl CoreService {
         if let Some(candidate) = candidates.first() {
             debug!("Writing heartbeat fields for candidate {:?}", candidate);
             // Update heartbeat fields using direct Store API calls
-            if let Err(e) = self.store.write(
+            match self.store.write(
                 *candidate,
                 &[ft_heartbeat],
                 Value::Choice(0),
@@ -1910,9 +1910,23 @@ impl CoreService {
                 None,
                 None,
             ) {
-                warn!("Failed to write heartbeat field: {}", e);
+                Ok(_) => {
+                    let write_info = WriteInfo::FieldUpdate {
+                        entity_id: *candidate,
+                        field_type: ft_heartbeat,
+                        value: Some(Value::Choice(0)),
+                        push_condition: qlib_rs::PushCondition::Always,
+                        adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                        write_time: Some(qlib_rs::data::now()),
+                        writer_id: self.candidate_entity_id,
+                    };
+                    self.broadcast_write_to_peers(write_info);
+                }
+                Err(e) => {
+                    warn!("Failed to write heartbeat field: {}", e);
+                }
             }
-            if let Err(e) = self.store.write(
+            match self.store.write(
                 *candidate,
                 &[ft_make_me],
                 Value::Choice(1),
@@ -1921,7 +1935,21 @@ impl CoreService {
                 Some(qlib_rs::PushCondition::Changes),
                 None,
             ) {
-                warn!("Failed to write make_me field: {}", e);
+                Ok(_) => {
+                    let write_info = WriteInfo::FieldUpdate {
+                        entity_id: *candidate,
+                        field_type: ft_make_me,
+                        value: Some(Value::Choice(1)),
+                        push_condition: qlib_rs::PushCondition::Changes,
+                        adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                        write_time: Some(qlib_rs::data::now()),
+                        writer_id: self.candidate_entity_id,
+                    };
+                    self.broadcast_write_to_peers(write_info);
+                }
+                Err(e) => {
+                    warn!("Failed to write make_me field: {}", e);
+                }
             }
         }
     }
@@ -2161,7 +2189,7 @@ impl CoreService {
                     "Updating available list for fault tolerance entity {:?}: {:?}",
                     ft_entity_id, available
                 );
-                if let Err(e) = self.store.write(
+                match self.store.write(
                     ft_entity_id,
                     &[ft_available_list],
                     Value::EntityList(available.clone()),
@@ -2170,8 +2198,22 @@ impl CoreService {
                     None,
                     None,
                 ) {
-                    warn!("Failed to update available list: {}", e);
-                    continue;
+                    Ok(_) => {
+                        let write_info = WriteInfo::FieldUpdate {
+                            entity_id: ft_entity_id,
+                            field_type: ft_available_list,
+                            value: Some(Value::EntityList(available.clone())),
+                            push_condition: qlib_rs::PushCondition::Always,
+                            adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                            write_time: Some(qlib_rs::data::now()),
+                            writer_id: self.candidate_entity_id,
+                        };
+                        self.broadcast_write_to_peers(write_info);
+                    }
+                    Err(e) => {
+                        warn!("Failed to update available list: {}", e);
+                        continue;
+                    }
                 }
             }
 
@@ -2188,7 +2230,7 @@ impl CoreService {
                             "Setting current leader to {:?} for fault tolerance entity {:?}",
                             me_as_candidate, ft_entity_id
                         );
-                        if let Err(e) = self.store.write(
+                        match self.store.write(
                             ft_entity_id,
                             &[ft_current_leader],
                             Value::EntityReference(Some(*me_as_candidate)),
@@ -2197,7 +2239,21 @@ impl CoreService {
                             None,
                             None,
                         ) {
-                            warn!("Failed to set current leader: {}", e);
+                            Ok(_) => {
+                                let write_info = WriteInfo::FieldUpdate {
+                                    entity_id: ft_entity_id,
+                                    field_type: ft_current_leader,
+                                    value: Some(Value::EntityReference(Some(*me_as_candidate))),
+                                    push_condition: qlib_rs::PushCondition::Always,
+                                    adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                                    write_time: Some(qlib_rs::data::now()),
+                                    writer_id: self.candidate_entity_id,
+                                };
+                                self.broadcast_write_to_peers(write_info);
+                            }
+                            Err(e) => {
+                                warn!("Failed to set current leader: {}", e);
+                            }
                         }
                     }
                 }
@@ -2213,7 +2269,7 @@ impl CoreService {
                             "Setting new leader {:?} for fault tolerance entity {:?} (no current leader)",
                             new_leader, ft_entity_id
                         );
-                        if let Err(e) = self.store.write(
+                        match self.store.write(
                             ft_entity_id,
                             &[ft_current_leader],
                             Value::EntityReference(new_leader),
@@ -2222,7 +2278,21 @@ impl CoreService {
                             None,
                             None,
                         ) {
-                            warn!("Failed to set new leader: {}", e);
+                            Ok(_) => {
+                                let write_info = WriteInfo::FieldUpdate {
+                                    entity_id: ft_entity_id,
+                                    field_type: ft_current_leader,
+                                    value: Some(Value::EntityReference(new_leader)),
+                                    push_condition: qlib_rs::PushCondition::Always,
+                                    adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                                    write_time: Some(qlib_rs::data::now()),
+                                    writer_id: self.candidate_entity_id,
+                                };
+                                self.broadcast_write_to_peers(write_info);
+                            }
+                            Err(e) => {
+                                warn!("Failed to set new leader: {}", e);
+                            }
                         }
                     }
                 } else if let Some(current_leader_id) = current_leader {
@@ -2264,7 +2334,7 @@ impl CoreService {
                                 "Updating leader from {:?} to {:?} for fault tolerance entity {:?} (current leader unavailable)",
                                 current_leader, next_leader, ft_entity_id
                             );
-                            if let Err(e) = self.store.write(
+                            match self.store.write(
                                 ft_entity_id,
                                 &[ft_current_leader],
                                 Value::EntityReference(next_leader),
@@ -2273,7 +2343,21 @@ impl CoreService {
                                 None,
                                 None,
                             ) {
-                                warn!("Failed to update leader: {}", e);
+                                Ok(_) => {
+                                    let write_info = WriteInfo::FieldUpdate {
+                                        entity_id: ft_entity_id,
+                                        field_type: ft_current_leader,
+                                        value: Some(Value::EntityReference(next_leader)),
+                                        push_condition: qlib_rs::PushCondition::Always,
+                                        adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                                        write_time: Some(qlib_rs::data::now()),
+                                        writer_id: self.candidate_entity_id,
+                                    };
+                                    self.broadcast_write_to_peers(write_info);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to update leader: {}", e);
+                                }
                             }
                         }
                     }
