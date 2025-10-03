@@ -103,7 +103,7 @@
     },
     {
       "entityType": "Candidate",
-      "inheritsFrom": [],
+      "inheritsFrom": ["Object"],
       "fields": [
         {
           "name": "Heartbeat",
@@ -127,7 +127,7 @@
     },
     {
       "entityType": "Service",
-      "inheritsFrom": ["Subject", "Candidate"],
+      "inheritsFrom": ["Candidate"],
       "fields": [
         {
           "name": "Status",
@@ -136,11 +136,6 @@
           "choices": ["Offline", "Online"]
         }
       ]
-    },
-    {
-      "entityType": "Tool",
-      "inheritsFrom": ["Subject"],
-      "fields": []
     },
     {
       "entityType": "User",
