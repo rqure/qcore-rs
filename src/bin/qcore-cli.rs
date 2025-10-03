@@ -738,13 +738,35 @@ fn cmd_poll(store: &StoreProxy, args: &[&str], colors: &Colors, notifications: &
     println!("{}Polling for notifications every {}ms. Press Ctrl+C to stop.{}", colors.green, interval_ms, colors.reset);
     println!();
 
-    loop {
-        // Process any pending notifications
+    // Set up Ctrl+C handler using a flag
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).context("Failed to set Ctrl+C handler")?;
+
+    while running.load(Ordering::SeqCst) {
+        // Process any pending notifications from the store
+        let _ = store.process_notifications();
+        
+        // Process any pending notifications from local receivers
         process_notifications(notifications, colors, store);
         
         // Sleep for the specified interval
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
     }
+    
+    // Reset the Ctrl+C handler to default
+    let _ = ctrlc::set_handler(|| {});
+    
+    println!();
+    println!("{}Stopped polling{}", colors.green, colors.reset);
+    
+    Ok(())
 }
 
 fn process_notifications(notifications: &HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>, colors: &Colors, store: &StoreProxy) {
