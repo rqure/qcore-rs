@@ -808,10 +808,10 @@ fn format_notification(notification: &Notification, colors: &Colors, store: &Sto
     
     // Format old and new values
     let prev_val = notification.previous.value.as_ref()
-        .map(|v| format_value(v, colors))
+        .map(|v| format_value_with_store(v, colors, Some(store)))
         .unwrap_or_else(|| format!("{}null{}", colors.dim, colors.reset));
     let curr_val = notification.current.value.as_ref()
-        .map(|v| format_value(v, colors))
+        .map(|v| format_value_with_store(v, colors, Some(store)))
         .unwrap_or_else(|| format!("{}null{}", colors.dim, colors.reset));
     
     let mut result = format!("{} {} {}\n    {}\n    {} -> {}", 
@@ -826,10 +826,15 @@ fn format_notification(notification: &Notification, colors: &Colors, store: &Sto
     // Add context fields
     for (field_path, info) in &notification.context {
         if !field_path.is_empty() {
+            let context_field_name = field_path.iter()
+                .map(|ft| store.resolve_field_type(*ft)
+                    .unwrap_or_else(|_| format!("Unknown({})", ft.0)))
+                .collect::<Vec<String>>()
+                .join("->");
             let context_value = info.value.as_ref()
-                .map(|v| format_value(v, colors))
+                .map(|v| format_value_with_store(v, colors, Some(store)))
                 .unwrap_or_else(|| format!("{}null{}", colors.dim, colors.reset));
-            result.push_str(&format!("\n    {}", context_value));
+            result.push_str(&format!("\n    {}: {}", context_field_name, context_value));
         }
     }
     
