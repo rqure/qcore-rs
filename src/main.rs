@@ -167,9 +167,13 @@ fn wait_for_signal() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     
-    ctrlc::set_handler(move || {
+    let handler = move || {
         r.store(false, Ordering::SeqCst);
-    })?;
+    };
+    
+    unsafe {
+        signal_hook::low_level::register(signal_hook::consts::SIGINT, handler)?;
+    }
     
     while running.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(100));

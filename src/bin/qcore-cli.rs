@@ -745,9 +745,13 @@ fn cmd_poll(store: &StoreProxy, args: &[&str], colors: &Colors, notifications: &
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     
-    ctrlc::set_handler(move || {
+    let handler = move || {
         r.store(false, Ordering::SeqCst);
-    }).context("Failed to set Ctrl+C handler")?;
+    };
+    
+    let handle = unsafe {
+        signal_hook::low_level::register(signal_hook::consts::SIGINT, handler)
+    }.context("Failed to register signal handler")?;
 
     while running.load(Ordering::SeqCst) {
         // Process any pending notifications from the store
@@ -760,8 +764,8 @@ fn cmd_poll(store: &StoreProxy, args: &[&str], colors: &Colors, notifications: &
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
     }
     
-    // Reset the Ctrl+C handler to default
-    let _ = ctrlc::set_handler(|| {});
+    // Unregister the signal handler
+    signal_hook::low_level::unregister(handle);
     
     println!();
     println!("{}Stopped polling{}", colors.green, colors.reset);
