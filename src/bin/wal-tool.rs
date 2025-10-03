@@ -298,7 +298,18 @@ fn resolve_entity_type(snapshot: &Option<Snapshot>, entity_type: &qlib_rs::Entit
 /// Format a value for display
 fn format_value(value: &Option<qlib_rs::Value>) -> String {
     match value {
-        Some(v) => format!("{:?}", v),
+        Some(v) => match v {
+            qlib_rs::Value::EntityReference(Some(entity_id)) => entity_id.0.to_string(),
+            qlib_rs::Value::EntityReference(None) => "null".to_string(),
+            qlib_rs::Value::Choice(n) => n.to_string(),
+            qlib_rs::Value::EntityList(ids) => format!("{:?}", ids),
+            qlib_rs::Value::Blob(bytes) => format!("<{} bytes>", bytes.len()),
+            qlib_rs::Value::Bool(b) => b.to_string(),
+            qlib_rs::Value::Float(f) => f.to_string(),
+            qlib_rs::Value::Int(i) => i.to_string(),
+            qlib_rs::Value::String(s) => format!("\"{}\"", s),
+            qlib_rs::Value::Timestamp(t) => format!("{:?}", t),
+        },
         None => "null".to_string(),
     }
 }
