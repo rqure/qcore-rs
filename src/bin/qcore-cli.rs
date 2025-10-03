@@ -230,7 +230,7 @@ fn run_interactive(store: &StoreProxy, config: &Config, colors: &Colors) -> Resu
                 match execute_command(store, input, config, colors, &mut notifications) {
                     Ok(_) => {
                         // Process any pending notifications
-                        process_notifications(&notifications, colors);
+                        process_notifications(&notifications, colors, store);
                     }
                     Err(e) => {
                         eprintln!("{}Error:{} {}", colors.red, colors.reset, e);
@@ -729,19 +729,39 @@ fn cmd_unlisten(store: &StoreProxy, args: &[&str], colors: &Colors, notification
     Ok(())
 }
 
-fn process_notifications(notifications: &HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>, colors: &Colors) {
+fn process_notifications(notifications: &HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>, colors: &Colors, store: &StoreProxy) {
     for (_config, (_sender, receiver)) in notifications.iter() {
         // Try to receive notifications without blocking
         while let Ok(notification) = receiver.try_recv() {
-            println!("{}Notification:{} {}", colors.magenta, colors.reset, format_notification(&notification, colors));
+            println!("{}NOTIFY:{} {}", colors.magenta, colors.reset, format_notification(&notification, colors, store));
         }
     }
 }
 
-fn format_notification(notification: &Notification, colors: &Colors) -> String {
-    let field_name = "unknown"; // TODO: resolve field name
-    let entity_name = format!("{}", notification.current.entity_id.0); // TODO: resolve entity name
+fn format_notification(notification: &Notification, colors: &Colors, store: &StoreProxy) -> String {
+    // Resolve entity type name
+    let entity_type = notification.current.entity_id.extract_type();
+    let entity_type_name = store.resolve_entity_type(entity_type)
+        .unwrap_or_else(|_| format!("Unknown({})", entity_type.0));
     
+    // Resolve field name (resolve entire field path)
+    let field_name = if !notification.current.field_path.is_empty() {
+        let field_names: Vec<String> = notification.current.field_path.iter()
+            .map(|ft| store.resolve_field_type(*ft)
+                .unwrap_or_else(|_| format!("Unknown({})", ft.0)))
+            .collect();
+        field_names.join("->")
+    } else {
+        "unknown".to_string()
+    };
+    
+    // Format timestamp
+    let timestamp = notification.current.timestamp
+        .as_ref()
+        .map(|ts| format_timestamp(ts))
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    // Format old and new values
     let prev_val = notification.previous.value.as_ref()
         .map(|v| format_value(v, colors))
         .unwrap_or_else(|| format!("{}null{}", colors.dim, colors.reset));
@@ -749,12 +769,26 @@ fn format_notification(notification: &Notification, colors: &Colors) -> String {
         .map(|v| format_value(v, colors))
         .unwrap_or_else(|| format!("{}null{}", colors.dim, colors.reset));
     
-    format!("Entity {} field {} changed: {} -> {}", 
-        entity_name,
+    let mut result = format!("{} {} {}\n    {}\n    {} -> {}", 
+        entity_type_name,
+        notification.current.entity_id.0,
         field_name,
+        timestamp,
         prev_val,
         curr_val
-    )
+    );
+    
+    // Add context fields
+    for (field_path, info) in &notification.context {
+        if !field_path.is_empty() {
+            let context_value = info.value.as_ref()
+                .map(|v| format_value(v, colors))
+                .unwrap_or_else(|| format!("{}null{}", colors.dim, colors.reset));
+            result.push_str(&format!("\n    {}", context_value));
+        }
+    }
+    
+    result
 }
 
 fn print_help(colors: &Colors) {
