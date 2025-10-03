@@ -958,8 +958,7 @@ impl CoreService {
                         command.is_response,
                         command.machine_id,
                     )?;
-                    // Send OK response
-                    self.send_ok(token)?;
+                    // No response needed for peer commands
                 } else if let Ok(_) = FullSyncRequestCommand::decode(resp_value.clone()) {
                     self.handle_peer_full_sync_request(token)?;
                 } else if let Ok(command) = FullSyncResponseCommand::decode(resp_value.clone()) {
@@ -1285,9 +1284,11 @@ impl CoreService {
                 peer_info.token = Some(token);
                 debug!("Associated token {:?} with peer {}", token, peer_machine_id);
 
-                // Update connection with peer entity ID if available
+                // Update connection with peer entity ID if available and mark as peer connection
                 if let Some(connection) = self.connections.get_mut(&token) {
                     connection.client_id = peer_info.entity_id;
+                    connection.is_peer_connection = true;
+                    debug!("Marked connection {:?} as peer connection for {}", token, peer_machine_id);
                 }
             }
             peer_info.start_time = Some(peer_start_time);
@@ -1478,6 +1479,8 @@ impl CoreService {
             );
         } else {
             info!("Sent full sync response to peer {}", requesting_machine_id);
+            // Apply write interest immediately to ensure response is sent
+            self.apply_write_interest_updates();
         }
 
         Ok(())
