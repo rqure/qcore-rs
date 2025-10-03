@@ -1525,7 +1525,7 @@ impl CoreService {
         debug!("Applying sync write from peer {}", peer_machine_id);
 
         // Apply the write to our store
-        match write_info {
+        match &write_info {
             WriteInfo::CreateEntity {
                 entity_type,
                 parent_id,
@@ -1533,12 +1533,12 @@ impl CoreService {
                 created_entity_id,
                 ..
             } => {
-                let _result_id = self
+                self
                     .store
                     .create_entity_with_id(
-                        entity_type,
-                        parent_id,
-                        &mut Some(created_entity_id),
+                        *entity_type,
+                        *parent_id,
+                        &mut Some(*created_entity_id),
                         name.as_str(),
                     )
                     .map_err(|e| {
@@ -1546,7 +1546,7 @@ impl CoreService {
                     })?;
             }
             WriteInfo::DeleteEntity { entity_id, .. } => {
-                self.store.delete_entity(entity_id).map_err(|e| {
+                self.store.delete_entity(*entity_id).map_err(|e| {
                     anyhow::anyhow!("Failed to apply DeleteEntity from peer: {}", e)
                 })?;
             }
@@ -1562,13 +1562,13 @@ impl CoreService {
                 if let Some(value) = value {
                     self.store
                         .write(
-                            entity_id,
-                            &[field_type],
-                            value,
-                            writer_id,
-                            write_time,
-                            Some(push_condition),
-                            Some(adjust_behavior),
+                            *entity_id,
+                            &[*field_type],
+                            value.clone(),
+                            *writer_id,
+                            *write_time,
+                            Some(push_condition.clone()),
+                            Some(adjust_behavior.clone()),
                         )
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to apply FieldUpdate from peer: {}", e)
