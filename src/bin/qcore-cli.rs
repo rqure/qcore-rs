@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use qlib_rs::{EntityId, EntityType, FieldType, StoreProxy, Value, Timestamp};
+use qlib_rs::{EntityId, EntityType, FieldType, StoreProxy, Value, Timestamp, Notification, NotifyConfig};
 use tracing::{info, debug};
 use base64::{Engine as _, engine::general_purpose};
+use crossbeam::channel::{Receiver, Sender};
 use rustyline::{
     completion::{Completer, Pair},
     error::ReadlineError,
@@ -13,6 +14,7 @@ use rustyline::{
     Context as RustyContext, Editor, Helper, Result as RustyResult,
 };
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// QCore CLI - Interactive command-line interface for QCore data store
 /// Similar to redis-cli, supports both interactive and command execution modes
@@ -149,11 +151,12 @@ fn main() -> Result<()> {
 
     // Execute single command
     if let Some(cmd) = &config.command {
+        let mut notifications: HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)> = HashMap::new();
         for i in 0..config.repeat {
             if i > 0 && config.interval > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(config.interval));
             }
-            execute_command(&store, cmd, &config, &colors)?;
+            execute_command(&store, cmd, &config, &colors, &mut notifications)?;
         }
         return Ok(());
     }
@@ -167,6 +170,9 @@ fn run_interactive(store: &StoreProxy, config: &Config, colors: &Colors) -> Resu
     println!("Type {}HELP{} for help, {}EXIT{} or {}QUIT{} to quit", 
         colors.cyan, colors.reset, colors.cyan, colors.reset, colors.cyan, colors.reset);
     println!();
+
+    // Track registered notifications: config -> (sender, receiver)
+    let mut notifications: HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)> = HashMap::new();
 
     // Setup rustyline editor
     let mut rl = Editor::<QCoreHelper, FileHistory>::new()
@@ -221,8 +227,11 @@ fn run_interactive(store: &StoreProxy, config: &Config, colors: &Colors) -> Resu
                 }
 
                 // Execute command
-                match execute_command(store, input, config, colors) {
-                    Ok(_) => {}
+                match execute_command(store, input, config, colors, &mut notifications) {
+                    Ok(_) => {
+                        // Process any pending notifications
+                        process_notifications(&notifications, colors);
+                    }
                     Err(e) => {
                         eprintln!("{}Error:{} {}", colors.red, colors.reset, e);
                     }
@@ -250,6 +259,7 @@ fn run_interactive(store: &StoreProxy, config: &Config, colors: &Colors) -> Resu
 }
 
 fn execute_file(store: &StoreProxy, file_path: &std::path::PathBuf, config: &Config, colors: &Colors) -> Result<()> {
+    let mut notifications: HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)> = HashMap::new();
     let content = std::fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
 
@@ -265,13 +275,13 @@ fn execute_file(store: &StoreProxy, file_path: &std::path::PathBuf, config: &Con
             println!("{}[{}]{} {}", colors.dim, line_num + 1, colors.reset, line);
         }
 
-        execute_command(store, line, config, colors)?;
+        execute_command(store, line, config, colors, &mut notifications)?;
     }
 
     Ok(())
 }
 
-fn execute_command(store: &StoreProxy, input: &str, config: &Config, colors: &Colors) -> Result<()> {
+fn execute_command(store: &StoreProxy, input: &str, config: &Config, colors: &Colors, notifications: &mut HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>) -> Result<()> {
     let parts: Vec<&str> = input.split_whitespace().collect();
     if parts.is_empty() {
         return Ok(());
@@ -298,6 +308,8 @@ fn execute_command(store: &StoreProxy, input: &str, config: &Config, colors: &Co
         "GETSCH" => cmd_getsch(store, args, colors),
         "SNAP" => cmd_snap(store, colors),
         "INFO" => cmd_info(store, colors),
+        "LISTEN" => cmd_listen(store, args, colors, notifications),
+        "UNLISTEN" => cmd_unlisten(store, args, colors, notifications),
         _ => {
             eprintln!("{}Unknown command:{} {}", colors.red, colors.reset, cmd);
             eprintln!("Type {}HELP{} for available commands", colors.cyan, colors.reset);
@@ -574,6 +586,125 @@ fn cmd_info(store: &StoreProxy, colors: &Colors) -> Result<()> {
     Ok(())
 }
 
+fn cmd_listen(store: &StoreProxy, args: &[&str], colors: &Colors, notifications: &mut HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>) -> Result<()> {
+    if args.len() < 2 {
+        return Err(anyhow::anyhow!("Usage: LISTEN <target> <field>\n  target: @<entity_id> or <entity_type>\n  field: field name"));
+    }
+
+    let target = args[0];
+    let field_name = args[1];
+    let field_type = store.get_field_type(field_name)?;
+
+    let config = if target.starts_with('@') {
+        // Entity ID
+        let entity_id_str = &target[1..];
+        let entity_id = parse_entity_id(entity_id_str)?;
+        NotifyConfig::EntityId {
+            entity_id,
+            field_type,
+            trigger_on_change: true,
+            context: vec![], // Empty context for now
+        }
+    } else {
+        // Entity type
+        let entity_type = store.get_entity_type(target)?;
+        NotifyConfig::EntityType {
+            entity_type,
+            field_type,
+            trigger_on_change: true,
+            context: vec![], // Empty context for now
+        }
+    };
+
+    // Check if already listening
+    if notifications.contains_key(&config) {
+        println!("{}Already listening for this configuration{}", colors.yellow, colors.reset);
+        return Ok(());
+    }
+
+    // Create channel
+    let (sender, receiver) = crossbeam::channel::unbounded();
+
+    // Register notification
+    store.register_notification(config.clone(), sender.clone())?;
+
+    // Store sender and receiver
+    notifications.insert(config, (sender, receiver));
+
+    println!("{}Listening for notifications{}", colors.green, colors.reset);
+    Ok(())
+}
+
+fn cmd_unlisten(store: &StoreProxy, args: &[&str], colors: &Colors, notifications: &mut HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>) -> Result<()> {
+    if args.len() < 2 {
+        return Err(anyhow::anyhow!("Usage: UNLISTEN <target> <field>\n  target: @<entity_id> or <entity_type>\n  field: field name"));
+    }
+
+    let target = args[0];
+    let field_name = args[1];
+    let field_type = store.get_field_type(field_name)?;
+
+    let config = if target.starts_with('@') {
+        // Entity ID
+        let entity_id_str = &target[1..];
+        let entity_id = parse_entity_id(entity_id_str)?;
+        NotifyConfig::EntityId {
+            entity_id,
+            field_type,
+            trigger_on_change: true,
+            context: vec![], // Empty context for now
+        }
+    } else {
+        // Entity type
+        let entity_type = store.get_entity_type(target)?;
+        NotifyConfig::EntityType {
+            entity_type,
+            field_type,
+            trigger_on_change: true,
+            context: vec![], // Empty context for now
+        }
+    };
+
+    // Check if listening
+    if let Some((sender, _receiver)) = notifications.remove(&config) {
+        // Unregister notification
+        let _ = store.unregister_notification(&config, &sender);
+        println!("{}Stopped listening{}", colors.green, colors.reset);
+    } else {
+        println!("{}Not currently listening for this configuration{}", colors.yellow, colors.reset);
+    }
+
+    Ok(())
+}
+
+fn process_notifications(notifications: &HashMap<NotifyConfig, (Sender<Notification>, Receiver<Notification>)>, colors: &Colors) {
+    for (_config, (_sender, receiver)) in notifications.iter() {
+        // Try to receive notifications without blocking
+        while let Ok(notification) = receiver.try_recv() {
+            println!("{}Notification:{} {}", colors.magenta, colors.reset, format_notification(&notification, colors));
+        }
+    }
+}
+
+fn format_notification(notification: &Notification, colors: &Colors) -> String {
+    let field_name = "unknown"; // TODO: resolve field name
+    let entity_name = format!("{}", notification.current.entity_id.0); // TODO: resolve entity name
+    
+    let prev_val = notification.previous.value.as_ref()
+        .map(|v| format_value(v, colors))
+        .unwrap_or_else(|| format!("{}null{}", colors.dim, colors.reset));
+    let curr_val = notification.current.value.as_ref()
+        .map(|v| format_value(v, colors))
+        .unwrap_or_else(|| format!("{}null{}", colors.dim, colors.reset));
+    
+    format!("Entity {} field {} changed: {} -> {}", 
+        entity_name,
+        field_name,
+        prev_val,
+        curr_val
+    )
+}
+
 fn print_help(colors: &Colors) {
     println!("{}Available Commands:{}", colors.bold, colors.reset);
     println!();
@@ -592,6 +723,8 @@ fn print_help(colors: &Colors) {
         ("FIND <type> [filter]", "Find entities"),
         ("TYPES", "List all entity types"),
         ("GETSCH <type>", "Get entity schema"),
+        ("LISTEN <target> <field>", "Listen for field changes"),
+        ("UNLISTEN <target> <field>", "Stop listening for field changes"),
         ("SNAP", "Take snapshot"),
         ("INFO", "Server information"),
         ("HELP", "Show this help"),
@@ -772,7 +905,7 @@ impl QCoreHelper {
         let commands = vec![
             "PING", "GET", "SET", "CREATE", "DELETE", "DEL", "EXISTS",
             "GETTYPE", "RESTYPE", "GETFLD", "RESFLD", "FIND", "TYPES",
-            "GETSCH", "SNAP", "INFO", "HELP", "CLEAR", "CLS", "HISTORY",
+            "GETSCH", "LISTEN", "UNLISTEN", "SNAP", "INFO", "HELP", "CLEAR", "CLS", "HISTORY",
             "EXIT", "QUIT"
         ].into_iter().map(String::from).collect();
 
