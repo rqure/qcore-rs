@@ -269,27 +269,6 @@
         ]
       },
       {
-        "entityType": "Folder",
-        "Name": "Tools",
-        "Children": [
-          {
-            "entityType": "Tool",
-            "Name": "qselect",
-            "Secret": "qselect"
-          },
-          {
-            "entityType": "Tool",
-            "Name": "qsnapshot",
-            "Secret": "qsnapshot"
-          },
-          {
-            "entityType": "Tool",
-            "Name": "qtree",
-            "Secret": "qtree"
-          }
-        ]
-      },
-      {
         "entityType": "FaultTolerance",
         "Name": "qcore",
         "CandidateList": ["QOS/qos-a/qcore", "QOS/qos-b/qcore", "QOS/qos-c/qcore"]
@@ -302,12 +281,6 @@
             "entityType": "User",
             "Name": "qei",
             "Secret": "__hashpw__(qei)",
-            "Active": true
-          },
-          {
-            "entityType": "User", 
-            "Name": "perftest",
-            "Secret": "__hashpw__(perftest)",
             "Active": true
           }
         ]
