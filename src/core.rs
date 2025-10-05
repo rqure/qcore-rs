@@ -20,7 +20,7 @@ use qlib_rs::data::resp::{
     EntityExistsCommand, EntityListResponse, EntityTypeListResponse, FieldExistsCommand,
     FieldSchemaResponse, FindEntitiesCommand, FindEntitiesExactCommand,
     FindEntitiesPaginatedCommand, FullSyncRequestCommand, FullSyncResponseCommand,
-    GetEntitySchemaCommand, GetEntityTypeCommand, GetEntityTypesCommand,
+    GetCompleteEntitySchemaCommand, GetEntitySchemaCommand, GetEntityTypeCommand, GetEntityTypesCommand,
     GetEntityTypesPaginatedCommand, GetFieldSchemaCommand, GetFieldTypeCommand, IntegerResponse,
     NotificationCommand, OwnedRespValue, PaginatedEntityResponse, PaginatedEntityTypeResponse,
     PeerHandshakeCommand, ReadCommand, ReadResponse, RegisterNotificationCommand,
@@ -724,6 +724,17 @@ impl CoreService {
                         }
                         Err(e) => {
                             self.send_error(token, format!("Get entity schema error: {}", e))?;
+                        }
+                    }
+                } else if let Ok(command) = GetCompleteEntitySchemaCommand::decode(resp_value.clone()) {
+                    match self.store.get_complete_entity_schema(command.entity_type) {
+                        Ok(schema) => {
+                            let response =
+                                EntitySchemaResp::from_complete_entity_schema(schema, &self.store);
+                            self.send_response(token, &response)?;
+                        }
+                        Err(e) => {
+                            self.send_error(token, format!("Get complete entity schema error: {}", e))?;
                         }
                     }
                 } else if let Ok(command) = UpdateSchemaCommand::decode(resp_value.clone()) {
