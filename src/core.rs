@@ -22,7 +22,7 @@ use qlib_rs::data::resp::{
     FindEntitiesPaginatedCommand, FullSyncRequestCommand, FullSyncResponseCommand,
     GetCompleteEntitySchemaCommand, GetEntitySchemaCommand, GetEntityTypeCommand, GetEntityTypesCommand,
     GetEntityTypesPaginatedCommand, GetFieldSchemaCommand, GetFieldTypeCommand, IntegerResponse,
-    NotificationCommand, OwnedRespValue, PaginatedEntityResponse, PaginatedEntityTypeResponse,
+    MachineInfoCommand, NotificationCommand, OwnedRespValue, PaginatedEntityResponse, PaginatedEntityTypeResponse,
     PeerHandshakeCommand, ReadCommand, ReadResponse, RegisterNotificationCommand,
     ResolveEntityTypeCommand, ResolveFieldTypeCommand, ResolveIndirectionCommand,
     ResolveIndirectionResponse, RespCommand, RespDecode, RespEncode, RespParser, RespToBytes,
@@ -923,6 +923,11 @@ impl CoreService {
                     }
                     let response = SnapshotResponse {
                         data: serde_json::to_string(&snapshot).unwrap_or_default(),
+                    };
+                    self.send_response(token, &response)?;
+                } else if let Ok(_command) = MachineInfoCommand::decode(resp_value.clone()) {
+                    let response = StringResponse {
+                        value: self.config.machine.clone(),
                     };
                     self.send_response(token, &response)?;
                 } else if let Ok(command) = RegisterNotificationCommand::decode(resp_value.clone())

@@ -314,6 +314,7 @@ fn execute_command(store: &StoreProxy, input: &str, config: &Config, colors: &Co
         "FEXISTS" => cmd_fexists(store, args, colors),
         "RESOLVE" => cmd_resolve(store, args, colors),
         "SNAP" => cmd_snap(store, colors),
+        "MACHINE" => cmd_machine(store, colors),
         "INFO" => cmd_info(store, colors),
         "LISTEN" => cmd_listen(store, args, colors, notifications),
         "UNLISTEN" => cmd_unlisten(store, args, colors, notifications),
@@ -928,6 +929,12 @@ fn cmd_snap(store: &StoreProxy, colors: &Colors) -> Result<()> {
     Ok(())
 }
 
+fn cmd_machine(store: &StoreProxy, colors: &Colors) -> Result<()> {
+    let machine_id = store.machine_info()?;
+    println!("{}\"{}\"{}", colors.yellow, machine_id, colors.reset);
+    Ok(())
+}
+
 fn cmd_info(store: &StoreProxy, colors: &Colors) -> Result<()> {
     let types = store.get_entity_types()?;
     
@@ -1236,6 +1243,7 @@ fn print_help(colors: &Colors) {
         ("UNLISTEN <target> <field> [CHANGE] [ctx...]", "Stop listening for field changes"),
         ("POLL [interval_ms]", "Poll for notifications continuously"),
         ("SNAP", "Take snapshot"),
+        ("MACHINE", "Get machine ID/name"),
         ("INFO", "Server information"),
         ("HELP", "Show this help"),
         ("CLEAR", "Clear screen"),
@@ -1423,7 +1431,7 @@ impl QCoreHelper {
         let commands = vec![
             "PING", "GET", "SET", "CREATE", "DELETE", "DEL", "EXISTS",
             "GETTYPE", "RESTYPE", "GETFLD", "RESFLD", "FIND", "TYPES",
-            "GETSCH", "LISTEN", "UNLISTEN", "POLL", "SNAP", "INFO", "HELP", "CLEAR", "CLS", "HISTORY",
+            "GETSCH", "LISTEN", "UNLISTEN", "POLL", "SNAP", "MACHINE", "INFO", "HELP", "CLEAR", "CLS", "HISTORY",
             "EXIT", "QUIT"
         ].into_iter().map(String::from).collect();
 
