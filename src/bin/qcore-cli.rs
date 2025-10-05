@@ -347,21 +347,60 @@ fn cmd_ping(colors: &Colors) -> Result<()> {
 }
 
 fn cmd_get(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
-    if args.len() < 2 {
-        return Err(anyhow::anyhow!("Usage: GET <entity_id> <field_path>"));
+    if args.is_empty() {
+        return Err(anyhow::anyhow!("Usage: GET <entity_id> [field_path...]"));
     }
 
     let entity_id = parse_entity_id(args[0])?;
-    let field_path = parse_field_path(store, args[1])?;
-
-    let (value, timestamp, writer_id) = store.read(entity_id, &field_path)?;
-
-    println!("{}", format_value_with_store(&value, colors, Some(store)));
     
-    if writer_id.is_some() || timestamp.unix_timestamp() > 0 {
-        println!("{}  Timestamp:{} {}", colors.dim, colors.reset, format_timestamp(&timestamp));
-        if let Some(writer) = writer_id {
-            println!("{}  Writer:{} {}", colors.dim, colors.reset, writer.0);
+    if args.len() == 1 {
+        // Get all fields from complete schema
+        let entity_type = entity_id.extract_type();
+        let schema = store.get_complete_entity_schema(entity_type)?;
+        
+        for (field_type, _field_schema) in schema.fields.iter() {
+            let field_path = vec![*field_type];
+            match store.read(entity_id, &field_path) {
+                Ok((value, timestamp, writer_id)) => {
+                    let field_name = store.resolve_field_type(*field_type)
+                        .unwrap_or_else(|_| format!("{}", field_type.0));
+                    println!("{}{}{}: {}", colors.cyan, field_name, colors.reset, format_value_with_store(&value, colors, Some(store)));
+                    
+                    if writer_id.is_some() || timestamp.unix_timestamp() > 0 {
+                        println!("{}  Timestamp:{} {}", colors.dim, colors.reset, format_timestamp(&timestamp));
+                        if let Some(writer) = writer_id {
+                            println!("{}  Writer:{} {}", colors.dim, colors.reset, writer.0);
+                        }
+                    }
+                    println!();
+                }
+                Err(e) => {
+                    let field_name = store.resolve_field_type(*field_type)
+                        .unwrap_or_else(|_| format!("{}", field_type.0));
+                    println!("{}{}{}: {}Error:{} {}", colors.cyan, field_name, colors.reset, colors.red, colors.reset, e);
+                }
+            }
+        }
+    } else {
+        // Get specified fields
+        for field_arg in &args[1..] {
+            let field_path = parse_field_path(store, field_arg)?;
+            match store.read(entity_id, &field_path) {
+                Ok((value, timestamp, writer_id)) => {
+                    println!("{}{}{}: {}", colors.cyan, field_arg, colors.reset, format_value_with_store(&value, colors, Some(store)));
+                    
+                    if writer_id.is_some() || timestamp.unix_timestamp() > 0 {
+                        println!("{}  Timestamp:{} {}", colors.dim, colors.reset, format_timestamp(&timestamp));
+                        if let Some(writer) = writer_id {
+                            println!("{}  Writer:{} {}", colors.dim, colors.reset, writer.0);
+                        }
+                    }
+                    println!();
+                }
+                Err(e) => {
+                    println!("{}{}{}: {}Error:{} {}", colors.cyan, field_arg, colors.reset, colors.red, colors.reset, e);
+                }
+            }
         }
     }
 
@@ -1172,7 +1211,7 @@ fn print_help(colors: &Colors) {
     
     let commands = [
         ("PING", "Test connection"),
-        ("GET <entity_id> <field>", "Get field value"),
+        ("GET <entity_id> [field...]", "Get field value(s) (all fields if none specified)"),
         ("SET <entity_id> <field> <value>", "Set field value"),
         ("CREATE <type> <name> [parent]", "Create new entity"),
         ("DELETE <entity_id>", "Delete entity"),
@@ -1211,6 +1250,8 @@ fn print_help(colors: &Colors) {
     println!();
     println!("{}Examples:{}", colors.bold, colors.reset);
     println!("  {}GET 12345 Name{}", colors.dim, colors.reset);
+    println!("  {}GET 12345 Name Age{}", colors.dim, colors.reset);
+    println!("  {}GET 12345{} (get all fields)", colors.dim, colors.reset);
     println!("  {}SET 12345 Name \"John Doe\"{}", colors.dim, colors.reset);
     println!("  {}CREATE User \"john@example.com\"{}", colors.dim, colors.reset);
     println!("  {}FIND User \"Age > 25\"{}", colors.dim, colors.reset);
