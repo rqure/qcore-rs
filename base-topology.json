@@ -178,7 +178,12 @@
       "inheritsFrom": ["Object"],
       "fields": [
         {
-          "name": "User",
+          "name": "CurrentUser",
+          "dataType": "EntityReference",
+          "default": null
+        },
+        {
+          "name": "PreviousUser",
           "dataType": "EntityReference",
           "default": null
         },
@@ -271,6 +276,16 @@
           {
             "entityType": "Service",
             "Name": "qcore"
+          },
+          {
+            "entityType": "Service",
+            "Name": "qweb",
+            "Children": [
+              {"entityType": "Session", "Name": "Session-1"},
+              {"entityType": "Session", "Name": "Session-2"},
+              {"entityType": "Session", "Name": "Session-3"},
+              {"entityType": "Session", "Name": "Session-4"}
+            ]
           }
         ]
       },
@@ -281,6 +296,16 @@
           {
             "entityType": "Service",
             "Name": "qcore"
+          },
+          {
+            "entityType": "Service",
+            "Name": "qweb",
+            "Children": [
+              {"entityType": "Session", "Name": "Session-1"},
+              {"entityType": "Session", "Name": "Session-2"},
+              {"entityType": "Session", "Name": "Session-3"},
+              {"entityType": "Session", "Name": "Session-4"}
+            ]
           }
         ]
       },
@@ -291,6 +316,16 @@
           {
             "entityType": "Service",
             "Name": "qcore"
+          },
+          {
+            "entityType": "Service",
+            "Name": "qweb",
+            "Children": [
+              {"entityType": "Session", "Name": "Session-1"},
+              {"entityType": "Session", "Name": "Session-2"},
+              {"entityType": "Session", "Name": "Session-3"},
+              {"entityType": "Session", "Name": "Session-4"}
+            ]
           }
         ]
       },
@@ -308,52 +343,6 @@
             "Name": "qei",
             "Secret": "__hashpw__(qei)",
             "Active": true
-          }
-        ]
-      },
-      {
-        "entityType": "Folder",
-        "Name": "Sessions",
-        "Children": [
-          {
-            "entityType": "Session",
-            "Name": "Session-1"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-2"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-3"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-4"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-5"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-6"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-7"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-8"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-9"
-          },
-          {
-            "entityType": "Session",
-            "Name": "Session-10"
           }
         ]
       },
