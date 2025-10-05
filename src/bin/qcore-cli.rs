@@ -302,8 +302,17 @@ fn execute_command(store: &StoreProxy, input: &str, config: &Config, colors: &Co
         "GETFLD" => cmd_getfld(store, args, colors),
         "RESFLD" => cmd_resfld(store, args, colors),
         "FIND" => cmd_find(store, args, colors),
+        "FINDPAG" => cmd_findpag(store, args, colors),
+        "FINDEX" => cmd_findex(store, args, colors),
         "TYPES" => cmd_types(store, colors),
+        "TYPEPAG" => cmd_typepag(store, args, colors),
         "GETSCH" => cmd_getsch(store, args, colors),
+        "GETCSCH" => cmd_getcsch(store, args, colors),
+        "SETSCH" => cmd_setsch(store, args, colors),
+        "GETFSCH" => cmd_getfsch(store, args, colors),
+        "SETFSCH" => cmd_setfsch(store, args, colors),
+        "FEXISTS" => cmd_fexists(store, args, colors),
+        "RESOLVE" => cmd_resolve(store, args, colors),
         "SNAP" => cmd_snap(store, colors),
         "INFO" => cmd_info(store, colors),
         "LISTEN" => cmd_listen(store, args, colors, notifications),
@@ -502,11 +511,127 @@ fn cmd_types(store: &StoreProxy, colors: &Colors) -> Result<()> {
 
     for entity_type in types.iter() {
         let name = store.resolve_entity_type(*entity_type)?;
-        println!("{}{:6}{} {}", colors.cyan, entity_type.0, colors.reset, name);
+        println!("{}{}{} - {}", colors.cyan, entity_type.0, colors.reset, name);
     }
     
     println!();
     println!("{}({} types){}", colors.dim, types.len(), colors.reset);
+
+    Ok(())
+}
+
+fn cmd_findpag(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.is_empty() {
+        return Err(anyhow::anyhow!("Usage: FINDPAG <entity_type> [limit] [cursor] [filter]"));
+    }
+
+    let entity_type = store.get_entity_type(args[0])?;
+    
+    let (page_opts, filter_start) = if args.len() >= 3 && args[1].parse::<usize>().is_ok() {
+        let limit: usize = args[1].parse().context("Invalid limit")?;
+        let cursor: usize = args[2].parse().context("Invalid cursor")?;
+        (Some(qlib_rs::PageOpts { limit, cursor: Some(cursor) }), 3)
+    } else if args.len() >= 2 && args[1].parse::<usize>().is_ok() {
+        let limit: usize = args[1].parse().context("Invalid limit")?;
+        (Some(qlib_rs::PageOpts { limit, cursor: None }), 2)
+    } else {
+        (None, 1)
+    };
+
+    let filter = if args.len() > filter_start {
+        Some(args[filter_start..].join(" "))
+    } else {
+        None
+    };
+
+    let result = store.find_entities_paginated(entity_type, page_opts.as_ref(), filter.as_deref())?;
+
+    for (i, entity_id) in result.items.iter().enumerate() {
+        let name_display = get_entity_name(store, *entity_id).unwrap_or_default();
+        if !name_display.is_empty() {
+            println!("{}{}{} {} ({})", colors.dim, i + 1, colors.reset, entity_id.0, name_display);
+        } else {
+            println!("{}{}{} {}", colors.dim, i + 1, colors.reset, entity_id.0);
+        }
+    }
+    
+    println!();
+    println!("{}({} of {} entities){}", colors.dim, result.items.len(), result.total, colors.reset);
+    if let Some(next) = result.next_cursor {
+        println!("{}Next cursor: {}{}", colors.dim, next, colors.reset);
+    }
+
+    Ok(())
+}
+
+fn cmd_findex(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.is_empty() {
+        return Err(anyhow::anyhow!("Usage: FINDEX <entity_type> [limit] [cursor] [filter]"));
+    }
+
+    let entity_type = store.get_entity_type(args[0])?;
+    
+    let (page_opts, filter_start) = if args.len() >= 3 && args[1].parse::<usize>().is_ok() {
+        let limit: usize = args[1].parse().context("Invalid limit")?;
+        let cursor: usize = args[2].parse().context("Invalid cursor")?;
+        (Some(qlib_rs::PageOpts { limit, cursor: Some(cursor) }), 3)
+    } else if args.len() >= 2 && args[1].parse::<usize>().is_ok() {
+        let limit: usize = args[1].parse().context("Invalid limit")?;
+        (Some(qlib_rs::PageOpts { limit, cursor: None }), 2)
+    } else {
+        (None, 1)
+    };
+
+    let filter = if args.len() > filter_start {
+        Some(args[filter_start..].join(" "))
+    } else {
+        None
+    };
+
+    let result = store.find_entities_exact(entity_type, page_opts.as_ref(), filter.as_deref())?;
+
+    for (i, entity_id) in result.items.iter().enumerate() {
+        let name_display = get_entity_name(store, *entity_id).unwrap_or_default();
+        if !name_display.is_empty() {
+            println!("{}{}{} {} ({})", colors.dim, i + 1, colors.reset, entity_id.0, name_display);
+        } else {
+            println!("{}{}{} {}", colors.dim, i + 1, colors.reset, entity_id.0);
+        }
+    }
+    
+    println!();
+    println!("{}({} of {} entities - exact match only){}", colors.dim, result.items.len(), result.total, colors.reset);
+    if let Some(next) = result.next_cursor {
+        println!("{}Next cursor: {}{}", colors.dim, next, colors.reset);
+    }
+
+    Ok(())
+}
+
+fn cmd_typepag(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    let page_opts = if args.len() >= 2 {
+        let limit: usize = args[0].parse().context("Invalid limit")?;
+        let cursor: usize = args[1].parse().context("Invalid cursor")?;
+        Some(qlib_rs::PageOpts { limit, cursor: Some(cursor) })
+    } else if args.len() == 1 {
+        let limit: usize = args[0].parse().context("Invalid limit")?;
+        Some(qlib_rs::PageOpts { limit, cursor: None })
+    } else {
+        None
+    };
+
+    let result = store.get_entity_types_paginated(page_opts.as_ref())?;
+
+    for entity_type in result.items.iter() {
+        let name = store.resolve_entity_type(*entity_type)?;
+        println!("{}{}{} - {}", colors.cyan, entity_type.0, colors.reset, name);
+    }
+    
+    println!();
+    println!("{}({} of {} types){}", colors.dim, result.items.len(), result.total, colors.reset);
+    if let Some(next) = result.next_cursor {
+        println!("{}Next cursor: {}{}", colors.dim, next, colors.reset);
+    }
 
     Ok(())
 }
@@ -553,6 +678,206 @@ fn cmd_getsch(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> 
         println!("    {}Rank:{} {}", colors.dim, colors.reset, field_schema.rank());
     }
 
+    Ok(())
+}
+
+fn cmd_getcsch(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.is_empty() {
+        return Err(anyhow::anyhow!("Usage: GETCSCH <entity_type>"));
+    }
+
+    let entity_type = store.get_entity_type(args[0])?;
+    let schema = store.get_complete_entity_schema(entity_type)?;
+
+    println!("{}Complete Entity Schema:{} {}", colors.bold, colors.reset, args[0]);
+    println!("{}Inherits:{} {}", colors.dim, colors.reset, if schema.inherit.is_empty() {
+            "None".to_string()
+        } else {
+            schema.inherit.iter()
+                .map(|et| store.resolve_entity_type(*et).unwrap_or_else(|_| format!("{}", et.0)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+    
+    println!();
+    println!("{}All Fields (including inherited):{}", colors.bold, colors.reset);
+    
+    for (field_type, field_schema) in schema.fields.iter() {
+        let field_name = store.resolve_field_type(*field_type).unwrap_or_else(|_| format!("{}", field_type.0));
+        let variant_name = match field_schema {
+            qlib_rs::FieldSchema::Blob { .. } => "Blob",
+            qlib_rs::FieldSchema::Bool { .. } => "Bool",
+            qlib_rs::FieldSchema::Choice { .. } => "Choice",
+            qlib_rs::FieldSchema::EntityList { .. } => "EntityList",
+            qlib_rs::FieldSchema::EntityReference { .. } => "EntityReference",
+            qlib_rs::FieldSchema::Float { .. } => "Float",
+            qlib_rs::FieldSchema::Int { .. } => "Int",
+            qlib_rs::FieldSchema::String { .. } => "String",
+            qlib_rs::FieldSchema::Timestamp { .. } => "Timestamp",
+        };
+        println!("  {}{}{}", colors.cyan, field_name, colors.reset);
+        println!("    {}Type:{} {}", colors.dim, colors.reset, variant_name);
+        let default = field_schema.default_value();
+        println!("    {}Default:{} {}", colors.dim, colors.reset, format_value(&default, colors));
+        println!("    {}Rank:{} {}", colors.dim, colors.reset, field_schema.rank());
+    }
+
+    Ok(())
+}
+
+fn cmd_setsch(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.is_empty() {
+        return Err(anyhow::anyhow!("Usage: SETSCH <json_file_path>"));
+    }
+
+    let json_content = std::fs::read_to_string(args[0])
+        .context("Failed to read schema file")?;
+    
+    let schema: qlib_rs::EntitySchema<qlib_rs::Single, String, String> = serde_json::from_str(&json_content)
+        .context("Failed to parse schema JSON")?;
+
+    store.update_schema(schema)?;
+    
+    println!("{}Schema updated{}", colors.green, colors.reset);
+    Ok(())
+}
+
+fn cmd_getfsch(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.len() < 2 {
+        return Err(anyhow::anyhow!("Usage: GETFSCH <entity_type> <field_name>"));
+    }
+
+    let entity_type = store.get_entity_type(args[0])?;
+    let field_type = store.get_field_type(args[1])?;
+    let field_schema = store.get_field_schema(entity_type, field_type)?;
+
+    let variant_name = match &field_schema {
+        qlib_rs::FieldSchema::Blob { .. } => "Blob",
+        qlib_rs::FieldSchema::Bool { .. } => "Bool",
+        qlib_rs::FieldSchema::Choice { .. } => "Choice",
+        qlib_rs::FieldSchema::EntityList { .. } => "EntityList",
+        qlib_rs::FieldSchema::EntityReference { .. } => "EntityReference",
+        qlib_rs::FieldSchema::Float { .. } => "Float",
+        qlib_rs::FieldSchema::Int { .. } => "Int",
+        qlib_rs::FieldSchema::String { .. } => "String",
+        qlib_rs::FieldSchema::Timestamp { .. } => "Timestamp",
+    };
+
+    println!("{}Field:{} {} ({})", colors.bold, colors.reset, args[1], field_type.0);
+    println!("{}Type:{} {}", colors.bold, colors.reset, variant_name);
+    let default = field_schema.default_value();
+    println!("{}Default:{} {}", colors.dim, colors.reset, format_value(&default, colors));
+    println!("{}Rank:{} {}", colors.dim, colors.reset, field_schema.rank());
+    Ok(())
+}
+
+fn cmd_setfsch(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.len() < 3 {
+        return Err(anyhow::anyhow!("Usage: SETFSCH <entity_type> <field_name> <value_type> [reference_type]"));
+    }
+
+    let entity_type = store.get_entity_type(args[0])?;
+    let field_type = store.get_field_type(args[1])?;
+    
+    let field_schema = match args[2].to_uppercase().as_str() {
+        "BLOB" | "BINARY" => qlib_rs::FieldSchema::Blob { 
+            field_type, 
+            default_value: Vec::new(), 
+            rank: 0, 
+            storage_scope: qlib_rs::StorageScope::Runtime 
+        },
+        "BOOL" | "BOOLEAN" => qlib_rs::FieldSchema::Bool { 
+            field_type, 
+            default_value: false, 
+            rank: 0, 
+            storage_scope: qlib_rs::StorageScope::Runtime 
+        },
+        "INT" | "INTEGER" => qlib_rs::FieldSchema::Int { 
+            field_type, 
+            default_value: 0, 
+            rank: 0, 
+            storage_scope: qlib_rs::StorageScope::Runtime 
+        },
+        "FLOAT" | "DOUBLE" => qlib_rs::FieldSchema::Float { 
+            field_type, 
+            default_value: 0.0, 
+            rank: 0, 
+            storage_scope: qlib_rs::StorageScope::Runtime 
+        },
+        "STRING" | "STR" => qlib_rs::FieldSchema::String { 
+            field_type, 
+            default_value: String::new(), 
+            rank: 0, 
+            storage_scope: qlib_rs::StorageScope::Runtime 
+        },
+        "TIMESTAMP" | "TIME" => qlib_rs::FieldSchema::Timestamp { 
+            field_type, 
+            default_value: qlib_rs::Timestamp::UNIX_EPOCH, 
+            rank: 0, 
+            storage_scope: qlib_rs::StorageScope::Runtime 
+        },
+        "REFERENCE" | "REF" | "ENTITYREFERENCE" => {
+            qlib_rs::FieldSchema::EntityReference { 
+                field_type, 
+                default_value: None, 
+                rank: 0, 
+                storage_scope: qlib_rs::StorageScope::Runtime 
+            }
+        },
+        "ENTITYLIST" | "REFLIST" | "REFERENCELIST" => {
+            qlib_rs::FieldSchema::EntityList { 
+                field_type, 
+                default_value: Vec::new(), 
+                rank: 0, 
+                storage_scope: qlib_rs::StorageScope::Runtime 
+            }
+        },
+        "CHOICE" => qlib_rs::FieldSchema::Choice { 
+            field_type, 
+            default_value: 0, 
+            rank: 0, 
+            choices: Vec::new(), 
+            storage_scope: qlib_rs::StorageScope::Runtime 
+        },
+        _ => return Err(anyhow::anyhow!("Unknown value type: {}", args[2])),
+    };
+
+    store.set_field_schema(entity_type, field_type, field_schema)?;
+    
+    println!("{}Field schema updated{}", colors.green, colors.reset);
+    Ok(())
+}
+
+fn cmd_fexists(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.len() < 2 {
+        return Err(anyhow::anyhow!("Usage: FEXISTS <entity_type> <field_name>"));
+    }
+
+    let entity_type = store.get_entity_type(args[0])?;
+    let field_type = store.get_field_type(args[1])?;
+    let exists = store.field_exists(entity_type, field_type);
+
+    println!("{}{}{}", colors.cyan, if exists { "1" } else { "0" }, colors.reset);
+    Ok(())
+}
+
+fn cmd_resolve(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.len() < 2 {
+        return Err(anyhow::anyhow!("Usage: RESOLVE <entity_id> <field1> [field2...]"));
+    }
+
+    let entity_id = parse_entity_id(args[0])?;
+    let mut field_path = Vec::new();
+    for field_name in &args[1..] {
+        let field_type = store.get_field_type(field_name)?;
+        field_path.push(field_type);
+    }
+
+    let (resolved_entity, final_field) = store.resolve_indirection(entity_id, &field_path)?;
+    let final_field_name = store.resolve_field_type(final_field)?;
+
+    println!("{}Entity:{} {}", colors.cyan, colors.reset, resolved_entity.0);
+    println!("{}Field:{} {} ({})", colors.cyan, colors.reset, final_field_name, final_field.0);
     Ok(())
 }
 
@@ -857,8 +1182,17 @@ fn print_help(colors: &Colors) {
         ("GETFLD <name>", "Get field type ID"),
         ("RESFLD <id>", "Resolve field type name"),
         ("FIND <type> [filter]", "Find entities"),
+        ("FINDPAG <type> [limit] [cursor] [filter]", "Find entities with pagination"),
+        ("FINDEX <type> [limit] [cursor] [filter]", "Find entities (exact match, no inheritance)"),
         ("TYPES", "List all entity types"),
+        ("TYPEPAG [limit] [cursor]", "List entity types with pagination"),
         ("GETSCH <type>", "Get entity schema"),
+        ("GETCSCH <type>", "Get complete entity schema (with inheritance)"),
+        ("SETSCH <json_file>", "Update entity schema from JSON file"),
+        ("GETFSCH <type> <field>", "Get field schema"),
+        ("SETFSCH <type> <field> <value_type>", "Set field schema"),
+        ("FEXISTS <type> <field>", "Check if field exists in schema"),
+        ("RESOLVE <entity_id> <field1> [field2...]", "Resolve field indirection"),
         ("LISTEN <target> <field> [CHANGE] [ctx...]", "Listen for field changes"),
         ("UNLISTEN <target> <field> [CHANGE] [ctx...]", "Stop listening for field changes"),
         ("POLL [interval_ms]", "Poll for notifications continuously"),
