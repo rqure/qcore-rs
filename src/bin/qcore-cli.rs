@@ -1545,7 +1545,8 @@ fn parse_field_path(store: &StoreProxy, s: &str) -> Result<Vec<FieldType>> {
     let mut field_types = Vec::new();
     
     for part in parts {
-        let field_type = store.get_field_type(part)?;
+        let field_type = store.get_field_type(part)
+            .with_context(|| format!("Field type '{}' not found. Field names are case-sensitive (e.g., 'Name' not 'name')", part))?;
         field_types.push(field_type);
     }
     
