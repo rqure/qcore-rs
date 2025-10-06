@@ -22,7 +22,7 @@ use std::collections::HashMap;
 #[command(name = "qcore-cli", about = "QCore command-line interface", version)]
 struct Config {
     /// QCore service URL (TCP endpoint for client connections)
-    #[arg(short = 'h', long = "host", default_value = "localhost")]
+    #[arg(long = "host", default_value = "localhost")]
     host: String,
 
     /// QCore service port
@@ -319,6 +319,7 @@ fn execute_command(store: &StoreProxy, input: &str, config: &Config, colors: &Co
         "LISTEN" => cmd_listen(store, args, colors, notifications),
         "UNLISTEN" => cmd_unlisten(store, args, colors, notifications),
         "POLL" => cmd_poll(store, args, colors, notifications),
+        "PIPELINE" => cmd_pipeline(store, args, colors),
         _ => {
             eprintln!("{}Unknown command:{} {}", colors.red, colors.reset, cmd);
             eprintln!("Type {}HELP{} for available commands", colors.cyan, colors.reset);
@@ -1212,6 +1213,252 @@ fn format_notification(notification: &Notification, colors: &Colors, store: &Sto
     result
 }
 
+fn cmd_pipeline(store: &StoreProxy, args: &[&str], colors: &Colors) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("{}Usage:{} PIPELINE <command1> | <command2> | ...", colors.yellow, colors.reset);
+        eprintln!("{}Example:{} PIPELINE GET 1 name | SET 1 name newvalue | GET 1 name", colors.yellow, colors.reset);
+        return Ok(());
+    }
+
+    // Split commands by pipe
+    let full_input = args.join(" ");
+    let command_strings: Vec<&str> = full_input.split('|').map(|s| s.trim()).collect();
+    
+    if command_strings.is_empty() {
+        eprintln!("{}Error:{} No commands provided", colors.red, colors.reset);
+        return Ok(());
+    }
+
+    println!("{}Executing pipeline with {} commands...{}", colors.dim, command_strings.len(), colors.reset);
+    println!();
+
+    let mut pipeline = store.pipeline();
+    
+    // Queue all commands
+    for (idx, cmd_str) in command_strings.iter().enumerate() {
+        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let cmd = parts[0].to_uppercase();
+        let cmd_args = &parts[1..];
+
+        println!("{}{}.{} {}", colors.dim, idx + 1, colors.reset, cmd_str);
+
+        match cmd.as_str() {
+            "GET" => {
+                if cmd_args.is_empty() {
+                    eprintln!("{}Error:{} GET requires entity_id", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let entity_id = parse_entity_id(cmd_args[0])?;
+                let field_path = if cmd_args.len() > 1 {
+                    parse_field_path(store, cmd_args[1])?
+                } else {
+                    vec![]
+                };
+                pipeline.read(entity_id, &field_path)?;
+            }
+            "SET" => {
+                if cmd_args.len() < 3 {
+                    eprintln!("{}Error:{} SET requires entity_id, field, and value", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let entity_id = parse_entity_id(cmd_args[0])?;
+                let field_path = parse_field_path(store, cmd_args[1])?;
+                let value = parse_value(cmd_args[2])?;
+                pipeline.write(entity_id, &field_path, value, None, None, None, None)?;
+            }
+            "CREATE" => {
+                if cmd_args.len() < 2 {
+                    eprintln!("{}Error:{} CREATE requires entity_type and name", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let entity_type = store.get_entity_type(cmd_args[0])?;
+                let name = cmd_args[1];
+                let parent_id = if cmd_args.len() > 2 {
+                    Some(parse_entity_id(cmd_args[2])?)
+                } else {
+                    None
+                };
+                pipeline.create_entity(entity_type, parent_id, name)?;
+            }
+            "DELETE" | "DEL" => {
+                if cmd_args.is_empty() {
+                    eprintln!("{}Error:{} DELETE requires entity_id", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let entity_id = parse_entity_id(cmd_args[0])?;
+                pipeline.delete_entity(entity_id)?;
+            }
+            "GETTYPE" => {
+                if cmd_args.is_empty() {
+                    eprintln!("{}Error:{} GETTYPE requires name", colors.red, colors.reset);
+                    return Ok(());
+                }
+                pipeline.get_entity_type(cmd_args[0])?;
+            }
+            "RESTYPE" => {
+                if cmd_args.is_empty() {
+                    eprintln!("{}Error:{} RESTYPE requires entity_type", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let entity_type = EntityType(cmd_args[0].parse()?);
+                pipeline.resolve_entity_type(entity_type)?;
+            }
+            "GETFLD" => {
+                if cmd_args.is_empty() {
+                    eprintln!("{}Error:{} GETFLD requires name", colors.red, colors.reset);
+                    return Ok(());
+                }
+                pipeline.get_field_type(cmd_args[0])?;
+            }
+            "RESFLD" => {
+                if cmd_args.is_empty() {
+                    eprintln!("{}Error:{} RESFLD requires field_type", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let field_type = FieldType(cmd_args[0].parse()?);
+                pipeline.resolve_field_type(field_type)?;
+            }
+            "EXISTS" => {
+                if cmd_args.is_empty() {
+                    eprintln!("{}Error:{} EXISTS requires entity_id", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let entity_id = parse_entity_id(cmd_args[0])?;
+                pipeline.entity_exists(entity_id)?;
+            }
+            "FEXISTS" => {
+                if cmd_args.len() < 2 {
+                    eprintln!("{}Error:{} FEXISTS requires entity_type and field_type", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let entity_type = EntityType(cmd_args[0].parse()?);
+                let field_type = FieldType(cmd_args[1].parse()?);
+                pipeline.field_exists(entity_type, field_type)?;
+            }
+            "FIND" => {
+                if cmd_args.is_empty() {
+                    eprintln!("{}Error:{} FIND requires entity_type", colors.red, colors.reset);
+                    return Ok(());
+                }
+                let entity_type = store.get_entity_type(cmd_args[0])?;
+                let filter = if cmd_args.len() > 1 {
+                    Some(cmd_args[1..].join(" "))
+                } else {
+                    None
+                };
+                pipeline.find_entities(entity_type, filter.as_deref())?;
+            }
+            "TYPES" => {
+                pipeline.get_entity_types()?;
+            }
+            _ => {
+                eprintln!("{}Error:{} Unsupported command in pipeline: {}", colors.red, colors.reset, cmd);
+                return Ok(());
+            }
+        }
+    }
+
+    println!();
+    println!("{}Executing pipeline...{}", colors.dim, colors.reset);
+
+    // Execute pipeline
+    let start = std::time::Instant::now();
+    let results = pipeline.execute()?;
+    let elapsed = start.elapsed();
+
+    println!();
+    println!("{}Results ({} responses):{}", colors.bold, results.len(), colors.reset);
+    println!();
+
+    // Display results
+    for (idx, result) in results.iter().enumerate() {
+        print!("{}{}.{} ", colors.dim, idx + 1, colors.reset);
+        
+        use qlib_rs::data::pipeline::DecodedResponse;
+        match result {
+            DecodedResponse::Read((value, timestamp, writer_id)) => {
+                println!("{}READ:{}", colors.green, colors.reset);
+                println!("  Value: {}", format_value_with_store(value, colors, Some(store)));
+                println!("  Timestamp: {}", format_timestamp(timestamp));
+                if let Some(writer) = writer_id {
+                    println!("  Writer: {}", writer.0);
+                }
+            }
+            DecodedResponse::Write(()) => {
+                println!("{}WRITE: OK{}", colors.green, colors.reset);
+            }
+            DecodedResponse::CreateEntity(entity_id) => {
+                let name_display = get_entity_name(store, *entity_id).unwrap_or_default();
+                if !name_display.is_empty() {
+                    println!("{}CREATE:{} {} ({})", colors.green, colors.reset, entity_id.0, name_display);
+                } else {
+                    println!("{}CREATE:{} {}", colors.green, colors.reset, entity_id.0);
+                }
+            }
+            DecodedResponse::DeleteEntity(()) => {
+                println!("{}DELETE: OK{}", colors.green, colors.reset);
+            }
+            DecodedResponse::GetEntityType(entity_type) => {
+                println!("{}GETTYPE:{} {}", colors.green, colors.reset, entity_type.0);
+            }
+            DecodedResponse::ResolveEntityType(name) => {
+                println!("{}RESTYPE:{} \"{}\"", colors.green, colors.reset, name);
+            }
+            DecodedResponse::GetFieldType(field_type) => {
+                println!("{}GETFLD:{} {}", colors.green, colors.reset, field_type.0);
+            }
+            DecodedResponse::ResolveFieldType(name) => {
+                println!("{}RESFLD:{} \"{}\"", colors.green, colors.reset, name);
+            }
+            DecodedResponse::EntityExists(exists) => {
+                println!("{}EXISTS:{} {}", colors.green, colors.reset, if *exists { "1" } else { "0" });
+            }
+            DecodedResponse::FieldExists(exists) => {
+                println!("{}FEXISTS:{} {}", colors.green, colors.reset, if *exists { "1" } else { "0" });
+            }
+            DecodedResponse::FindEntities(entities) => {
+                println!("{}FIND:{} {} entities", colors.green, colors.reset, entities.len());
+                for entity_id in entities.iter().take(10) {
+                    let name_display = get_entity_name(store, *entity_id).unwrap_or_default();
+                    if !name_display.is_empty() {
+                        println!("  {} ({})", entity_id.0, name_display);
+                    } else {
+                        println!("  {}", entity_id.0);
+                    }
+                }
+                if entities.len() > 10 {
+                    println!("  ... and {} more", entities.len() - 10);
+                }
+            }
+            DecodedResponse::GetEntityTypes(types) => {
+                println!("{}TYPES:{} {} types", colors.green, colors.reset, types.len());
+                for entity_type in types.iter().take(10) {
+                    if let Ok(name) = store.resolve_entity_type(*entity_type) {
+                        println!("  {} ({})", entity_type.0, name);
+                    } else {
+                        println!("  {}", entity_type.0);
+                    }
+                }
+                if types.len() > 10 {
+                    println!("  ... and {} more", types.len() - 10);
+                }
+            }
+            _ => {
+                println!("{}Response:{} {:?}", colors.cyan, colors.reset, result);
+            }
+        }
+        println!();
+    }
+
+    println!("{}Pipeline completed in {}{}", colors.dim, format_duration(&elapsed), colors.reset);
+    
+    Ok(())
+}
+
 fn print_help(colors: &Colors) {
     println!("{}Available Commands:{}", colors.bold, colors.reset);
     println!();
@@ -1242,6 +1489,7 @@ fn print_help(colors: &Colors) {
         ("LISTEN <target> <field> [CHANGE] [ctx...]", "Listen for field changes"),
         ("UNLISTEN <target> <field> [CHANGE] [ctx...]", "Stop listening for field changes"),
         ("POLL [interval_ms]", "Poll for notifications continuously"),
+        ("PIPELINE <cmd1> | <cmd2> | ...", "Execute multiple commands in a pipeline"),
         ("SNAP", "Take snapshot"),
         ("MACHINE", "Get machine ID/name"),
         ("INFO", "Server information"),
@@ -1266,6 +1514,7 @@ fn print_help(colors: &Colors) {
     println!("  {}LISTEN @12345 Name{}", colors.dim, colors.reset);
     println!("  {}LISTEN 12345 Name{}", colors.dim, colors.reset);
     println!("  {}LISTEN User Email CHANGE{}", colors.dim, colors.reset);
+    println!("  {}PIPELINE GET 1 name | SET 1 name test | GET 1 name{}", colors.dim, colors.reset);
     println!("  {}LISTEN @12345 Status Age Name{}", colors.dim, colors.reset);
     println!("  {}POLL{}", colors.dim, colors.reset);
     println!("  {}POLL 500{}", colors.dim, colors.reset);
