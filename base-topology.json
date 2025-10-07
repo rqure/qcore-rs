@@ -27,6 +27,12 @@
           "dataType": "EntityList",
           "default": [],
           "storageScope": "Configuration"
+        },
+        {
+          "name": "Faceplates",
+          "dataType": "EntityList",
+          "default": [],
+          "storageScope": "Configuration"
         }
       ]
     },
@@ -263,6 +269,109 @@
           "default": 0
         }
       ]
+    },
+    {
+      "entityType": "Faceplate",
+      "inheritsFrom": ["Object"],
+      "fields": [
+        {
+          "name": "Configuration",
+          "dataType": "String",
+          "default": "{}",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "TargetEntityType",
+          "dataType": "String",
+          "default": "",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "Bindings",
+          "dataType": "String",
+          "default": "[]",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "Components",
+          "dataType": "EntityList",
+          "default": [],
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "NotificationChannels",
+          "dataType": "String",
+          "default": "[]",
+          "storageScope": "Configuration"
+        }
+      ]
+    },
+    {
+      "entityType": "FaceplateComponent",
+      "inheritsFrom": ["Object"],
+      "fields": [
+        {
+          "name": "ComponentType",
+          "dataType": "Choice",
+          "default": "Custom",
+          "choices": ["Gauge", "Indicator", "FormField", "Trend", "Custom"],
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "Configuration",
+          "dataType": "String",
+          "default": "{}",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "Bindings",
+          "dataType": "String",
+          "default": "[]",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "AnimationRules",
+          "dataType": "String",
+          "default": "[]",
+          "storageScope": "Configuration"
+        }
+      ]
+    },
+    {
+      "entityType": "FaceplateBinding",
+      "inheritsFrom": ["Object"],
+      "fields": [
+        {
+          "name": "Expression",
+          "dataType": "String",
+          "default": "",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "TargetComponent",
+          "dataType": "EntityReference",
+          "default": null,
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "TargetProperty",
+          "dataType": "String",
+          "default": "",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "ValueTransform",
+          "dataType": "String",
+          "default": "",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "SubscriptionConfig",
+          "dataType": "String",
+          "default": "[]",
+          "storageScope": "Configuration"
+        }
+      ]
     }
   ],
   "tree": {
@@ -355,7 +464,98 @@
             "Name": "TestEntity",
             "TestValue": 0,
             "TestString": "Initial Test Value",
-            "TestFlag": false
+            "TestFlag": false,
+            "Faceplates": [
+              "QOS/Faceplate Builder/Faceplates/PerfTest Overview"
+            ]
+          }
+        ]
+      },
+      {
+        "entityType": "Folder",
+        "Name": "Faceplate Builder",
+        "Children": [
+          {
+            "entityType": "Folder",
+            "Name": "Component Library",
+            "Children": [
+              {
+                "entityType": "FaceplateComponent",
+                "Name": "PerfTest Gauge",
+                "ComponentType": "Gauge",
+                "Configuration": "{\"type\":\"gauge\",\"min\":0,\"max\":100,\"title\":\"Perf Test Value\"}",
+                "Bindings": "[{\"property\":\"value\",\"expression\":\"TestValue\"}]",
+                "AnimationRules": "[{\"expression\":\"TestFlag\",\"animation\":\"pulse\"}]"
+              },
+              {
+                "entityType": "FaceplateComponent",
+                "Name": "Status Indicator",
+                "ComponentType": "Indicator",
+                "Configuration": "{\"type\":\"indicator\",\"label\":\"Flag\",\"trueLabel\":\"Active\",\"falseLabel\":\"Inactive\"}",
+                "Bindings": "[{\"property\":\"status\",\"expression\":\"TestFlag\"}]",
+                "AnimationRules": "[]"
+              },
+              {
+                "entityType": "FaceplateComponent",
+                "Name": "Hierarchy Label",
+                "ComponentType": "FormField",
+                "Configuration": "{\"type\":\"label\",\"label\":\"Hierarchy\"}",
+                "Bindings": "[{\"property\":\"text\",\"expression\":\"Parent->Parent->Name\"}]",
+                "AnimationRules": "[]"
+              }
+            ]
+          },
+          {
+            "entityType": "Folder",
+            "Name": "Bindings",
+            "Children": [
+              {
+                "entityType": "FaceplateBinding",
+                "Name": "PerfTest Value Binding",
+                "Expression": "TestValue",
+                "TargetComponent": "QOS/Faceplate Builder/Component Library/PerfTest Gauge",
+                "TargetProperty": "value",
+                "ValueTransform": "",
+                "SubscriptionConfig": "[{\"fields\":[\"TestValue\"]}]"
+              },
+              {
+                "entityType": "FaceplateBinding",
+                "Name": "PerfTest Flag Binding",
+                "Expression": "TestFlag",
+                "TargetComponent": "QOS/Faceplate Builder/Component Library/Status Indicator",
+                "TargetProperty": "status",
+                "ValueTransform": "",
+                "SubscriptionConfig": "[{\"fields\":[\"TestFlag\"]}]"
+              },
+              {
+                "entityType": "FaceplateBinding",
+                "Name": "Hierarchy Name Binding",
+                "Expression": "Parent->Parent->Name",
+                "TargetComponent": "QOS/Faceplate Builder/Component Library/Hierarchy Label",
+                "TargetProperty": "text",
+                "ValueTransform": "",
+                "SubscriptionConfig": "[{\"fields\":[\"Parent\",\"Parent->Parent->Name\"]}]"
+              }
+            ]
+          },
+          {
+            "entityType": "Folder",
+            "Name": "Faceplates",
+            "Children": [
+              {
+                "entityType": "Faceplate",
+                "Name": "PerfTest Overview",
+                "TargetEntityType": "PerfTestEntity",
+                "Configuration": "{\"layout\":[{\"component\":\"PerfTest Gauge\",\"x\":0,\"y\":0},{\"component\":\"Status Indicator\",\"x\":1,\"y\":0},{\"component\":\"Hierarchy Label\",\"x\":0,\"y\":1}],\"bindings\":[{\"component\":\"PerfTest Gauge\",\"property\":\"value\",\"expression\":\"TestValue\"},{\"component\":\"Status Indicator\",\"property\":\"status\",\"expression\":\"TestFlag\"},{\"component\":\"Hierarchy Label\",\"property\":\"text\",\"expression\":\"Parent->Parent->Name\"}]}",
+                "Bindings": "[{\"component\":\"PerfTest Gauge\",\"property\":\"value\",\"expression\":\"TestValue\"},{\"component\":\"Status Indicator\",\"property\":\"status\",\"expression\":\"TestFlag\"},{\"component\":\"Hierarchy Label\",\"property\":\"text\",\"expression\":\"Parent->Parent->Name\"}]",
+                "Components": [
+                  "QOS/Faceplate Builder/Component Library/PerfTest Gauge",
+                  "QOS/Faceplate Builder/Component Library/Status Indicator",
+                  "QOS/Faceplate Builder/Component Library/Hierarchy Label"
+                ],
+                "NotificationChannels": "[{\"fields\":[\"TestValue\",\"TestFlag\",\"Parent\",\"Parent->Parent->Name\"]}]"
+              }
+            ]
           }
         ]
       }
