@@ -312,9 +312,20 @@
       "fields": [
         {
           "name": "ComponentType",
-          "dataType": "Choice",
+          "dataType": "String",
           "default": "Custom",
-          "choices": ["Gauge", "Indicator", "FormField", "Trend", "Custom"],
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "Primitive",
+          "dataType": "EntityReference",
+          "default": null,
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "PropertySchema",
+          "dataType": "String",
+          "default": "[]",
           "storageScope": "Configuration"
         },
         {
@@ -330,7 +341,55 @@
           "storageScope": "Configuration"
         },
         {
+          "name": "BehaviorScripts",
+          "dataType": "String",
+          "default": "[]",
+          "storageScope": "Configuration"
+        },
+        {
           "name": "AnimationRules",
+          "dataType": "String",
+          "default": "[]",
+          "storageScope": "Configuration"
+        }
+      ]
+    },
+    {
+      "entityType": "FaceplatePrimitive",
+      "inheritsFrom": ["Object"],
+      "fields": [
+        {
+          "name": "Category",
+          "dataType": "String",
+          "default": "",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "MarkupTemplate",
+          "dataType": "String",
+          "default": "",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "PropertySchema",
+          "dataType": "String",
+          "default": "[]",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "DefaultProps",
+          "dataType": "String",
+          "default": "{}",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "PreviewProps",
+          "dataType": "String",
+          "default": "{}",
+          "storageScope": "Configuration"
+        },
+        {
+          "name": "ScriptModules",
           "dataType": "String",
           "default": "[]",
           "storageScope": "Configuration"
@@ -477,30 +536,75 @@
         "Children": [
           {
             "entityType": "Folder",
+            "Name": "Primitives",
+            "Children": [
+              {
+                "entityType": "FaceplatePrimitive",
+                "Name": "Standard Gauge",
+                "Category": "Gauge",
+                  "MarkupTemplate": "<div class=\"primitive-gauge\"><svg class=\"dial\" viewBox=\"0 0 100 50\"><path d=\"M5 50 A45 45 0 0 1 95 50\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"6\"/></svg><div class=\"readout\"><slot /></div></div>",
+                "PropertySchema": "[{\\\"name\\\":\\\"value\\\",\\\"type\\\":\\\"number\\\",\\\"default\\\":0},{\\\"name\\\":\\\"min\\\",\\\"type\\\":\\\"number\\\",\\\"default\\\":0},{\\\"name\\\":\\\"max\\\",\\\"type\\\":\\\"number\\\",\\\"default\\\":100},{\\\"name\\\":\\\"unit\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"\\\"}]",
+                "DefaultProps": "{\\\"value\\\":0,\\\"min\\\":0,\\\"max\\\":100,\\\"unit\\\":\\\"\\\"}",
+                "PreviewProps": "{\\\"value\\\":58,\\\"min\\\":0,\\\"max\\\":100,\\\"unit\\\":\\\"%\\\"}",
+                "ScriptModules": "[]"
+              },
+              {
+                "entityType": "FaceplatePrimitive",
+                "Name": "Status Pill",
+                "Category": "Indicator",
+            "MarkupTemplate": "<div class=\"primitive-status\" data-state=\"{state}\"><span class=\"status-label\"><slot /></span></div>",
+                "PropertySchema": "[{\\\"name\\\":\\\"state\\\",\\\"type\\\":\\\"boolean\\\",\\\"default\\\":true},{\\\"name\\\":\\\"trueLabel\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Online\\\"},{\\\"name\\\":\\\"falseLabel\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Offline\\\"}]",
+                "DefaultProps": "{\\\"state\\\":true,\\\"trueLabel\\\":\\\"Online\\\",\\\"falseLabel\\\":\\\"Offline\\\"}",
+                "PreviewProps": "{\\\"state\\\":true,\\\"trueLabel\\\":\\\"Active\\\",\\\"falseLabel\\\":\\\"Inactive\\\"}",
+                "ScriptModules": "[]"
+              },
+              {
+                "entityType": "FaceplatePrimitive",
+                "Name": "Static Label",
+                "Category": "Label",
+                  "MarkupTemplate": "<div class=\"primitive-label\"><span class=\"label-text\"><slot /></span></div>",
+                "PropertySchema": "[{\\\"name\\\":\\\"text\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Label\\\"}]",
+                "DefaultProps": "{\\\"text\\\":\\\"Label\\\"}",
+                "PreviewProps": "{\\\"text\\\":\\\"Hierarchy: QOS\\\"}",
+                "ScriptModules": "[]"
+              }
+            ]
+          },
+          {
+            "entityType": "Folder",
             "Name": "Component Library",
             "Children": [
               {
                 "entityType": "FaceplateComponent",
                 "Name": "PerfTest Gauge",
                 "ComponentType": "Gauge",
-                "Configuration": "{\"type\":\"gauge\",\"min\":0,\"max\":100,\"title\":\"Perf Test Value\"}",
+                "Primitive": "QOS/Faceplate Builder/Primitives/Standard Gauge",
+                "PropertySchema": "[{\\\"name\\\":\\\"label\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Perf Test Value\\\"},{\\\"name\\\":\\\"precision\\\",\\\"type\\\":\\\"number\\\",\\\"default\\\":1},{\\\"name\\\":\\\"unit\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"%\\\"}]",
+                "Configuration": "{\"props\":{\"label\":\"Perf Test Value\",\"precision\":1,\"unit\":\"%\"}}",
                 "Bindings": "[{\"property\":\"value\",\"expression\":\"TestValue\"}]",
+                "BehaviorScripts": "[]",
                 "AnimationRules": "[{\"expression\":\"TestFlag\",\"animation\":\"pulse\"}]"
               },
               {
                 "entityType": "FaceplateComponent",
                 "Name": "Status Indicator",
                 "ComponentType": "Indicator",
-                "Configuration": "{\"type\":\"indicator\",\"label\":\"Flag\",\"trueLabel\":\"Active\",\"falseLabel\":\"Inactive\"}",
+                "Primitive": "QOS/Faceplate Builder/Primitives/Status Pill",
+                "PropertySchema": "[{\\\"name\\\":\\\"label\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Flag\\\"}]",
+                "Configuration": "{\"props\":{\"label\":\"Flag\",\"trueLabel\":\"Active\",\"falseLabel\":\"Inactive\"}}",
                 "Bindings": "[{\"property\":\"status\",\"expression\":\"TestFlag\"}]",
+                "BehaviorScripts": "[]",
                 "AnimationRules": "[]"
               },
               {
                 "entityType": "FaceplateComponent",
                 "Name": "Hierarchy Label",
-                "ComponentType": "FormField",
-                "Configuration": "{\"type\":\"label\",\"label\":\"Hierarchy\"}",
+                "ComponentType": "Label",
+                "Primitive": "QOS/Faceplate Builder/Primitives/Static Label",
+                "PropertySchema": "[{\\\"name\\\":\\\"label\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Hierarchy\\\"}]",
+                "Configuration": "{\"props\":{\"label\":\"Hierarchy\"}}",
                 "Bindings": "[{\"property\":\"text\",\"expression\":\"Parent->Parent->Name\"}]",
+                "BehaviorScripts": "[]",
                 "AnimationRules": "[]"
               }
             ]
