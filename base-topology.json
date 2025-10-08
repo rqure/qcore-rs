@@ -437,48 +437,6 @@
           "storageScope": "Configuration"
         }
       ]
-    },
-    {
-      "entityType": "FaceplateBindingLibrary",
-      "inheritsFrom": ["Object"],
-      "fields": [
-        {
-          "name": "Expression",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "TargetComponent",
-          "dataType": "EntityReference",
-          "default": null,
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "TargetProperty",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "ValueTransform",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "SubscriptionConfig",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "Description",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        }
-      ]
     }
   ],
   "tree": {
