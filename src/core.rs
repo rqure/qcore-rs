@@ -1242,14 +1242,10 @@ impl CoreService {
 
         // Disconnect all non-peer clients since snapshot restoration invalidates their state
         let mut non_peer_tokens = Vec::new();
-        let peer_tokens: HashSet<Token> = self
-            .peers
-            .values()
-            .filter_map(|peer_info| peer_info.token)
-            .collect();
 
         for (&token, connection) in &self.connections {
-            if !peer_tokens.contains(&token) {
+            // Use the connection's is_peer_connection flag to determine if it's a peer
+            if !connection.is_peer_connection {
                 non_peer_tokens.push(token);
                 info!(
                     "Disconnecting non-peer client {} due to snapshot restoration",
