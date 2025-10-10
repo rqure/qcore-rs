@@ -323,12 +323,6 @@
           "storageScope": "Configuration"
         },
         {
-          "name": "Primitive",
-          "dataType": "EntityReference",
-          "default": null,
-          "storageScope": "Configuration"
-        },
-        {
           "name": "PropertySchema",
           "dataType": "String",
           "default": "[]",
@@ -354,48 +348,6 @@
         },
         {
           "name": "AnimationRules",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        }
-      ]
-    },
-    {
-      "entityType": "FaceplatePrimitive",
-      "inheritsFrom": ["Object"],
-      "fields": [
-        {
-          "name": "Category",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "MarkupTemplate",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "PropertySchema",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "DefaultProps",
-          "dataType": "String",
-          "default": "{}",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "PreviewProps",
-          "dataType": "String",
-          "default": "{}",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "ScriptModules",
           "dataType": "String",
           "default": "[]",
           "storageScope": "Configuration"
@@ -542,127 +494,15 @@
         "Children": [
           {
             "entityType": "Folder",
-            "Name": "Primitives",
-            "Children": [
-              {
-                "entityType": "FaceplatePrimitive",
-                "Name": "Standard Gauge",
-                "Category": "Gauge",
-                  "MarkupTemplate": "<div class=\"primitive-gauge\"><svg class=\"dial\" viewBox=\"0 0 100 50\"><path d=\"M5 50 A45 45 0 0 1 95 50\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"6\"/></svg><div class=\"readout\"><slot /></div></div>",
-                "PropertySchema": "[{\\\"name\\\":\\\"value\\\",\\\"type\\\":\\\"number\\\",\\\"default\\\":0},{\\\"name\\\":\\\"min\\\",\\\"type\\\":\\\"number\\\",\\\"default\\\":0},{\\\"name\\\":\\\"max\\\",\\\"type\\\":\\\"number\\\",\\\"default\\\":100},{\\\"name\\\":\\\"unit\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"\\\"}]",
-                "DefaultProps": "{\\\"value\\\":0,\\\"min\\\":0,\\\"max\\\":100,\\\"unit\\\":\\\"\\\"}",
-                "PreviewProps": "{\\\"value\\\":58,\\\"min\\\":0,\\\"max\\\":100,\\\"unit\\\":\\\"%\\\"}",
-                "ScriptModules": "[]"
-              },
-              {
-                "entityType": "FaceplatePrimitive",
-                "Name": "Status Pill",
-                "Category": "Indicator",
-            "MarkupTemplate": "<div class=\"primitive-status\" data-state=\"{state}\"><span class=\"status-label\"><slot /></span></div>",
-                "PropertySchema": "[{\\\"name\\\":\\\"state\\\",\\\"type\\\":\\\"boolean\\\",\\\"default\\\":true},{\\\"name\\\":\\\"trueLabel\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Online\\\"},{\\\"name\\\":\\\"falseLabel\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Offline\\\"}]",
-                "DefaultProps": "{\\\"state\\\":true,\\\"trueLabel\\\":\\\"Online\\\",\\\"falseLabel\\\":\\\"Offline\\\"}",
-                "PreviewProps": "{\\\"state\\\":true,\\\"trueLabel\\\":\\\"Active\\\",\\\"falseLabel\\\":\\\"Inactive\\\"}",
-                "ScriptModules": "[]"
-              },
-              {
-                "entityType": "FaceplatePrimitive",
-                "Name": "Static Label",
-                "Category": "Label",
-                  "MarkupTemplate": "<div class=\"primitive-label\"><span class=\"label-text\"><slot /></span></div>",
-                "PropertySchema": "[{\\\"name\\\":\\\"text\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Label\\\"}]",
-                "DefaultProps": "{\\\"text\\\":\\\"Label\\\"}",
-                "PreviewProps": "{\\\"text\\\":\\\"Hierarchy: QOS\\\"}",
-                "ScriptModules": "[]"
-              }
-            ]
-          },
-          {
-            "entityType": "Folder",
-            "Name": "Component Library",
-            "Children": [
-              {
-                "entityType": "FaceplateComponent",
-                "Name": "PerfTest Gauge",
-                "ComponentType": "Gauge",
-                "Primitive": "QOS/Faceplate Builder/Primitives/Standard Gauge",
-                "PropertySchema": "[{\\\"name\\\":\\\"label\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Perf Test Value\\\"},{\\\"name\\\":\\\"precision\\\",\\\"type\\\":\\\"number\\\",\\\"default\\\":1},{\\\"name\\\":\\\"unit\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"%\\\"}]",
-                "Configuration": "{\"props\":{\"label\":\"Perf Test Value\",\"precision\":1,\"unit\":\"%\"}}",
-                "Bindings": "[{\"property\":\"value\",\"expression\":\"TestValue\"}]",
-                "BehaviorScripts": "[]",
-                "AnimationRules": "[{\"expression\":\"TestFlag\",\"animation\":\"pulse\"}]"
-              },
-              {
-                "entityType": "FaceplateComponent",
-                "Name": "Status Indicator",
-                "ComponentType": "Indicator",
-                "Primitive": "QOS/Faceplate Builder/Primitives/Status Pill",
-                "PropertySchema": "[{\\\"name\\\":\\\"label\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Flag\\\"}]",
-                "Configuration": "{\"props\":{\"label\":\"Flag\",\"trueLabel\":\"Active\",\"falseLabel\":\"Inactive\"}}",
-                "Bindings": "[{\"property\":\"status\",\"expression\":\"TestFlag\"}]",
-                "BehaviorScripts": "[]",
-                "AnimationRules": "[]"
-              },
-              {
-                "entityType": "FaceplateComponent",
-                "Name": "Hierarchy Label",
-                "ComponentType": "Label",
-                "Primitive": "QOS/Faceplate Builder/Primitives/Static Label",
-                "PropertySchema": "[{\\\"name\\\":\\\"label\\\",\\\"type\\\":\\\"string\\\",\\\"default\\\":\\\"Hierarchy\\\"}]",
-                "Configuration": "{\"props\":{\"label\":\"Hierarchy\"}}",
-                "Bindings": "[{\"property\":\"text\",\"expression\":\"Parent->Parent->Name\"}]",
-                "BehaviorScripts": "[]",
-                "AnimationRules": "[]"
-              }
-            ]
-          },
-          {
-            "entityType": "Folder",
-            "Name": "Bindings",
-            "Children": [
-              {
-                "entityType": "FaceplateBinding",
-                "Name": "PerfTest Value Binding",
-                "Expression": "TestValue",
-                "TargetComponent": "QOS/Faceplate Builder/Component Library/PerfTest Gauge",
-                "TargetProperty": "value",
-                "ValueTransform": "",
-                "SubscriptionConfig": "[{\"fields\":[\"TestValue\"]}]"
-              },
-              {
-                "entityType": "FaceplateBinding",
-                "Name": "PerfTest Flag Binding",
-                "Expression": "TestFlag",
-                "TargetComponent": "QOS/Faceplate Builder/Component Library/Status Indicator",
-                "TargetProperty": "status",
-                "ValueTransform": "",
-                "SubscriptionConfig": "[{\"fields\":[\"TestFlag\"]}]"
-              },
-              {
-                "entityType": "FaceplateBinding",
-                "Name": "Hierarchy Name Binding",
-                "Expression": "Parent->Parent->Name",
-                "TargetComponent": "QOS/Faceplate Builder/Component Library/Hierarchy Label",
-                "TargetProperty": "text",
-                "ValueTransform": "",
-                "SubscriptionConfig": "[{\"fields\":[\"Parent\",\"Parent->Parent->Name\"]}]"
-              }
-            ]
-          },
-          {
-            "entityType": "Folder",
             "Name": "Faceplates",
             "Children": [
               {
                 "entityType": "Faceplate",
                 "Name": "PerfTest Overview",
                 "TargetEntityType": "PerfTestEntity",
-                "Configuration": "{\"layout\":[{\"component\":\"PerfTest Gauge\",\"x\":0,\"y\":0},{\"component\":\"Status Indicator\",\"x\":1,\"y\":0},{\"component\":\"Hierarchy Label\",\"x\":0,\"y\":1}],\"bindings\":[{\"component\":\"PerfTest Gauge\",\"property\":\"value\",\"expression\":\"TestValue\"},{\"component\":\"Status Indicator\",\"property\":\"status\",\"expression\":\"TestFlag\"},{\"component\":\"Hierarchy Label\",\"property\":\"text\",\"expression\":\"Parent->Parent->Name\"}]}",
-                "Bindings": "[{\"component\":\"PerfTest Gauge\",\"property\":\"value\",\"expression\":\"TestValue\"},{\"component\":\"Status Indicator\",\"property\":\"status\",\"expression\":\"TestFlag\"},{\"component\":\"Hierarchy Label\",\"property\":\"text\",\"expression\":\"Parent->Parent->Name\"}]",
-                "Components": [
-                  "QOS/Faceplate Builder/Component Library/PerfTest Gauge",
-                  "QOS/Faceplate Builder/Component Library/Status Indicator",
-                  "QOS/Faceplate Builder/Component Library/Hierarchy Label"
-                ],
+                "Configuration": "{\"layout\":[],\"bindings\":[]}",
+                "Bindings": "[]",
+                "Components": [],
                 "NotificationChannels": "[{\"fields\":[\"TestValue\",\"TestFlag\",\"Parent\",\"Parent->Parent->Name\"]}]"
               }
             ]
