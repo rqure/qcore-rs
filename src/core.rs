@@ -171,6 +171,17 @@ struct Connection {
     needs_write_interest: bool,
 }
 
+/// Track state of an in-progress failover operation
+#[derive(Debug, Clone)]
+struct FailoverState {
+    /// When the failover was triggered (write time of FailOver field)
+    trigger_time: time::OffsetDateTime,
+    /// The grace period duration in milliseconds
+    grace_period_ms: i64,
+    /// Whether we've cleared the CurrentLeader yet
+    leader_cleared: bool,
+}
+
 /// Core service that handles both client and peer connections
 pub struct CoreService {
     config: CoreConfig,
@@ -189,6 +200,9 @@ pub struct CoreService {
 
     // Cached candidate entity ID for this machine
     candidate_entity_id: Option<EntityId>,
+
+    // Track in-progress failover operations by FaultTolerance entity ID
+    failover_states: FxHashMap<EntityId, FailoverState>,
 
     // Handles to other services
     snapshot_handle: Option<SnapshotHandle>,
@@ -230,6 +244,7 @@ impl CoreService {
             is_leader: true, // Start as leader until we learn about older peers
             store,
             candidate_entity_id: None,
+            failover_states: FxHashMap::default(),
             snapshot_handle: None,
             wal_handle: None,
         };
@@ -1978,6 +1993,8 @@ impl CoreService {
             ft_candidate_list,
             ft_available_list,
             ft_current_leader,
+            ft_fail_over,
+            ft_fail_over_grace_period,
             ft_make_me,
             ft_heartbeat,
             ft_death_detection_timeout,
@@ -2038,6 +2055,22 @@ impl CoreService {
                 }
             };
 
+            let ft_fail_over = match ft.fail_over {
+                Some(field) => field,
+                None => {
+                    warn!("Field type 'FailOver' not found");
+                    return;
+                }
+            };
+
+            let ft_fail_over_grace_period = match ft.fail_over_grace_period {
+                Some(field) => field,
+                None => {
+                    warn!("Field type 'FailOverGracePeriod' not found");
+                    return;
+                }
+            };
+
             let ft_make_me = match ft.make_me {
                 Some(field) => field,
                 None => {
@@ -2068,6 +2101,8 @@ impl CoreService {
                 ft_candidate_list,
                 ft_available_list,
                 ft_current_leader,
+                ft_fail_over,
+                ft_fail_over_grace_period,
                 ft_make_me,
                 ft_heartbeat,
                 ft_death_detection_timeout,
@@ -2107,6 +2142,8 @@ impl CoreService {
             let candidate_list_result = self.store.read(ft_entity_id, &[ft_candidate_list]);
             let available_list_result = self.store.read(ft_entity_id, &[ft_available_list]);
             let current_leader_result = self.store.read(ft_entity_id, &[ft_current_leader]);
+            let fail_over_result = self.store.read(ft_entity_id, &[ft_fail_over]);
+            let fail_over_grace_period_result = self.store.read(ft_entity_id, &[ft_fail_over_grace_period]);
 
             let candidates = match candidate_list_result {
                 Ok((value, _, _)) => {
@@ -2149,6 +2186,125 @@ impl CoreService {
                 }
                 Err(_) => None,
             };
+
+            // Read FailOver field to detect manual failover trigger
+            let fail_over_write_time = match fail_over_result {
+                Ok((_, write_time, _)) => Some(write_time),
+                Err(_) => None,
+            };
+
+            // Read FailOverGracePeriod
+            let fail_over_grace_period_ms = match fail_over_grace_period_result {
+                Ok((value, _, _)) => {
+                    if let Value::Int(period) = value {
+                        period
+                    } else {
+                        1000 // Default 1 second
+                    }
+                }
+                Err(_) => 1000,
+            };
+
+            // Check if we need to handle an ongoing or new failover
+            let mut should_clear_failover_state = false;
+            if let Some(write_time) = fail_over_write_time {
+                // Check if we have an existing failover state for this entity
+                let existing_state = self.failover_states.get(&ft_entity_id);
+                
+                let needs_new_failover = match existing_state {
+                    Some(state) => {
+                        // Check if the write time changed (new failover trigger)
+                        state.trigger_time != write_time
+                    }
+                    None => {
+                        // No existing state - only start failover if there's a current leader
+                        current_leader.is_some()
+                    }
+                };
+
+                if needs_new_failover && current_leader.is_some() {
+                    // New failover triggered - initialize state
+                    debug!(
+                        "Failover triggered for fault tolerance entity {:?}, clearing leader",
+                        ft_entity_id
+                    );
+                    
+                    self.failover_states.insert(
+                        ft_entity_id,
+                        FailoverState {
+                            trigger_time: write_time,
+                            grace_period_ms: fail_over_grace_period_ms,
+                            leader_cleared: false,
+                        },
+                    );
+                } else if let Some(state) = existing_state {
+                    // Check if grace period has elapsed
+                    let elapsed = now - state.trigger_time;
+                    let grace_period = time::Duration::milliseconds(state.grace_period_ms);
+                    
+                    if !state.leader_cleared {
+                        // First phase: Clear the current leader
+                        debug!(
+                            "Failover phase 1: Clearing CurrentLeader for fault tolerance entity {:?}",
+                            ft_entity_id
+                        );
+                        
+                        match self.store.write(
+                            ft_entity_id,
+                            &[ft_current_leader],
+                            Value::EntityReference(None),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ) {
+                            Ok(_) => {
+                                let write_info = WriteInfo::FieldUpdate {
+                                    entity_id: ft_entity_id,
+                                    field_type: ft_current_leader,
+                                    value: Some(Value::EntityReference(None)),
+                                    push_condition: qlib_rs::PushCondition::Always,
+                                    adjust_behavior: qlib_rs::AdjustBehavior::Set,
+                                    write_time: Some(qlib_rs::data::now()),
+                                    writer_id: self.candidate_entity_id,
+                                };
+                                self.broadcast_write_to_peers(write_info);
+                                
+                                // Update state to indicate leader has been cleared
+                                if let Some(state) = self.failover_states.get_mut(&ft_entity_id) {
+                                    state.leader_cleared = true;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to clear current leader during failover: {}", e);
+                            }
+                        }
+                        // Skip normal leadership logic this iteration
+                        continue;
+                    } else if elapsed >= grace_period {
+                        // Grace period elapsed and leader is cleared - failover complete
+                        // Let normal logic handle leader promotion
+                        debug!(
+                            "Failover phase 2: Grace period elapsed for fault tolerance entity {:?}, promoting new leader",
+                            ft_entity_id
+                        );
+                        should_clear_failover_state = true;
+                    } else {
+                        // Grace period still active - skip normal leadership logic
+                        debug!(
+                            "Failover in progress: waiting for grace period ({}/{} ms)",
+                            elapsed.whole_milliseconds(),
+                            state.grace_period_ms
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Clean up failover state if complete or if FailOver field was never written
+            if should_clear_failover_state || fail_over_write_time.is_none() {
+                self.failover_states.remove(&ft_entity_id);
+            }
 
             // Check availability of each candidate
             let mut available = Vec::new();
@@ -2275,6 +2431,20 @@ impl CoreService {
                 // Promote an available candidate to leader if needed
                 if current_leader.is_none() {
                     // No current leader, pick first available
+                    // Apply grace period for normal failover (only for non-qcore candidates)
+                    // Use failover_states to track grace period
+                    let state = self.failover_states.entry(ft_entity_id).or_insert(FailoverState {
+                        trigger_time: now,
+                        grace_period_ms: fail_over_grace_period_ms,
+                        leader_cleared: false,
+                    });
+                    if (now - state.trigger_time).whole_milliseconds() < state.grace_period_ms as i128 {
+                        debug!("Normal failover: waiting for grace period ({}/{} ms) before promoting new leader", (now - state.trigger_time).whole_milliseconds(), state.grace_period_ms);
+                        continue;
+                    } else {
+                        // After grace period, remove state and promote
+                        self.failover_states.remove(&ft_entity_id);
+                    }
                     let new_leader = available.first().cloned();
                     if new_leader.is_some() {
                         debug!(
@@ -2310,6 +2480,18 @@ impl CoreService {
                 } else if let Some(current_leader_id) = current_leader {
                     if !available.contains(&current_leader_id) {
                         // Current leader is not available, find next one
+                        // Apply grace period for normal failover (only for non-qcore candidates)
+                        let state = self.failover_states.entry(ft_entity_id).or_insert(FailoverState {
+                            trigger_time: now,
+                            grace_period_ms: fail_over_grace_period_ms,
+                            leader_cleared: false,
+                        });
+                        if (now - state.trigger_time).whole_milliseconds() < state.grace_period_ms as i128 {
+                            debug!("Normal failover: waiting for grace period ({}/{} ms) before promoting new leader", (now - state.trigger_time).whole_milliseconds(), state.grace_period_ms);
+                            continue;
+                        } else {
+                            self.failover_states.remove(&ft_entity_id);
+                        }
                         let next_leader = if let Some(current_idx) =
                             candidates.iter().position(|c| *c == current_leader_id)
                         {
