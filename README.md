@@ -33,120 +33,123 @@ RUST_LOG=info ./target/release/qcore-rs --id 2 --ws-addr 127.0.0.1:8081 --config
 
 ### 2. Use the Client
 
-Once the cluster is running, you can interact with it using the built-in client:
+Once the cluster is running, you can interact with it using the built-in CLI:
 
 ```bash
-# Get cluster status
-cargo run --bin qcore-client -- metrics
+# Interactive mode
+cargo run --bin qcore-cli
 
-# Create a new entity
-cargo run --bin qcore-client -- create User --name "John Doe"
-
-# Write data to an entity (replace EntityId with actual ID from create command)
-cargo run --bin qcore-client -- write "User$uuid" "age" "30"
-cargo run --bin qcore-client -- write "User$uuid" "email" '"john.doe@example.com"'
-
-# Read data from an entity
-cargo run --bin qcore-client -- read "User$uuid" "age"
-cargo run --bin qcore-client -- read "User$uuid" "email"
-
-# Delete an entity
-cargo run --bin qcore-client -- delete "User$uuid"
+# Or execute single commands
+cargo run --bin qcore-cli -- -c "INFO"
+cargo run --bin qcore-cli -- -c "CREATE User john@example.com"
+cargo run --bin qcore-cli -- -c "SET 12345 Name \"John Doe\""
+cargo run --bin qcore-cli -- -c "GET 12345 Name"
+cargo run --bin qcore-cli -- -c "DELETE 12345"
 ```
 
-### 3. Run Demo
+### 3. Test the Cluster
 
-Use the provided demo scripts:
+Test the cluster setup:
 
 ```bash
-# Complete client functionality demo
-./demo_client.sh
-
-# Interactive client testing (requires running cluster)
-./test_client.sh
+# Use the provided test script
+./test_cluster.sh
 ```
 
-## Client Commands
+## CLI Commands
 
-The `qcore-client` tool provides the following commands:
+The `qcore-cli` tool provides an interactive Redis-like interface with the following commands:
 
 ### Basic Operations
 
-```bash
-# Get cluster metrics and status
-cargo run --bin qcore-client -- metrics
+- `PING` - Test connection
+- `GET <entity_id> [field...]` - Get field value(s) from an entity
+- `SET <entity_id> <field> <value>` - Set field value
+- `CREATE <type> <name> [parent]` - Create new entity
+- `DELETE <entity_id>` - Delete entity
+- `EXISTS <entity_id>` - Check if entity exists
 
-# Create a new entity
-cargo run --bin qcore-client -- create <entity_type> --name <name> [--parent <parent_id>]
+### Schema Operations
 
-# Read a field from an entity
-cargo run --bin qcore-client -- read <entity_id> <field>
+- `GETSCH <type>` - Get entity schema
+- `GETCSCH <type>` - Get complete entity schema (with inheritance)
+- `SETSCH <json_file>` - Update entity schema from JSON file
+- `GETFSCH <type> <field>` - Get field schema
+- `SETFSCH <type> <field> <value_type>` - Set field schema
+- `FEXISTS <type> <field>` - Check if field exists in schema
 
-# Write a value to an entity field
-cargo run --bin qcore-client -- write <entity_id> <field> <value> [--behavior set|add|subtract]
+### Query Operations
 
-# Delete an entity
-cargo run --bin qcore-client -- delete <entity_id>
+- `FIND <type> [filter]` - Find entities
+- `FINDPAG <type> [limit] [cursor] [filter]` - Find entities with pagination
+- `FINDEX <type> [limit] [cursor] [filter]` - Find entities (exact match, no inheritance)
+- `TYPES` - List all entity types
+- `TYPEPAG [limit] [cursor]` - List entity types with pagination
 
-# Get schema information
-cargo run --bin qcore-client -- schema <entity_type> [--complete]
-```
+### Real-time Notifications
 
-### Value Formats
+- `LISTEN <target> <field> [CHANGE] [ctx...]` - Listen for field changes
+- `UNLISTEN <target> <field> [CHANGE] [ctx...]` - Stop listening for field changes
+- `POLL [interval_ms]` - Poll for notifications continuously
 
-The client supports various data types:
+### Utility Commands
 
-- **Strings**: `"hello world"` or simple strings without quotes
-- **Numbers**: `42` or `3.14`
-- **Booleans**: `true` or `false`
-- **Entity References**: `EntityType$id`
-- **Entity Lists**: `["EntityType$id1", "EntityType$id2"]`
-
-### Write Behaviors
-
-- `set` (default): Replace the current value
-- `add`: Add to the current numeric value
-- `subtract`: Subtract from the current numeric value
+- `PIPELINE <cmd1> | <cmd2> | ...` - Execute multiple commands in a pipeline
+- `SNAP` - Take snapshot
+- `MACHINE` - Get machine ID/name
+- `INFO` - Server information
 
 ### Examples
 
 ```bash
-# Create entities
-cargo run --bin qcore-client -- create User --name "Alice"
-cargo run --bin qcore-client -- create Post --parent "User$123" --name "My Post"
+# Interactive mode
+cargo run --bin qcore-cli
+> PING
+PONG
+> CREATE User john@example.com
+Created entity: 12345
+> SET 12345 Name "John Doe"
+OK
+> GET 12345 Name
+"John Doe"
+> DELETE 12345
+OK
 
-# Write different data types
-cargo run --bin qcore-client -- write "User$123" "age" "25"
-cargo run --bin qcore-client -- write "User$123" "email" '"alice@example.com"'
-cargo run --bin qcore-client -- write "User$123" "active" "true"
+# Single command execution
+cargo run --bin qcore-cli -- -c "INFO"
+cargo run --bin qcore-cli -- -c "CREATE User alice@example.com"
 
-# Arithmetic operations
-cargo run --bin qcore-client -- write "User$123" "score" "100"
-cargo run --bin qcore-client -- write "User$123" "score" "10" --behavior add
-cargo run --bin qcore-client -- write "User$123" "score" "5" --behavior subtract
+# Execute commands from file
+cargo run --bin qcore-cli -- --eval commands.txt
 
-# Read data
-cargo run --bin qcore-client -- read "User$123" "age"
-cargo run --bin qcore-client -- read "User$123" "email"
+# Output in different formats
+cargo run --bin qcore-cli -- -c "GET 12345 Name" -f json
+cargo run --bin qcore-cli -- -c "GET 12345 Name" -f csv
 ```
 
 ## Tools
 
 qcore-rs includes several command-line tools for interacting with and managing the data store:
 
-### qcore-client
+### qcore-cli
 
-The main client tool for performing CRUD operations on the data store.
+The main interactive CLI tool for performing operations on the data store, similar to redis-cli.
 
 ```bash
-# Get cluster metrics and status
-cargo run --bin qcore-client -- metrics
+# Interactive mode
+cargo run --bin qcore-cli
 
-# Create, read, write, and delete entities
-cargo run --bin qcore-client -- create User --name "John Doe"
-cargo run --bin qcore-client -- read "User$123" "name"
-cargo run --bin qcore-client -- write "User$123" "age" "30"
-cargo run --bin qcore-client -- delete "User$123"
+# Single command execution
+cargo run --bin qcore-cli -- -c "CREATE User john@example.com"
+cargo run --bin qcore-cli -- -c "GET 12345 Name"
+cargo run --bin qcore-cli -- -c "SET 12345 Age 30"
+cargo run --bin qcore-cli -- -c "DELETE 12345"
+
+# Execute commands from file
+cargo run --bin qcore-cli -- --eval script.txt
+
+# Different output formats
+cargo run --bin qcore-cli -- -c "INFO" -f json
 ```
 
 ### snapshot-tool
@@ -182,7 +185,51 @@ cargo run --bin tree-tool --verbose
 cargo run --bin tree-tool --max-depth 3 --start-from "Folder$123"
 ```
 
-For detailed usage information, see [README_tree_tool.md](README_tree_tool.md).
+### select-tool
+
+Query entities from the data store using CEL (Common Expression Language) filters.
+
+```bash
+# Find entities by type with CEL filter
+cargo run --bin select-tool --entity-type User --filter "Age > 25"
+
+# More complex queries
+cargo run --bin select-tool --entity-type User --filter "Name == 'John' && IsActive == true"
+cargo run --bin select-tool --entity-type Project --filter "Department->Name == 'Engineering'"
+```
+
+### benchmark-tool
+
+Performance benchmarking tool, similar to redis-benchmark, for testing QCore throughput and latency.
+
+```bash
+# Run benchmark with default settings
+cargo run --bin benchmark-tool
+
+# Custom configuration
+cargo run --bin benchmark-tool --clients 100 --requests 50000
+
+# Benchmark specific operations
+cargo run --bin benchmark-tool --test SET --clients 50 --requests 10000
+```
+
+### wal-tool
+
+Read and inspect Write-Ahead Log (WAL) files for debugging and analysis.
+
+```bash
+# View WAL files
+cargo run --bin wal-tool --data-dir ./data --machine qos-a
+
+# Filter by time range
+cargo run --bin wal-tool --start-time 2023-01-01T00:00:00Z --end-time 2023-01-02T00:00:00Z
+
+# Follow WAL in real-time
+cargo run --bin wal-tool --follow
+
+# Show file info only
+cargo run --bin wal-tool --info
+```
 
 ## Node Discovery
 
@@ -208,7 +255,7 @@ For the client to perform write operations (create, write, delete), the cluster 
 
 1. **Multi-node setup**: Start at least 2 nodes with the same `--min-nodes` value
 2. **Auto-initialization**: Use `--auto-init` flag to automatically initialize when minimum nodes are discovered
-3. **Wait for leader election**: Check `cargo run --bin qcore-client -- metrics` until you see a `Current Leader`
+3. **Wait for leader election**: Check `cargo run --bin qcore-cli -- -c "INFO"` until you see a `Current Leader`
 
 Single-node clusters remain in "Learner" state and cannot accept write operations. Read operations and cluster metrics work in any state.
 
@@ -222,8 +269,8 @@ Single-node clusters remain in "Learner" state and cannot accept write operation
 ./target/release/qcore-rs --id 2 --ws-addr 127.0.0.1:8081 --config-file schemas.yaml --enable-discovery --min-nodes 2 --auto-init
 
 # Wait for "Cluster initialized successfully" in logs, then:
-cargo run --bin qcore-client -- metrics  # Should show Current Leader
-cargo run --bin qcore-client -- create User "John Doe"  # Should work
+cargo run --bin qcore-cli -- -c "INFO"  # Should show Current Leader
+cargo run --bin qcore-cli -- -c "CREATE User john@example.com"  # Should work
 ```
 
 ## Discovery Options
@@ -253,14 +300,6 @@ RUST_LOG=info ./target/release/qcore-rs --id 1 --ws-addr 127.0.0.1:8080 --config
 
 # Terminal 2: Start second node  
 RUST_LOG=info ./target/release/qcore-rs --id 2 --ws-addr 127.0.0.1:8081 --config-file schemas.yaml --enable-discovery --min-nodes 1 --auto-init
-```
-
-### Automated Test
-
-Use the provided test script:
-
-```bash
-./test_discovery.sh
 ```
 
 ### Expected Output
