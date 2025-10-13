@@ -1256,10 +1256,11 @@ impl CoreService {
         self.store.restore_snapshot(snapshot);
 
         // Disconnect all non-peer clients since snapshot restoration invalidates their state
+        // NOTE: We keep peer connections alive to avoid triggering unnecessary re-sync cycles
         let mut non_peer_tokens = Vec::new();
 
         for (&token, connection) in &self.connections {
-            // Use the connection's is_peer_connection flag to determine if it's a peer
+            // Only disconnect non-peer connections
             if !connection.is_peer_connection {
                 non_peer_tokens.push(token);
                 info!(
@@ -1305,20 +1306,50 @@ impl CoreService {
             peer_machine_id, peer_start_time
         );
 
-        // Update peer info with the token if this is a new connection
-        if let Some(peer_info) = self.peers.get_mut(&peer_machine_id) {
-            if peer_info.token.is_none() {
-                peer_info.token = Some(token);
-                debug!("Associated token {:?} with peer {}", token, peer_machine_id);
+        // Check if we already have a connection to this peer
+        let has_existing_connection = if let Some(peer_info) = self.peers.get(&peer_machine_id) {
+            peer_info.token.is_some() && peer_info.token != Some(token)
+        } else {
+            false
+        };
 
-                // Update connection with peer entity ID if available and mark as peer connection
-                if let Some(connection) = self.connections.get_mut(&token) {
-                    connection.client_id = peer_info.entity_id;
-                    connection.is_peer_connection = true;
-                    debug!("Marked connection {:?} as peer connection for {}", token, peer_machine_id);
+        // If we already have a connection and this is an incoming duplicate, close the duplicate
+        // We keep the connection initiated by the peer with the lower machine ID
+        if has_existing_connection {
+            let should_keep_new = peer_machine_id < self.config.machine;
+            if !should_keep_new {
+                debug!(
+                    "Closing duplicate incoming connection from peer {} (we should initiate)",
+                    peer_machine_id
+                );
+                // Return error to trigger connection removal
+                return Err(anyhow::anyhow!("Duplicate peer connection"));
+            } else {
+                // Close the old connection and use the new one
+                if let Some(peer_info) = self.peers.get_mut(&peer_machine_id) {
+                    if let Some(old_token) = peer_info.token {
+                        debug!(
+                            "Closing old connection {:?} for peer {}, using new connection {:?}",
+                            old_token, peer_machine_id, token
+                        );
+                        self.connections.remove(&old_token);
+                    }
                 }
             }
+        }
+
+        // Update peer info with the token if this is a new connection
+        if let Some(peer_info) = self.peers.get_mut(&peer_machine_id) {
+            peer_info.token = Some(token);
             peer_info.start_time = Some(peer_start_time);
+            debug!("Associated token {:?} with peer {}", token, peer_machine_id);
+
+            // Update connection with peer entity ID if available and mark as peer connection
+            if let Some(connection) = self.connections.get_mut(&token) {
+                connection.client_id = peer_info.entity_id;
+                connection.is_peer_connection = true;
+                debug!("Marked connection {:?} as peer connection for {}", token, peer_machine_id);
+            }
         } else {
             warn!("Received handshake from unknown peer: {}", peer_machine_id);
         }
