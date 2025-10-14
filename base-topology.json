@@ -68,6 +68,37 @@
       "fields": []
     },
     {
+      "entityType": "ExampleDevice",
+      "inheritsFrom": ["Object"],
+      "fields": [
+        {
+          "name": "Status",
+          "dataType": "Choice",
+          "default": "Offline",
+          "choices": ["Offline", "Online", "Error", "Maintenance"],
+          "storageScope": "Runtime"
+        },
+        {
+          "name": "Temperature",
+          "dataType": "Float",
+          "default": 20.0,
+          "storageScope": "Runtime"
+        },
+        {
+          "name": "Pressure",
+          "dataType": "Float",
+          "default": 100.0,
+          "storageScope": "Runtime"
+        },
+        {
+          "name": "Active",
+          "dataType": "Bool",
+          "default": false,
+          "storageScope": "Runtime"
+        }
+      ]
+    },
+    {
       "entityType": "Subject",
       "inheritsFrom": ["Object"],
       "fields": [
@@ -245,32 +276,6 @@
       ]
     },
     {
-      "entityType": "PerfTestEntity",
-      "inheritsFrom": ["Object"],
-      "fields": [
-        {
-          "name": "TestValue",
-          "dataType": "Int",
-          "default": 0
-        },
-        {
-          "name": "TestString",
-          "dataType": "String",
-          "default": ""
-        },
-        {
-          "name": "TestFlag",
-          "dataType": "Bool",
-          "default": false
-        },
-        {
-          "name": "TestTimestamp",
-          "dataType": "Timestamp",
-          "default": 0
-        }
-      ]
-    },
-    {
       "entityType": "Faceplate",
       "inheritsFrom": ["Object"],
       "fields": [
@@ -284,108 +289,6 @@
           "name": "TargetEntityType",
           "dataType": "String",
           "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "Bindings",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "Components",
-          "dataType": "EntityList",
-          "default": [],
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "NotificationChannels",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "ScriptModules",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        }
-      ]
-    },
-    {
-      "entityType": "FaceplateComponent",
-      "inheritsFrom": ["Object"],
-      "fields": [
-        {
-          "name": "ComponentType",
-          "dataType": "String",
-          "default": "Custom",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "PropertySchema",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "Configuration",
-          "dataType": "String",
-          "default": "{}",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "Bindings",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "BehaviorScripts",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "AnimationRules",
-          "dataType": "String",
-          "default": "[]",
-          "storageScope": "Configuration"
-        }
-      ]
-    },
-    {
-      "entityType": "FaceplateBinding",
-      "inheritsFrom": ["Object"],
-      "fields": [
-        {
-          "name": "Expression",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "TargetComponent",
-          "dataType": "EntityReference",
-          "default": null,
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "TargetProperty",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "ValueTransform",
-          "dataType": "String",
-          "default": "",
-          "storageScope": "Configuration"
-        },
-        {
-          "name": "SubscriptionConfig",
-          "dataType": "String",
-          "default": "[]",
           "storageScope": "Configuration"
         }
       ]
@@ -474,17 +377,41 @@
       },
       {
         "entityType": "Folder",
-        "Name": "Performance Testing",
+        "Name": "Example Devices",
+        "Description": "Example device entities for testing faceplates",
         "Children": [
           {
-            "entityType": "PerfTestEntity",
-            "Name": "TestEntity",
-            "TestValue": 0,
-            "TestString": "Initial Test Value",
-            "TestFlag": false,
+            "entityType": "ExampleDevice",
+            "Name": "Temperature Sensor 1",
+            "Description": "Primary temperature sensor in Zone A",
+            "Status": "Online",
+            "Temperature": 25.5,
+            "Pressure": 101.3,
+            "Active": true,
             "Faceplates": [
-              "QOS/Faceplate Builder/Faceplates/PerfTest Overview"
+              "QOS/Faceplate Builder/Faceplates/Temperature Sensor Display"
             ]
+          },
+          {
+            "entityType": "ExampleDevice",
+            "Name": "Temperature Sensor 2",
+            "Description": "Backup temperature sensor in Zone A",
+            "Status": "Online",
+            "Temperature": 22.8,
+            "Pressure": 101.2,
+            "Active": true,
+            "Faceplates": [
+              "QOS/Faceplate Builder/Faceplates/Temperature Sensor Display"
+            ]
+          },
+          {
+            "entityType": "ExampleDevice",
+            "Name": "Pressure Sensor 1",
+            "Description": "High-precision pressure sensor",
+            "Status": "Maintenance",
+            "Temperature": 20.0,
+            "Pressure": 98.5,
+            "Active": false
           }
         ]
       },
@@ -498,12 +425,10 @@
             "Children": [
               {
                 "entityType": "Faceplate",
-                "Name": "PerfTest Overview",
-                "TargetEntityType": "PerfTestEntity",
-                "Configuration": "{\"layout\":[],\"bindings\":[]}",
-                "Bindings": "[]",
-                "Components": [],
-                "NotificationChannels": "[{\"fields\":[\"TestValue\",\"TestFlag\",\"Parent\",\"Parent->Parent->Name\"]}]"
+                "Name": "Temperature Sensor Display",
+                "Description": "Example faceplate showing temperature with color-coded visual display",
+                "TargetEntityType": "ExampleDevice",
+                "Configuration": "{\"model\":{\"type\":\"Model\",\"boundary\":{\"from\":{\"x\":0,\"y\":0},\"to\":{\"x\":400,\"y\":300}},\"shapes\":[{\"type\":\"Circle\",\"location\":{\"x\":200,\"y\":100},\"rotation\":0,\"radius\":60,\"fillColor\":\"#00ff88\",\"fillOpacity\":0.7,\"id\":\"tempIndicator\"},{\"type\":\"Text\",\"location\":{\"x\":200,\"y\":100},\"rotation\":0,\"text\":\"20.0°C\",\"fontSize\":24,\"color\":\"#ffffff\",\"id\":\"tempText\"},{\"type\":\"Text\",\"location\":{\"x\":200,\"y\":30},\"rotation\":0,\"text\":\"Temperature\",\"fontSize\":18,\"color\":\"#aaaaaa\"},{\"type\":\"Polygon\",\"location\":{\"x\":100,\"y\":220},\"rotation\":0,\"edges\":[{\"x\":-15,\"y\":-15},{\"x\":15,\"y\":-15},{\"x\":0,\"y\":15}],\"fillColor\":\"#ff0088\",\"fillOpacity\":0.5,\"id\":\"statusIndicator\"},{\"type\":\"Text\",\"location\":{\"x\":150,\"y\":220},\"rotation\":0,\"text\":\"Offline\",\"fontSize\":16,\"color\":\"#ff0088\",\"id\":\"statusText\"}]},\"notificationChannels\":[{\"name\":\"temperature_monitor\",\"config\":{\"EntityId\":{\"entity_id\":\"TARGET_ENTITY\",\"field_type\":\"Temperature\",\"trigger_on_change\":true,\"context\":[[\"Status\"]]}},\"callback\":\"function(notification) { const temp = notification.current.value.Float || 20.0; const tempText = this.findShapeById('tempText'); const tempIndicator = this.findShapeById('tempIndicator'); if (tempText) { tempText.setText(temp.toFixed(1) + '°C'); } if (tempIndicator) { if (temp > 80) { tempIndicator.setFillColor('#ff0000'); } else if (temp > 60) { tempIndicator.setFillColor('#ffaa00'); } else if (temp < 10) { tempIndicator.setFillColor('#0088ff'); } else { tempIndicator.setFillColor('#00ff88'); } } }\"},{\"name\":\"status_monitor\",\"config\":{\"EntityId\":{\"entity_id\":\"TARGET_ENTITY\",\"field_type\":\"Status\",\"trigger_on_change\":true,\"context\":[]}},\"callback\":\"function(notification) { const status = notification.current.value.Choice || 'Offline'; const statusText = this.findShapeById('statusText'); const statusIndicator = this.findShapeById('statusIndicator'); if (statusText) { statusText.setText(status); } if (statusIndicator) { switch(status) { case 'Online': statusIndicator.setFillColor('#00ff88'); statusText.setColor('#00ff88'); break; case 'Error': statusIndicator.setFillColor('#ff0000'); statusText.setColor('#ff0000'); break; case 'Maintenance': statusIndicator.setFillColor('#ffaa00'); statusText.setColor('#ffaa00'); break; default: statusIndicator.setFillColor('#888888'); statusText.setColor('#888888'); } } }\"}],\"targetEntityType\":\"ExampleDevice\"}"
               }
             ]
           }
